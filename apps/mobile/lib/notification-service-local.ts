@@ -594,13 +594,22 @@ async function runRescheduleCycle(api: AlarmNotificationsApi): Promise<void> {
   });
 }
 
-function enqueueReschedule(api: AlarmNotificationsApi): void {
-  rescheduleQueue = rescheduleQueue
+// Every reschedule cycle must run through this one queue. Two cycles in flight
+// at once both see a key that still needs arming (the first has not stored its
+// alarm id yet) and each create a native alarm, so the reminder fires twice.
+// On Android that overlap is routine: coming back to the foreground fires the
+// overdue one-shot top-up timer and the AppState start request together.
+// The returned promise rejects with the cycle's error; the queue itself never does.
+function queueRescheduleCycle(api: AlarmNotificationsApi): Promise<void> {
+  const cycle = rescheduleQueue
     .catch(() => undefined)
-    .then(async () => {
-      await runRescheduleCycle(api);
-    })
-    .catch((error) => logNotificationError('Failed to reschedule local notifications', error));
+    .then(() => runRescheduleCycle(api));
+  rescheduleQueue = cycle.catch((error) => logNotificationError('Failed to reschedule local notifications', error));
+  return cycle;
+}
+
+function enqueueReschedule(api: AlarmNotificationsApi): void {
+  queueRescheduleCycle(api).catch(() => undefined);
 }
 
 function enqueueNotificationEventReschedule(api: AlarmNotificationsApi): void {
@@ -960,7 +969,7 @@ export async function startLocalMobileNotifications(): Promise<void> {
     logNotificationInfo('Start requested while service is already running; rescheduling current reminders');
     const api = await loadAlarmApi();
     if (api) {
-      await runRescheduleCycle(api);
+      await queueRescheduleCycle(api);
     }
     return;
   }
@@ -986,7 +995,7 @@ export async function startLocalMobileNotifications(): Promise<void> {
   }
 
   attachNativeEventListeners();
-  await runRescheduleCycle(api);
+  await queueRescheduleCycle(api);
   logNotificationInfo('Service started');
 
   storeSubscription?.();

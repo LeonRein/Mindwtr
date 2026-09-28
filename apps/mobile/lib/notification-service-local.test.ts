@@ -832,6 +832,42 @@ describe('notification-service-local', () => {
     );
   });
 
+  it('does not schedule the same reminder twice when reschedule requests overlap', async () => {
+    await startLocalMobileNotifications();
+    const listener = (mockStoreSubscribe.mock.calls as unknown[][])[0]?.[0] as (state: unknown, prevState: unknown) => void;
+    expect(listener).toBeTypeOf('function');
+
+    // Android coming back to the foreground: an overdue store/top-up reschedule
+    // and the AppState start request both run while a new due reminder is
+    // pending. Each cycle used to see the key as unscheduled and arm its own
+    // native alarm, so the reminder fired twice.
+    let resolveFirstSchedule: (value: { id: number }) => void = () => undefined;
+    mockAlarmScheduleAlarm
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirstSchedule = resolve; }))
+      .mockResolvedValue({ id: 100 });
+    const prevState = { ...mockStoreState };
+    mockStoreState.tasks = [
+      { id: 'task-1', title: 'Pay rent', description: '', dueDate: new Date(Date.now() + 5 * 60 * 1000).toISOString() },
+    ];
+
+    vi.useFakeTimers();
+    try {
+      listener({ ...mockStoreState }, prevState);
+      await vi.advanceTimersByTimeAsync(2_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    const secondStart = startLocalMobileNotifications();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveFirstSchedule({ id: 99 });
+    await secondStart;
+
+    const taskScheduleCalls = (mockAlarmScheduleAlarm.mock.calls as unknown as [{ data?: { taskId?: string } }][])
+      .filter(([details]) => details.data?.taskId === 'task-1');
+    expect(taskScheduleCalls).toHaveLength(1);
+    expect(__localNotificationTestUtils.getAlarmMapSnapshot().get('task:task-1')?.id).toBe(99);
+  });
+
   it('does not reschedule unchanged persisted daily digest alarms on startup', async () => {
     const signature = JSON.stringify({
       title: 'Morning',
