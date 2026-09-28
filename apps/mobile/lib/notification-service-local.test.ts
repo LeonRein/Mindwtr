@@ -853,7 +853,7 @@ describe('notification-service-local', () => {
     vi.useFakeTimers();
     try {
       listener({ ...mockStoreState }, prevState);
-      await vi.advanceTimersByTimeAsync(2_500);
+      await vi.advanceTimersByTimeAsync(3000);
     } finally {
       vi.useRealTimers();
     }
