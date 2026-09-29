@@ -99,6 +99,7 @@ const POMODORO_ALERT_DELIVERY_RELEASE_CHECK = 'v1.3.0/pomodoro-alert-delivery';
 const DAILY_DIGEST_INDEPENDENT_RELEASE_CHECK = 'v1.3.1/daily-digest-independent';
 const REMINDER_CANCEL_RELEASE_CHECK = 'v1.3.4/reminder-withdrawn-clears-tray';
 const DENIED_RESUME_CLEANUP_RELEASE_CHECK = 'v1.3.4/denied-resume-cleanup';
+const SERIALIZED_RESCHEDULE_RELEASE_CHECK = 'v1.3.4/serialized-reminder-cycles';
 
 let started = false;
 let alarmApi: AlarmNotificationsApi | null = null;
@@ -604,12 +605,12 @@ function queueRescheduleCycle(api: AlarmNotificationsApi): Promise<void> {
   const cycle = rescheduleQueue
     .catch(() => undefined)
     .then(() => runRescheduleCycle(api));
-  rescheduleQueue = cycle.catch((error) => logNotificationError('Failed to reschedule local notifications', error));
+  rescheduleQueue = cycle.catch(() => undefined);
   return cycle;
 }
 
 function enqueueReschedule(api: AlarmNotificationsApi): void {
-  queueRescheduleCycle(api).catch(() => undefined);
+  queueRescheduleCycle(api).catch((error) => logNotificationError('Failed to reschedule local notifications', error));
 }
 
 function enqueueNotificationEventReschedule(api: AlarmNotificationsApi): void {
@@ -966,7 +967,9 @@ export async function scheduleLocalPomodoroCompletionNotification(
 
 export async function startLocalMobileNotifications(): Promise<void> {
   if (started) {
-    logNotificationInfo('Start requested while service is already running; rescheduling current reminders');
+    logNotificationInfo('Start requested while service is already running; rescheduling current reminders', {
+      releaseCheck: SERIALIZED_RESCHEDULE_RELEASE_CHECK,
+    });
     const api = await loadAlarmApi();
     if (api) {
       await queueRescheduleCycle(api);

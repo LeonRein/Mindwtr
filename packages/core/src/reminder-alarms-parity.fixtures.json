@@ -98,6 +98,36 @@
       "addedLogLines": []
      }
     ]
+   },
+   {
+    "change": "A start request while the service runs queues its reconciliation behind any cycle already in flight, so two cycles never arm the same reminder (PR #1311). Its \"Start requested while service is already running; rescheduling current reminders\" log line carries releaseCheck v1.3.4/serialized-reminder-cycles. Maintainer ruling, 2026-09-29.",
+    "source": "The same harness and scenarios run on the working tree of PR #1311 (apps/mobile/lib/notification-service-local.ts). Every observation not listed here is unchanged, and in the listed ones only that log line's extra differs (was null).",
+    "observations": [
+     {
+      "scenario": "digests and the weekly review with task reminders off",
+      "cycle": 1
+     },
+     {
+      "scenario": "digests and the weekly review with task reminders off",
+      "cycle": 2
+     },
+     {
+      "scenario": "task reminders of every kind, then a completed task and a moved review",
+      "cycle": 1
+     },
+     {
+      "scenario": "the Android one-shot cap and its top-up",
+      "cycle": 1
+     },
+     {
+      "scenario": "a rejected alarm aborts the cycle and keeps the ids already created",
+      "cycle": 1
+     },
+     {
+      "scenario": "no reminder feature on cancels every alarm",
+      "cycle": 1
+     }
+    ]
    }
   ]
  },
@@ -5921,7 +5951,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",
@@ -6001,7 +6033,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",
@@ -6734,7 +6768,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",
@@ -15701,7 +15737,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",
@@ -21834,7 +21872,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",
@@ -22132,7 +22172,9 @@
      [
       "logInfo",
       "[Local Notifications] Start requested while service is already running; rescheduling current reminders",
-      null
+      {
+       "releaseCheck": "v1.3.4/serialized-reminder-cycles"
+      }
      ],
      [
       "logInfo",

@@ -866,6 +866,10 @@ describe('notification-service-local', () => {
       .filter(([details]) => details.data?.taskId === 'task-1');
     expect(taskScheduleCalls).toHaveLength(1);
     expect(__localNotificationTestUtils.getAlarmMapSnapshot().get('task:task-1')?.id).toBe(99);
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      '[Local Notifications] Start requested while service is already running; rescheduling current reminders',
+      expect.objectContaining({ extra: { releaseCheck: 'v1.3.4/serialized-reminder-cycles' } }),
+    );
   });
 
   it('does not reschedule unchanged persisted daily digest alarms on startup', async () => {
