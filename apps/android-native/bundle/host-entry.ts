@@ -1002,6 +1002,14 @@ const attachmentDraftJson = (json: string): unknown => {
     } catch { /* A parser excerpt could expose draft content or a picked path. */ }
     throw new Error('INVALID_INPUT');
 };
+// Pure validation remains available before boot; applying an owned Save also
+// requires the current iOS file capability and stable personal workspace.
+const requireOwnedAttachmentSave = (): void => {
+    if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments
+        || isSandboxMode() || isWorkspaceTransitionActive()) {
+        throw new Error('NOT_READY: Attachment draft capability is unavailable');
+    }
+};
 const attachmentDraftDependencies = {
     assertEditable(taskID: string): void {
         if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments
@@ -3082,16 +3090,35 @@ globalThis.MindwtrHost = {
     attachmentDraftResult(json: string): string {
         return submit(async () => completeNativeAttachmentDraftAdd(attachmentDraftJson(json), attachmentDraftDependencies));
     },
+    attachmentOwnedSavePrepare(json: string): string {
+        return submit(async () => {
+            requireOwnedAttachmentSave();
+            requireSaved();
+            return unwrap(await contract.prepareOwnedEditorFileAddTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorFileAddTaskDraftSave>[0]));
+        });
+    },
+    attachmentOwnedSaveValidate(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return unwrap(contract.validatePreparedOwnedEditorFileAddTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.validatePreparedOwnedEditorFileAddTaskDraftSave>[0]));
+        });
+    },
+    attachmentOwnedSaveCommit(json: string): string {
+        return submit(async () => {
+            requireOwnedAttachmentSave();
+            return unwrap(await contract.commitPreparedOwnedEditorFileAddTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorFileAddTaskDraftSave>[0]));
+        });
+    },
     /** Called only after the native private record and exact checkpoint are durable. */
     attachmentDraftAcknowledged(operation: string, outcome: string): string {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments
-                || !(['add', 'checkpoint'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
+                || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained')) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { releaseCheck: 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
+                    context: { releaseCheck: operation === 'save' ? 'v1.3.5/ios-attachment-owned-save' : 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
             } catch { /* Diagnostics cannot invalidate a durable acknowledgment. */ }
             return {};
         });

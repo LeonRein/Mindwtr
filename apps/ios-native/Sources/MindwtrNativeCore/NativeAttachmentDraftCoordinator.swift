@@ -10,6 +10,10 @@ enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeDiscardDecision, afterDiscardDecision, beforeDetach, afterDetach
     case beforeAdvanceIntent, afterAdvanceIntent, beforeAdvanceEditor, afterAdvanceEditor
     case beforeAdvanceMarker, afterAdvanceMarker
+    case afterSaveFreeze, afterSaveJournal, beforeSaveCommit, afterSaveCommit
+    case beforeSaveTerminal, afterSaveTerminal, beforeSaveEditorDetach, afterSaveEditorDetach
+    case beforeSaveStage(Int), afterSaveStage(Int), beforeSaveRelease, afterSaveRelease
+    case beforeSaveJournalClear, afterSaveJournalClear, beforeSaveThaw, afterSaveThaw
 }
 final class AttachmentDraftHostHooks: @unchecked Sendable {
     var boundary: ((AttachmentDraftBoundary) throws -> Void)?
@@ -97,6 +101,17 @@ final class NativeAttachmentDraftCoordinator {
         guard let value = try editor.read(), value.attempt == nil, Self.equal(value.snapshot, expected) else { throw Self.failure }
     }
     private func lineage(_ record: Store.Record) throws {
+        try history(record)
+        if record.session.state == .active {
+            guard let value = try editor.read(), value.attempt == nil else { throw Self.failure }
+            let after = record.operations.last.flatMap { $0.phase == .resultDurable ? $0.after : nil }
+            guard Self.equal(value.snapshot, record.session.checkpoint) || after.map({ Self.equal(value.snapshot, $0) }) == true
+                || record.checkpointAdvance.map({ Self.equal(value.snapshot, $0.after) }) == true else { throw Self.failure }
+        }
+    }
+    /// Metadata validation only. Owned Save separately requires its exact full
+    /// editor attempt; the existing editable lineage gate is never relaxed.
+    private func history(_ record: Store.Record) throws {
         for op in record.operations {
             _ = try prepared(op)
             if let reply = op.replyJSON { guard Self.equal(reply, try addReply(op)) else { throw Self.failure } }
@@ -112,12 +127,6 @@ final class NativeAttachmentDraftCoordinator {
             : record.operations.last?.after.payloadJSON ?? record.session.checkpoint.payloadJSON
         try projection(record, payload: projected)
         if let advance = record.checkpointAdvance { try projection(record, payload: advance.after.payloadJSON) }
-        if record.session.state == .active {
-            guard let value = try editor.read(), value.attempt == nil else { throw Self.failure }
-            let after = record.operations.last.flatMap { $0.phase == .resultDurable ? $0.after : nil }
-            guard Self.equal(value.snapshot, record.session.checkpoint) || after.map({ Self.equal(value.snapshot, $0) }) == true
-                || record.checkpointAdvance.map({ Self.equal(value.snapshot, $0.after) }) == true else { throw Self.failure }
-        }
     }
     private func projection(_ record: Store.Record, payload projected: String) throws {
         let initial = record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON
@@ -286,6 +295,82 @@ final class NativeAttachmentDraftCoordinator {
         #endif
         return settled
     }
+
+    struct OwnedSavePreparation {
+        let record: NativeAttachmentDraftStore.Record
+        let fingerprint: String
+        let snapshot: EditorDraftSnapshot
+        let envelopeJSON: String
+        let resultJSON: String
+    }
+
+    /// Native structural correspondence for pre-runtime journal admission.
+    /// Shared full lineage/effect validation and descriptor proofs remain separate.
+    static func ownedSaveLineageJSON(_ record: NativeAttachmentDraftStore.Record) throws -> String {
+        _ = try NativeAttachmentDraftStore.ownedSaveFingerprint(record)
+        let additions = try record.operations.map { try object($0.preparedJSON, limit: 2 * 1024 * 1024) }
+        guard let root = additions.first?["managedDirectoryURI"] as? String else { throw failure }
+        return try json(["version": 2, "taskID": record.session.taskID,
+            "initialPayloadJSON": record.operations[0].before.payloadJSON,
+            "beforePayloadJSON": record.session.checkpoint.payloadJSON,
+            "priorAdditions": additions, "managedDirectoryURI": root])
+    }
+
+    func prepareOwnedSave(_ saveRequestJSON: String, session: String, generation: Int) throws -> OwnedSavePreparation {
+        jobs.drain()
+        guard let record = try store.read(), let value = try editor.read(), value.attempt == nil,
+              Self.equal(value.snapshot.sessionID, session), value.snapshot.generation == generation,
+              Self.equal(value.snapshot, record.session.checkpoint) else { throw Self.failure }
+        let fingerprint = try Store.ownedSaveFingerprint(record)
+        try lineage(record)
+        try verifyOwnedSavePublished(record)
+        let save = try Self.object(saveRequestJSON, limit: 2_000_000)
+        let checkpoint = try Self.object(String(decoding: JSONEncoder().encode(value.snapshot), as: UTF8.self))
+        let owned = try Self.object(Self.ownedSaveLineageJSON(record))
+        let request: [String: Any] = ["version": 1, "kind": "owned-editor-file-add-save", "checkpoint": checkpoint,
+                                     "ownedDraft": owned, "saveRequest": save]
+        let response = try Self.object(invoke("attachmentOwnedSavePrepare", [Self.json(request)]), limit: 16 * 1024 * 1024)
+        guard Set(response.keys) == Set(["kind", "prepared"]), response["kind"] as? String == "prepared",
+              let prepared = response["prepared"] as? [String: Any], let repeated = prepared["request"] as? [String: Any],
+              Self.equal(try Self.json(repeated), try Self.json(request)) else { throw Self.failure }
+        let envelope = try Self.json(["request": request, "prepared": prepared])
+        let validation = try Self.object(invoke("attachmentOwnedSaveValidate", [envelope]), limit: 16 * 1024 * 1024)
+        guard Set(validation.keys) == Set(["version", "kind", "result"]), Self.integer(validation["version"]) == 1,
+              validation["kind"] as? String == "owned-editor-file-add-save",
+              let result = validation["result"] as? [String: Any], Set(result.keys) == Set(["id", "draft"]),
+              let id = result["id"] as? String, Self.equal(id, value.snapshot.taskID), result["draft"] is [String: Any] else { throw Self.failure }
+        return .init(record: record, fingerprint: fingerprint, snapshot: value.snapshot,
+                     envelopeJSON: envelope, resultJSON: try Self.json(result))
+    }
+
+    /// Call before first invocation and every nonterminal replay. This uses the
+    /// recorded published inode/root/content; it never recopies a cache source.
+    func verifyOwnedSavePublished(_ record: NativeAttachmentDraftStore.Record) throws {
+        jobs.drain()
+        _ = try Store.ownedSaveFingerprint(record)
+        try history(record)
+        let cancellation = NativeAttachmentCancellation()
+        for op in record.operations {
+            guard let reserved = op.stage, let expected = op.published else { throw Self.failure }
+            let raw = try file(.verifyPublication(targetURI: op.targetURI, stage: stage(reserved),
+                sha256: op.source.sha256, size: op.source.size), cancellation: cancellation, ignoringCancellation: true)
+            let actual = try JSONDecoder().decode(Store.Published.self, from: Data(Self.json(raw).utf8))
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            guard try encoder.encode(actual) == encoder.encode(expected) else { throw Self.failure }
+        }
+    }
+
+    /// The caller already owns a validated durable success terminal and checks
+    /// the exact sidecar/editor before each job. No JSC runs during retirement.
+    func retireOwnedSaveStage(_ op: NativeAttachmentDraftStore.Operation) throws {
+        guard let reserved = op.stage else { throw Self.failure }
+        let value = try file(.retirePrivateStage(stage: stage(reserved), targetURI: op.targetURI,
+            operationID: op.requestId.replacingOccurrences(of: "-", with: "")),
+            cancellation: NativeAttachmentCancellation(), ignoringCancellation: true)
+        guard Set(value.keys) == Set(["status"]), let status = value["status"] as? String,
+              ["removed", "missing"].contains(status) else { throw Self.failure }
+    }
+    func drainOwnedSaveJobs() { jobs.drain() }
 
     func add(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
         let request = try Self.request(raw, add: true)

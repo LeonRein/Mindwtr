@@ -20,6 +20,10 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 - `Linux desktop notification submitted` / `Linux desktop notification delivery failed` (`notification-service.tsx`), with backend, bounded outcome, and a safe error category on failure.
 - `Android widget list rendered within parcel budget` (`widget-service.ts`), with aggregate collection, item, eligible-item, and parcel-byte counts.
 
+## v1.3.5 (add before tagging, trim in the release after)
+
+- **`v1.3.5/ios-attachment-owned-save`** — `apps/android-native/bundle/host-entry.ts`, after the native owner completes ordinary editor/file Add Save. `Native iOS attachment draft acknowledged` with `operation=save`, `outcome=confirmed` proves durable task acknowledgment, private-stage retirement, and exact draft/journal release. Published task files and picker source copies remain untouched. This internal path does not establish file Remove, Discard cleanup, picker/viewer UI, or sync acceptance. No task identifiers, content, filenames, paths, URLs, hashes, or raw errors are logged.
+
 ## v1.3.4 (add before tagging, trim in the release after)
 
 - **`v1.3.4/mcp-local-api`** — `apps/mcp-server/src/local-api-service.ts`, MCP helper stderr after the first successful authenticated desktop Local API request. Proves this helper reached the API, not that SQLite was installed or the app UI refreshed. Test with the native addon omitted, read tasks, create a synthetic task with writes enabled, and confirm it appears in the app. No token, URL, task content, identifiers or response body is logged. This helper diagnostic is collected from the MCP client's stderr log, not desktop Settings → Diagnostics.

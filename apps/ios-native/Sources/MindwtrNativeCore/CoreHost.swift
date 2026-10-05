@@ -10,6 +10,13 @@ public struct CoreHostRejection: LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
+/// A validated Save succeeded and its terminal was durably journaled. Retry
+/// owns only cleanup, never another task commit.
+public struct CoreHostAttachmentCleanupPending: LocalizedError, Sendable {
+    public let resultJSON: String
+    public var errorDescription: String? { "Task saved. Attachment cleanup needs Retry." }
+}
+
 /// Recovery could not prove this authenticated request landed; no replay write was attempted.
 public struct CoreHostAppLockRecovery: LocalizedError, Sendable {
     public var errorDescription: String? { "App lock outcome is unknown. Cancel the pending change to use the saved setting." }
@@ -74,6 +81,10 @@ public final class CoreHost: @unchecked Sendable {
     }
     public func beginAttachmentDraftV2(expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.beginAttachmentDraftV2(expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
+    }
+    public func saveAttachmentDraftAdds(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
+        try await perform { try $0.saveAttachmentDraftAdds(saveRequestJSON: saveRequestJSON,
+            expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
     public func readAttachmentDraft() async throws -> String {
         try await perform { try $0.readAttachmentDraft() }
@@ -235,6 +246,17 @@ private enum TerminalResult: Codable {
 // ownership. The public facade holds only immutable references and schedules all
 // access here. No JSValue, JSContext or SQLite handle crosses this boundary.
 private final class Engine: @unchecked Sendable {
+    private static let ownedSaveMethod = "attachmentOwnedSaveCommit"
+    private static let ownedSaveMaximumBytes = 8 * 1024 * 1024
+    private static let ownedSaveRejectionBytes = 64 * 1024
+    private static let ownedSaveFailure = HostFailure("SAVE_FAILED: Owned attachment Save could not be confirmed; retry the exact pending change")
+    private struct OwnedSaveJournal {
+        let fingerprint: String
+        let envelopeJSON: String
+        let snapshot: EditorDraftSnapshot
+        let attempt: EditorDraftAttempt
+        let record: NativeAttachmentDraftStore.Record?
+    }
     private let queue: DispatchQueue
     private let databaseURL: URL
     private let bundleURL: URL
@@ -505,7 +527,9 @@ private final class Engine: @unchecked Sendable {
             throw HostFailure("Invalid pending command journal")
         }
         guard saved.version == 2 else { throw HostFailure("Unsupported pending command journal; raw captures cannot be safely replanned") }
-        if saved.method == "projectLifecycleCommit" {
+        if saved.method == Self.ownedSaveMethod {
+            _ = try decodeOwnedSaveJournal(journalData, checkingNative: true)
+        } else if saved.method == "projectLifecycleCommit" {
             _ = try projectLifecycleJournalArguments(saved)
         } else {
             _ = try journalArguments(saved, checkingEditorSnapshot: checkingEditorSnapshot)
@@ -573,6 +597,10 @@ private final class Engine: @unchecked Sendable {
             try checkException()
             guard let host = runtime.objectForKeyedSubscript("MindwtrHost"), !host.isUndefined, !host.isNull else {
                 throw HostFailure("Core bundle has no host contract")
+            }
+            if let command = pending, command.method == Self.ownedSaveMethod {
+                if case .success(let value) = command.terminal { _ = try validateOwnedSaveAcknowledgement(command, value: value) }
+                else { _ = try validateOwnedSaveAcknowledgement(command) }
             }
             if let command = pending, command.method == "draftCommit" {
                 if case .success(let value) = command.terminal { try validateDraftAcknowledgment(command, value: value) }
@@ -1331,6 +1359,395 @@ private final class Engine: @unchecked Sendable {
     func beginAttachmentDraftV2(expectedSession: String, expectedGeneration: Int) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinator().beginV2(session: expectedSession, generation: expectedGeneration) }
     }
+
+    private static func ownedEqual(_ lhs: String, _ rhs: String) -> Bool { lhs.utf8.elementsEqual(rhs.utf8) }
+    private static func ownedEqual(_ lhs: EditorDraftSnapshot, _ rhs: EditorDraftSnapshot) -> Bool {
+        lhs.version == rhs.version && ownedEqual(lhs.sessionID, rhs.sessionID) && ownedEqual(lhs.taskID, rhs.taskID)
+            && lhs.generation == rhs.generation && ownedEqual(lhs.payloadJSON, rhs.payloadJSON)
+    }
+    private static func ownedEqual(_ lhs: EditorDraftAttempt, _ rhs: EditorDraftAttempt) -> Bool {
+        ownedEqual(lhs.id, rhs.id) && ownedEqual(lhs.sessionID, rhs.sessionID) && ownedEqual(lhs.taskID, rhs.taskID)
+            && lhs.generation == rhs.generation && ownedEqual(lhs.method, rhs.method) && ownedEqual(lhs.argumentsJSON, rhs.argumentsJSON)
+    }
+    private static func ownedJSON(_ value: Any) throws -> String {
+        String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+    }
+    private static func ownedOriginalRequest(_ attempt: EditorDraftAttempt) throws -> [String: Any] {
+        guard attempt.method == "attachmentDraftSave", attempt.argumentsJSON.utf8.count <= 2_000_000,
+              let args = try NativeJSON.jsonObject(with: Data(attempt.argumentsJSON.utf8)) as? [String], args.count == 1,
+              args[0].utf8.count <= 2_000_000,
+              let original = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
+              Set(original.keys) == Set(["id", "base", "patch", "scheduleBase", "attachments"]
+                + (original["recurrenceBase"] == nil ? [] : ["recurrenceBase"])),
+              let id = original["id"] as? String, ownedEqual(id, attempt.taskID),
+              original["base"] is [String: Any], original["patch"] is [String: Any], original["scheduleBase"] is [String: Any],
+              let attachments = original["attachments"] as? [String: Any], Set(attachments.keys) == Set(["base", "value"]),
+              attachments["base"] is [Any], attachments["value"] is [Any] else { throw ownedSaveFailure }
+        return original
+    }
+    /// Does not read files or assert a Save outcome. Startup separately binds
+    /// the native files, then pure shared validation proves the complete effect.
+    private func ownedSaveJournal(_ command: PendingCommand, checkingNative: Bool = true) throws -> OwnedSaveJournal {
+        guard command.version == 2, command.method == Self.ownedSaveMethod,
+              try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes,
+              let attempt = command.editorDraft,
+              let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
+              let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
+              Set(wrapper.keys) == Set(["version", "recordSHA256", "envelope"]), Self.isInteger(wrapper["version"], equalTo: 1),
+              let fingerprint = wrapper["recordSHA256"] as? String, fingerprint.utf8.count == 64,
+              fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              let envelope = wrapper["envelope"] as? [String: Any], Set(envelope.keys) == Set(["request", "prepared"]),
+              let request = envelope["request"] as? [String: Any],
+              Set(request.keys) == Set(["version", "kind", "checkpoint", "ownedDraft", "saveRequest"]),
+              Self.isInteger(request["version"], equalTo: 1), request["kind"] as? String == "owned-editor-file-add-save",
+              let checkpoint = request["checkpoint"] as? [String: Any],
+              Set(checkpoint.keys) == Set(["version", "sessionID", "taskID", "generation", "payloadJSON"]),
+              Self.isInteger(checkpoint["version"], equalTo: 1), Self.isInteger(checkpoint["generation"]),
+              let snapshot = try? JSONDecoder().decode(EditorDraftSnapshot.self, from: Data(Self.ownedJSON(checkpoint).utf8)),
+              let owned = request["ownedDraft"] as? [String: Any],
+              Set(owned.keys) == Set(["version", "taskID", "initialPayloadJSON", "beforePayloadJSON", "priorAdditions", "managedDirectoryURI"]),
+              Self.isInteger(owned["version"], equalTo: 2), let task = owned["taskID"] as? String,
+              Self.ownedEqual(task, snapshot.taskID), let latest = owned["beforePayloadJSON"] as? String,
+              Self.ownedEqual(latest, snapshot.payloadJSON), owned["initialPayloadJSON"] is String,
+              let additions = owned["priorAdditions"] as? [[String: Any]], (1...128).contains(additions.count),
+              owned["managedDirectoryURI"] is String,
+              let save = request["saveRequest"] as? [String: Any],
+              let prepared = envelope["prepared"] as? [String: Any],
+              Set(prepared.keys) == Set(["version", "kind", "request", "preparedAt", "deviceIdBefore", "deviceIdToInitialize", "scope", "effect"]),
+              Self.isInteger(prepared["version"], equalTo: 1), prepared["kind"] as? String == "owned-editor-file-add-save",
+              Self.equalJSON(prepared["request"], request), prepared["preparedAt"] is String,
+              prepared["scope"] is [String: Any], prepared["effect"] is [String: Any] else { throw Self.ownedSaveFailure }
+        try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
+        guard Self.equalJSON(try Self.ownedOriginalRequest(attempt), save) else { throw Self.ownedSaveFailure }
+        if case .rejected(let message) = command.terminal {
+            guard isDefiniteRejection(message, method: command.method) else { throw Self.ownedSaveFailure }
+        }
+        var actual: NativeAttachmentDraftStore.Record?
+        if checkingNative {
+            let success: Bool
+            if case .success = command.terminal { success = true } else { success = false }
+            actual = try NativeAttachmentDraftStore(databaseURL: databaseURL).read()
+            if let actual {
+                guard Self.ownedEqual(try NativeAttachmentDraftStore.ownedSaveFingerprint(actual), fingerprint),
+                      Self.ownedEqual(actual.session.checkpoint, snapshot),
+                      Self.equalJSON(try NativeJSON.jsonObject(with: Data(NativeAttachmentDraftCoordinator.ownedSaveLineageJSON(actual).utf8)), owned) else {
+                    throw Self.ownedSaveFailure
+                }
+            } else if !success { throw Self.ownedSaveFailure }
+            if let current = try editorDrafts.read() {
+                guard Self.ownedEqual(current.snapshot, snapshot) else { throw Self.ownedSaveFailure }
+                if let frozen = current.attempt {
+                    guard Self.ownedEqual(frozen, attempt) else { throw Self.ownedSaveFailure }
+                } else if case .rejected = command.terminal {
+                    // A prior exact thaw may precede a failed journal clear.
+                } else { throw Self.ownedSaveFailure }
+            } else if !success { throw Self.ownedSaveFailure }
+        }
+        return .init(fingerprint: fingerprint, envelopeJSON: try Self.ownedJSON(envelope),
+                     snapshot: snapshot, attempt: attempt, record: actual)
+    }
+
+    private func decodeOwnedSaveJournal(_ data: Data, checkingNative: Bool) throws -> PendingCommand {
+        guard data.count <= Self.ownedSaveMaximumBytes,
+              let raw = try NativeJSON.jsonObject(with: data) as? [String: Any],
+              Set(raw.keys) == Set(["version", "method", "argumentsJSON", "editorDraft"]
+                + (raw["terminal"] == nil ? [] : ["terminal"])),
+              let draft = raw["editorDraft"] as? [String: Any],
+              Set(draft.keys) == Set(["id", "sessionID", "taskID", "generation", "method", "argumentsJSON"]),
+              let command = try? JSONDecoder().decode(PendingCommand.self, from: data), command.method == Self.ownedSaveMethod else {
+            throw Self.ownedSaveFailure
+        }
+        if let terminal = raw["terminal"] {
+            guard let object = terminal as? [String: Any], object.count == 1,
+                  let kind = object.keys.first, ["success", "rejected"].contains(kind),
+                  let body = object[kind] as? [String: Any], Set(body.keys) == Set(["_0"]), body["_0"] is String else {
+                throw Self.ownedSaveFailure
+            }
+        }
+        _ = try ownedSaveJournal(command, checkingNative: checkingNative)
+        return command
+    }
+
+    /// Only used by the new owned command's mutation guards. The legacy
+    /// journal loader and its historical transport limits remain unchanged.
+    private func ownedJournalBytes() throws -> Data? {
+        let fd = open(journalURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT { return nil }
+            throw Self.ownedSaveFailure
+        }
+        defer { Darwin.close(fd) }
+        var before = stat()
+        guard fstat(fd, &before) == 0, (before.st_mode & S_IFMT) == S_IFREG, before.st_nlink == 1,
+              before.st_size >= 0, before.st_size <= Int64(Self.ownedSaveMaximumBytes) else { throw Self.ownedSaveFailure }
+        var result = Data(), buffer = Data(count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else { throw Self.ownedSaveFailure }
+            if count == 0 { break }
+            guard result.count + count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+            result.append(buffer.prefix(count))
+        }
+        var after = stat(), named = stat()
+        func same(_ lhs: stat, _ rhs: stat) -> Bool {
+            lhs.st_dev == rhs.st_dev && lhs.st_ino == rhs.st_ino && lhs.st_mode == rhs.st_mode
+                && lhs.st_nlink == rhs.st_nlink && lhs.st_size == rhs.st_size
+                && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+                && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+        }
+        guard result.count == Int(before.st_size), fstat(fd, &after) == 0, lstat(journalURL.path, &named) == 0,
+              same(before, after), same(after, named) else { throw Self.ownedSaveFailure }
+        return result
+    }
+    private func ownedEncoded<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; return try encoder.encode(value)
+    }
+    private func requireOwnedJournalOnDisk(_ command: PendingCommand) throws {
+        guard let data = try ownedJournalBytes() else { throw Self.ownedSaveFailure }
+        let actual = try decodeOwnedSaveJournal(data, checkingNative: false)
+        guard try ownedEncoded(actual) == ownedEncoded(command) else { throw Self.ownedSaveFailure }
+    }
+    private func requireOwnedJournalWriteIdentity(_ command: PendingCommand) throws {
+        guard let bytes = try ownedJournalBytes() else { return }
+        let actual = try decodeOwnedSaveJournal(bytes, checkingNative: false)
+        var before = actual, after = command; before.terminal = nil; after.terminal = nil
+        guard try ownedEncoded(before) == ownedEncoded(after) else { throw Self.ownedSaveFailure }
+        if let terminal = actual.terminal {
+            guard let incoming = command.terminal, try ownedEncoded(terminal) == ownedEncoded(incoming) else { throw Self.ownedSaveFailure }
+        }
+    }
+
+    private func validateOwnedSaveAcknowledgement(_ command: PendingCommand, value: String? = nil) throws -> String {
+        let captured = try ownedSaveJournal(command, checkingNative: false)
+        let encoded = try invoke("attachmentOwnedSaveValidate", arguments: [captured.envelopeJSON])
+        guard let validation = try NativeJSON.jsonObject(with: Data(encoded.utf8)) as? [String: Any],
+              Set(validation.keys) == Set(["version", "kind", "result"]), Self.isInteger(validation["version"], equalTo: 1),
+              validation["kind"] as? String == "owned-editor-file-add-save",
+              let expected = validation["result"] as? [String: Any], Set(expected.keys) == Set(["id", "draft"]),
+              let id = expected["id"] as? String, Self.ownedEqual(id, captured.snapshot.taskID), expected["draft"] is [String: Any] else {
+            throw Self.ownedSaveFailure
+        }
+        if let value {
+            guard let acknowledged = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
+                  Set(acknowledged.keys) == Set(["id", "draft"]), Self.equalJSON(expected, acknowledged) else { throw Self.ownedSaveFailure }
+        }
+        return try Self.ownedJSON(expected)
+    }
+
+    private func ownedSaveCoordinatorForWork() throws -> NativeAttachmentDraftCoordinator {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, lockFD >= 0, let jobs = attachmentJobs else { throw Self.ownedSaveFailure }
+        let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs) { [unowned self] name, args in
+            try self.invoke(name, arguments: args)
+        }
+        #if DEBUG
+        coordinator.hooks = attachmentDraftHooks
+        #endif
+        return coordinator
+    }
+
+    private func preflightOwnedSave(_ command: PendingCommand, snapshot: EditorDraftSnapshot, result: String) throws {
+        guard let attempt = command.editorDraft else { throw Self.ownedSaveFailure }
+        try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
+        _ = try ownedSaveJournal(command, checkingNative: false)
+        var success = command; success.terminal = .success(result)
+        var rejected = command
+        // Each ASCII control byte has the maximum six-byte JSON escaping cost.
+        // Reserve a full bounded rejection rather than truncating future evidence.
+        rejected.terminal = .rejected(String(repeating: "\u{0000}", count: Self.ownedSaveRejectionBytes))
+        for candidate in [command, success, rejected] {
+            guard try JSONEncoder().encode(candidate).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        }
+    }
+
+    private func requireUnfrozenOwnedSave(_ prepared: NativeAttachmentDraftCoordinator.OwnedSavePreparation) throws {
+        guard let record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
+              Self.ownedEqual(try NativeAttachmentDraftStore.ownedSaveFingerprint(record), prepared.fingerprint),
+              let current = try editorDrafts.read(), current.attempt == nil,
+              Self.ownedEqual(current.snapshot, prepared.snapshot) else { throw Self.ownedSaveFailure }
+    }
+
+    private func requireOwnedSaveInvocation(_ command: PendingCommand) throws -> OwnedSaveJournal {
+        try requireOwnedJournalOnDisk(command)
+        let captured = try ownedSaveJournal(command)
+        guard let record = captured.record else { throw Self.ownedSaveFailure }
+        try ownedSaveCoordinatorForWork().verifyOwnedSavePublished(record)
+        try requireOwnedJournalOnDisk(command)
+        return try ownedSaveJournal(command)
+    }
+
+    private func ownedJournalIsAbsent() throws -> Bool {
+        var info = stat()
+        if lstat(journalURL.path, &info) == 0 { return false }
+        guard errno == ENOENT else { throw Self.ownedSaveFailure }
+        return true
+    }
+
+    func saveAttachmentDraftAdds(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, !recoveryActivationPending, pending == nil else { throw Self.ownedSaveFailure }
+        do {
+            let prepared = try attachmentDraftCoordinator().prepareOwnedSave(saveRequestJSON,
+                session: expectedSession, generation: expectedGeneration)
+            let original = try Self.ownedJSON([saveRequestJSON])
+            let attempt = EditorDraftAttempt(id: UUID().uuidString.lowercased(), sessionID: prepared.snapshot.sessionID,
+                taskID: prepared.snapshot.taskID, generation: prepared.snapshot.generation,
+                method: "attachmentDraftSave", argumentsJSON: original)
+            let envelope = try NativeJSON.jsonObject(with: Data(prepared.envelopeJSON.utf8))
+            let wrapper = try Self.ownedJSON(["version": 1, "recordSHA256": prepared.fingerprint, "envelope": envelope])
+            let command = PendingCommand(version: 2, method: Self.ownedSaveMethod,
+                argumentsJSON: try Self.ownedJSON([wrapper]), editorDraft: attempt)
+            try preflightOwnedSave(command, snapshot: prepared.snapshot, result: prepared.resultJSON)
+            try requireUnfrozenOwnedSave(prepared)
+            guard try ownedJournalIsAbsent() else { throw Self.ownedSaveFailure }
+            try editorDrafts.freezeOwnedSaveMatching(expected: prepared.snapshot, attempt: attempt)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveFreeze)
+            #endif
+            pending = command
+            try persist(command)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveJournal)
+            try attachmentDraftHooks?.boundary?(.beforeSaveCommit)
+            #endif
+            let captured = try requireOwnedSaveInvocation(command)
+            let terminal: TerminalResult
+            do { terminal = .success(try invoke(command.method, arguments: [captured.envelopeJSON])) }
+            catch let failure as HostFailure {
+                guard isDefiniteRejection(failure.message, method: command.method) else { throw failure }
+                terminal = .rejected(failure.message)
+            }
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveCommit)
+            #endif
+            return try finishOwnedSave(command, with: terminal).value()
+        } catch let known as CoreHostAttachmentCleanupPending { throw known }
+        catch let rejected as CoreHostRejection { throw rejected }
+        catch { throw Self.ownedSaveFailure }
+    }
+
+    /// A crash after freeze and before journal creation proves no invocation
+    /// only through demonstrable journal absence, never through a read error.
+    private func reconcileUnjournaledOwnedSave(snapshot: EditorDraftSnapshot, attempt: EditorDraftAttempt) throws {
+        guard pending == nil, try ownedJournalIsAbsent(),
+              let record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
+              Self.ownedEqual(record.session.checkpoint, snapshot) else { throw Self.ownedSaveFailure }
+        _ = try NativeAttachmentDraftStore.ownedSaveFingerprint(record)
+        _ = try Self.ownedOriginalRequest(attempt)
+        try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
+        try editorDrafts.thawOwnedSaveMatching(expected: snapshot, attempt: attempt)
+    }
+
+    private func requireOwnedCleanup(_ command: PendingCommand, editorAbsent: Bool = false,
+                                     sidecarAbsent: Bool = false) throws -> OwnedSaveJournal {
+        let captured = try ownedSaveJournal(command)
+        try requireOwnedJournalOnDisk(command)
+        if editorAbsent { guard try editorDrafts.read() == nil else { throw Self.ownedSaveFailure } }
+        if sidecarAbsent { guard captured.record == nil else { throw Self.ownedSaveFailure } }
+        return captured
+    }
+
+    private func clearOwnedSavePending(_ command: PendingCommand, success: Bool) throws {
+        _ = try requireOwnedCleanup(command, editorAbsent: success, sidecarAbsent: success)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeSaveJournalClear)
+        try faults?.journalRemove?()
+        #endif
+        _ = try requireOwnedCleanup(command, editorAbsent: success, sidecarAbsent: success)
+        try DurableFile.remove(journalURL)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterSaveJournalClear)
+        #endif
+        let captured = try ownedSaveJournal(command)
+        if success {
+            guard captured.record == nil, try editorDrafts.read() == nil else { throw Self.ownedSaveFailure }
+        }
+        guard try ownedJournalIsAbsent() else { throw Self.ownedSaveFailure }
+        pending = nil
+    }
+
+    private func finishOwnedSave(_ command: PendingCommand, with terminal: TerminalResult) throws -> TerminalResult {
+        let result: String?
+        if case .success(let value) = terminal {
+            _ = try validateOwnedSaveAcknowledgement(command, value: value)
+            result = value
+        } else {
+            _ = try validateOwnedSaveAcknowledgement(command)
+            if case .rejected(let message) = terminal {
+                guard isDefiniteRejection(message, method: command.method) else { throw Self.ownedSaveFailure }
+            }
+            result = nil
+        }
+        var finished = command; finished.terminal = terminal
+        pending = finished
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeSaveTerminal)
+        #endif
+        // No cleanup authority exists until this exact terminal reaches disk.
+        try persist(finished)
+        do {
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveTerminal)
+            #endif
+            let captured = try requireOwnedCleanup(finished)
+            if result != nil {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeSaveEditorDetach)
+                try faults?.editorDraftRemove?()
+                #endif
+                _ = try requireOwnedCleanup(finished)
+                try editorDrafts.removeOwnedSaveMatching(expected: captured.snapshot, attempt: captured.attempt)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterSaveEditorDetach)
+                #endif
+                _ = try requireOwnedCleanup(finished, editorAbsent: true)
+                if let record = captured.record {
+                    let coordinator = try ownedSaveCoordinatorForWork()
+                    for (index, op) in record.operations.enumerated() {
+                        // An already absent sidecar authorizes no further file job.
+                        guard try requireOwnedCleanup(finished, editorAbsent: true).record != nil else { break }
+                        #if DEBUG
+                        try attachmentDraftHooks?.boundary?(.beforeSaveStage(index))
+                        #endif
+                        guard try requireOwnedCleanup(finished, editorAbsent: true).record != nil else { break }
+                        try coordinator.retireOwnedSaveStage(op)
+                        #if DEBUG
+                        try attachmentDraftHooks?.boundary?(.afterSaveStage(index))
+                        #endif
+                        _ = try requireOwnedCleanup(finished, editorAbsent: true)
+                    }
+                    coordinator.drainOwnedSaveJobs()
+                }
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeSaveRelease)
+                #endif
+                _ = try requireOwnedCleanup(finished, editorAbsent: true)
+                try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseSavedAddsMatching(fingerprint: captured.fingerprint)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterSaveRelease)
+                #endif
+                _ = try requireOwnedCleanup(finished, editorAbsent: true, sidecarAbsent: true)
+                try clearOwnedSavePending(finished, success: true)
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["save", "confirmed"])
+            } else {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeSaveThaw)
+                #endif
+                _ = try requireOwnedCleanup(finished)
+                try editorDrafts.thawOwnedSaveMatching(expected: captured.snapshot, attempt: captured.attempt)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterSaveThaw)
+                #endif
+                _ = try requireOwnedCleanup(finished)
+                try clearOwnedSavePending(finished, success: false)
+            }
+        } catch {
+            if let result { throw CoreHostAttachmentCleanupPending(resultJSON: result) }
+            throw Self.ownedSaveFailure
+        }
+        return terminal
+    }
     func readAttachmentDraft() throws -> String {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed else { throw HostFailure("Attachment draft recovery is not ready") }
@@ -1353,6 +1770,10 @@ private final class Engine: @unchecked Sendable {
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft recovery is not settled") }
         guard let current = try editorDrafts.read() else { return nil }
         if let attempt = current.attempt {
+            if attempt.method == "attachmentDraftSave" {
+                try reconcileUnjournaledOwnedSave(snapshot: current.snapshot, attempt: attempt)
+                return current.snapshot
+            }
             try requireNoAttachmentDraft()
             // No journal means the invocation never began, or a definite refusal settled.
             try editorDrafts.thaw(attempt)
@@ -4110,6 +4531,20 @@ private final class Engine: @unchecked Sendable {
     private func resolvePending() throws -> TerminalResult? {
         guard started, !closed else { throw HostFailure("Core host is not ready; retry startup") }
         guard let command = pending else { return nil }
+        if command.method == Self.ownedSaveMethod {
+            if let terminal = command.terminal { return try finishOwnedSave(command, with: terminal) }
+            // A failed warm write remains owed. Replay rejection is uncertain.
+            try persist(command)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.beforeSaveCommit)
+            #endif
+            let captured = try requireOwnedSaveInvocation(command)
+            let value = try invoke(command.method, arguments: [captured.envelopeJSON])
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveCommit)
+            #endif
+            return try finishOwnedSave(command, with: .success(value))
+        }
         if let terminal = command.terminal {
             if command.method == "referenceTasksMoveCommit", case .success(let value) = terminal {
                 let probed = try invoke("referenceTasksMoveOutcome", arguments: referenceTasksMoveJournalArguments(command))
@@ -4210,6 +4645,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func finish(_ command: PendingCommand, with terminal: TerminalResult) throws -> TerminalResult {
+        if command.method == Self.ownedSaveMethod { return try finishOwnedSave(command, with: terminal) }
         if command.method == "backupDocumentCommit", case .success(let value) = terminal {
             // A terminal journal is not permission to apply a missing receipt.
             // This probe is SQL read-only, including after a cold restart.
@@ -5141,7 +5577,11 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func isDefiniteRejection(_ message: String, method: String) -> Bool {
-        ["INVALID_INPUT:", "TASK_NOT_FOUND:", "NOT_READY:"].contains(where: { message.hasPrefix($0) })
+        if method == Self.ownedSaveMethod {
+            return message.utf8.count <= Self.ownedSaveRejectionBytes
+                && ["INVALID_INPUT:", "TASK_NOT_FOUND:", "NOT_READY:", "STALE_REVISION:"].contains(where: { message.hasPrefix($0) })
+        }
+        return ["INVALID_INPUT:", "TASK_NOT_FOUND:", "NOT_READY:"].contains(where: { message.hasPrefix($0) })
             || (["doneTaskStatusCommit", "doneTaskCompletedAtCommit", "archiveTaskCompletedAtCommit", "referenceTaskBackdateCommit", "referenceTaskDestinationCommit", "referenceProjectNextActionCommit"].contains(method) && message.hasPrefix("STALE_REVISION:"))
             || (["referenceTasksRemoveTagCommit", "referenceTasksAddTagCommit", "referenceTasksMoveCommit", "archivedTaskRestoreCommit", "archivedTasksRestoreCommit", "archivedTasksDeleteCommit", "archivedTasksDeleteUndoCommit", "taskCompletionCommit", "taskCompletionUndoCommit", "taskDeleteCommit", "taskDeleteUndoCommit", "taskPromoteCommit", "trashTaskRestoreCommit", "trashProjectRestoreCommit", "projectDeleteCommit", "projectDeleteUndoCommit", "projectDuplicateCommit", "projectLifecycleCommit"].contains(method) && message.hasPrefix("STALE_REVISION:"))
             || (["saveDraft", "draftCommit", "calendarPreference", "focusGroupWrite", "taskListSortWrite", "unassignedAreaColorWrite", "somedaySectionCreateWrite", "somedaySectionRenameWrite", "somedaySectionDeleteWrite", "somedaySectionTaskCommit", "boardCommit", "calendarUnscheduleCommit", "calendarDeleteCommit", "calendarComposerCommit", "calendarComposerCreateCommit", "mindSweepCommit", "inboxPreparedCommit", "checklistPreparedCommit", "taskCancellationUndoCommit", "projectCreateCommit", "projectSectionCreateCommit", "projectSectionRenameCommit", "projectSectionDeleteCommit", "projectSectionOrderCommit", "areaCreateCommit", "manageAreaCreateCommit", "managePersonCreateCommit", "appLockCommit", "gtdWorkflowCommit", "generalPreferenceCommit", "manageTaxonomyCommit", "managePersonEditCommit", "managePersonDeleteCommit", "areaColorCommit", "areaRenameCommit", "manageAreaEditCommit", "areaOrderCommit", "areaDeleteCommit", "manageAreaDeleteCommit", "projectFocusCommit", "taskFocusCommit", "focusOrderCommit", "focusSavedFilterCommit", "savedSearchCommit", "projectRenameCommit", "projectFlowCommit", "projectTaskSortCommit", "projectTaskOrderCommit", "projectNotesWriteCommit", "projectTagsWriteCommit", "projectAttachmentWriteCommit", "projectStatusCommit", "projectDateCommit", "projectAreaCommit"].contains(method) && message.hasPrefix("STALE_REVISION:"))
@@ -8026,6 +8466,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func journalArguments(_ command: PendingCommand, checkingEditorSnapshot: Bool = true) throws -> [Any] {
+        if command.method == Self.ownedSaveMethod { return [try ownedSaveJournal(command).envelopeJSON] }
         if command.method == "backupDocumentCommit" {
             _ = try backupOperationReference(command)
             return [try backupEncoded(backupOperationReference(command))]
@@ -11334,6 +11775,18 @@ private final class Engine: @unchecked Sendable {
 
 
     private func persist(_ command: PendingCommand) throws {
+        if command.method == Self.ownedSaveMethod {
+            let data = try JSONEncoder().encode(command)
+            guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+            _ = try ownedSaveJournal(command, checkingNative: false)
+            try requireOwnedJournalWriteIdentity(command)
+            #if DEBUG
+            try faults?.journalWrite?()
+            #endif
+            try requireOwnedJournalWriteIdentity(command)
+            try DurableFile.write(data, to: journalURL, privateDraft: true)
+            return
+        }
         #if DEBUG
         try faults?.journalWrite?()
         #endif
