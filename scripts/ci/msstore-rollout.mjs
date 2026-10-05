@@ -107,7 +107,8 @@ function validateIdentity({ app, appId, submissionId, allowPending = false }) {
     throw new Error('Microsoft Store returned the wrong application identity.');
   }
   const publishedId = app.lastPublishedApplicationSubmission?.id;
-  if (String(publishedId ?? '') !== submissionId) {
+  const pendingId = String(app.pendingApplicationSubmission?.id ?? '');
+  if (String(publishedId ?? '') !== submissionId && !(allowPending && pendingId === submissionId)) {
     throw new Error(`Submission ${submissionId} is not the current last published application submission.`);
   }
   // A pending submission blocks a mutation, not a read: the Windows release job
@@ -180,6 +181,11 @@ export async function manageRollout({
   validateIdentity({ app, appId, submissionId, allowPending: action === 'status' });
 
   const submission = await request('GET', submissionPath);
+  if (String(submission?.id ?? '') === submissionId && action === 'status'
+      && typeof submission.status === 'string' && submission.status && submission.status !== 'Published') {
+    log(`Microsoft Store submission ${submissionId}: ${submission.status}; not distributing yet.`);
+    return { submissionId, action, status: submission.status, percentage: null, open: false, pendingSubmissionId };
+  }
   if (String(submission?.id ?? '') !== submissionId || submission.status !== 'Published') {
     throw new Error(`Submission ${submissionId} must be Published before its package rollout can be managed.`);
   }
@@ -346,7 +352,7 @@ export async function runCli({
   if (env.GITHUB_STEP_SUMMARY) {
     appendFileSync(
       env.GITHUB_STEP_SUMMARY,
-      `\n## Microsoft Store package rollout\n\n- Submission: \`${result.submissionId}\`\n- Action: **${result.action}**\n- Decision: **${result.decision ?? result.action}**\n- State: **${result.status}**\n- Percentage: **${result.percentage}%**\n`,
+      `\n## Microsoft Store package rollout\n\n- Submission: \`${result.submissionId}\`\n- Action: **${result.action}**\n- Decision: **${result.decision ?? result.action}**\n- State: **${result.status}**\n- Percentage: **${result.percentage == null ? 'not distributing' : `${result.percentage}%`}**\n`,
     );
   }
   return result;

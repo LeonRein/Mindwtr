@@ -1,6 +1,1 @@
-- Les tâches en attente montrent la personne assignée et Focus est plus clair.
-- Les répétitions mensuelles gèrent les jours positionnés et le saut d'une occurrence.
-- Le calendrier ajoute les filtres par Domaine et des lignes de temps plus précises.
-- Les widgets suivent la langue et le format 12/24 h.
-- Les Raccourcis peuvent ouvrir les listes enregistrées et lancer la capture audio dans Focus.
-- Filtres, sync, stockage et récupération protègent mieux les changements récents.
+Classez les projets Un jour en sections, déplacez les tâches avec Destination et choisissez les dates de début dans Aujourd’hui. La conservation des archives est désactivée par défaut. Le calendrier affiche échéances horaires et séries quotidiennes ou hebdomadaires. Les widgets montrent les contextes ; la saisie audio garde le focus. Ouvrez les liens UpNote. MCP est intégré sur ordinateur. Pièces jointes, calendrier et sync iCloud sont plus fiables.

@@ -78,6 +78,110 @@ struct LocalApiHandle {
     join: Option<JoinHandle<()>>,
 }
 
+impl Drop for LocalApiHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            // The accept loop is nonblocking; a rejected peer's response has a
+            // five-second write timeout. Never let optional-server cleanup
+            // prevent the desktop from exiting even if the loop panics/stalls.
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while !join.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalApiAccess {
+    allow_write: bool,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl LocalApiAccess {
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err("Local API server is stopped".to_string());
+        }
+        Ok(())
+    }
+
+    fn ensure_write(&self) -> Result<(), String> {
+        self.ensure_active()?;
+        if !self.allow_write {
+            return Err("Local API is read-only".to_string());
+        }
+        Ok(())
+    }
+
+    fn lock_write<'a>(
+        &self,
+        write_lock: &'a Mutex<()>,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+        let guard = lock_recovering(write_lock);
+        // A request may have queued before stop/rotation. Re-check after it
+        // acquires the shared mutation lock, immediately before storage.
+        self.ensure_write()?;
+        Ok(guard)
+    }
+}
+
+/// An ephemeral, separately authenticated bridge for the managed helper. It
+/// never reads or changes the external Local API's configuration or token.
+pub(crate) struct PrivateMcpApiBridge {
+    handle: LocalApiHandle,
+    token: String,
+}
+
+impl PrivateMcpApiBridge {
+    pub(crate) fn url(&self) -> String {
+        format!("http://{LOCAL_API_HOST}:{}", self.handle.port)
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifetime_fixture() -> Self {
+        // Exercise production bridge/handle Drop with a real listener without
+        // constructing a Wry AppHandle. Handler policy has separate tests.
+        let listener = TcpListener::bind((LOCAL_API_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signal = shutdown.clone();
+        let join = thread::spawn(move || {
+            while !signal.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(listener);
+        });
+        Self {
+            handle: LocalApiHandle {
+                port,
+                shutdown,
+                join: Some(join),
+            },
+            token: generate_local_api_token(),
+        }
+    }
+}
+
+pub(crate) fn start_private_mcp_api_bridge(
+    app: tauri::AppHandle,
+    state: &LocalApiServerState,
+    allow_write: bool,
+) -> Result<PrivateMcpApiBridge, String> {
+    let token = generate_local_api_token();
+    let handle =
+        start_runtime_with_access(app, 0, token.clone(), state.write_lock.clone(), allow_write)?;
+    Ok(PrivateMcpApiBridge { handle, token })
+}
+
 #[derive(Default)]
 struct LocalApiRuntime {
     handle: Option<LocalApiHandle>,
@@ -250,14 +354,7 @@ fn status_from_runtime(config: LocalApiConfig, runtime: &LocalApiRuntime) -> Loc
 }
 
 fn stop_runtime(runtime: &mut LocalApiRuntime) {
-    let Some(mut handle) = runtime.handle.take() else {
-        return;
-    };
-    handle.shutdown.store(true, Ordering::SeqCst);
-    let _ = TcpStream::connect((LOCAL_API_HOST, handle.port));
-    if let Some(join) = handle.join.take() {
-        let _ = join.join();
-    }
+    drop(runtime.handle.take());
 }
 
 fn start_runtime(
@@ -266,15 +363,33 @@ fn start_runtime(
     token: String,
     write_lock: Arc<Mutex<()>>,
 ) -> Result<LocalApiHandle, String> {
+    start_runtime_with_access(app, port, token, write_lock, true)
+}
+
+fn start_runtime_with_access(
+    app: tauri::AppHandle,
+    port: u16,
+    token: String,
+    write_lock: Arc<Mutex<()>>,
+    allow_write: bool,
+) -> Result<LocalApiHandle, String> {
     ensure_data_file(&app)?;
     let listener = TcpListener::bind((LOCAL_API_HOST, port))
         .map_err(|error| format!("Failed to start local API server on port {port}: {error}"))?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("Failed to configure local API server: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "Failed to locate local API listener".to_string())?
+        .port();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = shutdown.clone();
+    let access = LocalApiAccess {
+        allow_write,
+        shutdown: shutdown.clone(),
+    };
     let active_connections = Arc::new(AtomicUsize::new(0));
     let join = thread::spawn(move || {
         while !thread_shutdown.load(Ordering::SeqCst) {
@@ -287,9 +402,10 @@ fn start_runtime(
                     let token = token.clone();
                     let write_lock = write_lock.clone();
                     let active_connections = active_connections.clone();
+                    let access = access.clone();
                     thread::spawn(move || {
                         let _slot_guard = ConnectionSlotGuard(active_connections);
-                        handle_connection(app, token, write_lock, stream);
+                        handle_connection(app, token, write_lock, access, stream);
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -457,12 +573,13 @@ fn handle_connection(
     app: tauri::AppHandle,
     token: String,
     write_lock: Arc<Mutex<()>>,
+    access: LocalApiAccess,
     mut stream: TcpStream,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let response = match read_request(&mut stream, deadline) {
-        Ok(Some(request)) => handle_api_request(&app, &token, &write_lock, request),
+        Ok(Some(request)) => handle_api_request(&app, &token, &write_lock, &access, request),
         Ok(None) => return,
         Err(error) => ApiResponse::error(400, error),
     };
@@ -596,6 +713,7 @@ fn http_response(response: &ApiResponse) -> String {
         201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -617,19 +735,39 @@ fn handle_api_request(
     app: &tauri::AppHandle,
     token: &str,
     write_lock: &Arc<Mutex<()>>,
+    access: &LocalApiAccess,
     request: ApiRequest,
 ) -> ApiResponse {
-    if request.method == "OPTIONS" {
-        return ApiResponse::ok(json!({ "ok": true }));
-    }
-    if !is_request_authorized(&request, token) {
-        return ApiResponse::error(401, "Unauthorized");
+    if let Some(response) = authorize_api_request(&request, token, access) {
+        return response;
     }
 
-    match route_api_request(app, write_lock, request) {
+    match route_api_request(app, write_lock, access, request) {
         Ok(response) => response,
         Err(error) => api_error_response(error),
     }
+}
+
+fn authorize_api_request(
+    request: &ApiRequest,
+    token: &str,
+    access: &LocalApiAccess,
+) -> Option<ApiResponse> {
+    if let Err(error) = access.ensure_active() {
+        return Some(api_error_response(error));
+    }
+    if request.method == "OPTIONS" {
+        return Some(ApiResponse::ok(json!({ "ok": true })));
+    }
+    if !is_request_authorized(&request, token) {
+        return Some(ApiResponse::error(401, "Unauthorized"));
+    }
+    if request.method != "GET" {
+        if let Err(error) = access.ensure_write() {
+            return Some(api_error_response(error));
+        }
+    }
+    None
 }
 
 // Constant-time over fixed-length digests rather than the raw header value:
@@ -662,6 +800,12 @@ fn is_request_authorized(request: &ApiRequest, token: &str) -> bool {
 fn api_error_response(error: String) -> ApiResponse {
     if matches!(
         error.as_str(),
+        "Local API is read-only" | "Local API server is stopped"
+    ) {
+        return ApiResponse::error(403, error);
+    }
+    if matches!(
+        error.as_str(),
         "Task not found" | "Project not found" | "Area not found"
     ) {
         return ApiResponse::error(404, error);
@@ -683,6 +827,7 @@ fn api_error_response(error: String) -> ApiResponse {
 fn route_api_request(
     app: &tauri::AppHandle,
     write_lock: &Arc<Mutex<()>>,
+    access: &LocalApiAccess,
     request: ApiRequest,
 ) -> Result<ApiResponse, String> {
     let segments = path_segments(&request.path);
@@ -707,7 +852,7 @@ fn route_api_request(
     }
 
     if request.method == "POST" && request.path == "/projects" {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let body = parse_body_object(&request.body)?;
         let target_area_id = body
             .get("props")
@@ -754,7 +899,7 @@ fn route_api_request(
         && segments[2] == "restore"
         && request.method == "POST";
     if delete_project || restore_project {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let scope = ProjectMutationReadScope::lifecycle(&segments[1]);
         let (changed, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
             let rows = apply_project_delete_or_restore(data, &segments[1], restore_project)?;
@@ -773,7 +918,7 @@ fn route_api_request(
     }
 
     if segments.len() == 2 && segments[0] == "projects" && request.method == "PATCH" {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let body = parse_body_object(&request.body)?;
         let scope = ProjectMutationReadScope::patch(
             &segments[1],
@@ -822,7 +967,7 @@ fn route_api_request(
     }
 
     if request.method == "POST" && request.path == "/tasks" {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let body = parse_body_object(&request.body)?;
         let props = body.get("props").and_then(Value::as_object);
         let scope = TaskMutationReadScope::create(
@@ -867,7 +1012,7 @@ fn route_api_request(
     }
 
     if segments.len() == 2 && segments[0] == "tasks" && request.method == "PATCH" {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let body = parse_body_object(&request.body)?;
         let is_triage = body.contains_key("status");
         let scope = TaskMutationReadScope::patch(
@@ -891,7 +1036,7 @@ fn route_api_request(
     }
 
     if segments.len() == 2 && segments[0] == "tasks" && request.method == "DELETE" {
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let scope = TaskMutationReadScope::existing(&segments[1], false);
         mutate_task_rows_with_retries(app, scope, |data| {
             let device_id = device_id_from_data(data);
@@ -912,7 +1057,7 @@ fn route_api_request(
         if !matches!(action, "complete" | "archive" | "restore") {
             return Ok(ApiResponse::error(404, "Not found"));
         }
-        let _guard = lock_recovering(write_lock);
+        let _guard = access.lock_write(write_lock)?;
         let scope = TaskMutationReadScope::existing(&segments[1], action == "restore");
         let mutation = mutate_task_rows_with_retries(app, scope, |data| {
             if action == "complete" && recurrence_completion_refusal(data, &segments[1]).is_some() {
@@ -4531,6 +4676,78 @@ fn hex_value(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_mcp_bridge_auth_and_read_only_block_mutations_before_storage() {
+        let access = LocalApiAccess {
+            allow_write: false,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let mut request = ApiRequest {
+            method: "GET".to_string(),
+            path: "/tasks".to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            authorize_api_request(&request, "private-token", &access)
+                .unwrap()
+                .status,
+            401
+        );
+        request
+            .headers
+            .insert("authorization".into(), "Bearer private-token".into());
+        assert!(authorize_api_request(&request, "private-token", &access).is_none());
+        for method in ["POST", "PATCH", "DELETE", "PUT"] {
+            request.method = method.to_string();
+            assert_eq!(
+                authorize_api_request(&request, "private-token", &access)
+                    .unwrap()
+                    .status,
+                403
+            );
+        }
+        // The public Local API token is deliberately unrelated.
+        request.method = "GET".into();
+        assert_eq!(
+            authorize_api_request(&request, "external-token", &access)
+                .unwrap()
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn private_mcp_bridge_revokes_a_write_waiting_for_the_shared_lock() {
+        let write_lock = Arc::new(Mutex::new(()));
+        let access = LocalApiAccess {
+            allow_write: true,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let guard = lock_recovering(&write_lock);
+        let writer_lock = write_lock.clone();
+        let writer_access = access.clone();
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            assert!(writer_access.ensure_write().is_ok());
+            ready.send(()).unwrap();
+            let result = writer_access.lock_write(&writer_lock).map(|_| ());
+            result
+        });
+        waiting.recv().unwrap();
+        access.shutdown.store(true, Ordering::SeqCst);
+        drop(guard);
+        assert_eq!(
+            writer.join().unwrap(),
+            Err("Local API server is stopped".into())
+        );
+        assert_eq!(
+            api_error_response(access.ensure_write().unwrap_err()).status,
+            403
+        );
+    }
 
     /// Every write route serializes on the same `Mutex<()>`, and requests run on their own
     /// threads. One panic in a handler used to poison it for the life of the process: reads

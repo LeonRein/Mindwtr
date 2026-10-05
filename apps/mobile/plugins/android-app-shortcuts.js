@@ -16,6 +16,7 @@ const VOICE_CATEGORY = 'android.intent.category.VOICE';
 // The native quick-capture dialog (modules/android-widget, #1169): saves to the
 // Inbox queue and closes without bringing the app forward.
 const QUICK_CAPTURE_ACTIVITY = 'tech.dongdongbh.mindwtr.androidwidget.QuickCaptureActivity';
+const DETAILED_CAPTURE_ACTIVITY = 'tech.dongdongbh.mindwtr.androidwidget.DetailedCaptureActivity';
 
 const buildShortcutsXml = (packageName) => `<?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
@@ -132,6 +133,18 @@ const buildShortcutsXml = (packageName) => `<?xml version="1.0" encoding="utf-8"
   <shortcut
     android:enabled="true"
     android:icon="@mipmap/ic_launcher"
+    android:shortcutId="add_task_details"
+    android:shortcutLongLabel="@string/shortcut_add_task_details_long"
+    android:shortcutShortLabel="@string/shortcut_add_task_details_short">
+    <intent
+      android:action="android.intent.action.VIEW"
+      android:data="mindwtr:///capture-quick?mode=text&amp;entry=details"
+      android:targetPackage="${packageName}"
+      android:targetClass="${DETAILED_CAPTURE_ACTIVITY}" />
+  </shortcut>
+  <shortcut
+    android:enabled="true"
+    android:icon="@mipmap/ic_launcher"
     android:shortcutId="open_focus"
     android:shortcutLongLabel="@string/shortcut_open_focus_long"
     android:shortcutShortLabel="@string/shortcut_open_focus_short">
@@ -154,8 +167,10 @@ const buildShortcutsXml = (packageName) => `<?xml version="1.0" encoding="utf-8"
 
 const SHORTCUTS_STRINGS_XML = `<?xml version="1.0" encoding="utf-8"?>
 <resources>
-  <string name="shortcut_add_task_long" translatable="false">Add task to Inbox</string>
-  <string name="shortcut_add_task_short" translatable="false">Add task</string>
+  <string name="shortcut_add_task_long" translatable="false">Quick capture to Inbox</string>
+  <string name="shortcut_add_task_short" translatable="false">Capture</string>
+  <string name="shortcut_add_task_details_long" translatable="false">Add task with details</string>
+  <string name="shortcut_add_task_details_short" translatable="false">Add task…</string>
   <string name="shortcut_open_focus_long" translatable="false">Open Focus view</string>
   <string name="shortcut_open_focus_short" translatable="false">Focus</string>
   <string name="shortcut_open_calendar_long" translatable="false">Open Calendar view</string>
@@ -318,6 +333,22 @@ const ensureManifestAppActions = (androidManifest) => {
   }
 
   ensureMainActivityAppActions(mainActivity);
+  let detailedCaptureActivity = application.activity.find((activity) =>
+    activity?.$?.['android:name'] === DETAILED_CAPTURE_ACTIVITY
+  );
+  if (!detailedCaptureActivity) {
+    detailedCaptureActivity = { $: {} };
+    application.activity.push(detailedCaptureActivity);
+  }
+  // Static shortcuts clear their first intent's task; isolate that from MainActivity.
+  detailedCaptureActivity.$ = {
+    'android:name': DETAILED_CAPTURE_ACTIVITY,
+    'android:exported': 'false',
+    'android:theme': '@android:style/Theme.NoDisplay',
+    'android:excludeFromRecents': 'true',
+    'android:noHistory': 'true',
+    'android:taskAffinity': '',
+  };
   return androidManifest;
 };
 

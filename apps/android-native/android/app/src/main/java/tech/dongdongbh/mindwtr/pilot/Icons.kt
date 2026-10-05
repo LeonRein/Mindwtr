@@ -132,9 +132,6 @@ object Lucide {
     val ExternalLink = lucide("ExternalLink", "M15 3h6v6", "M10 14 21 3", "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6", stroke = 2.2f)
     /** RN's START_LATER_ICON. */
     val Clock3 = lucide("Clock3", "M12 6v6h4", circle(12, 12, 10))
-    /** RN's INCUBATE_ICON. */
-    val Sprout = lucide("Sprout", "M14 9.536V7a4 4 0 0 1 4-4h1.5a.5.5 0 0 1 .5.5V5a4 4 0 0 1-4 4 4 4 0 0 0-4 4c0 2 1 3 1 5a5 5 0 0 1-1 3",
-        "M4 9a5 5 0 0 1 8 4 5 5 0 0 1-8-4", "M5 21h14")
     /** RN's add-project button draws Plus at stroke 2.4. */
     val PlusMedium = lucide("PlusMedium", "M5 12h14", "M12 5v14", stroke = 2.4f)
     // The Menu tab's screens (views/waiting-view.tsx, views/someday-view.tsx, list-overflow-menu.tsx, archived.tsx).

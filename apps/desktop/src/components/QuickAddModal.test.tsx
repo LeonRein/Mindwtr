@@ -995,6 +995,43 @@ describe('QuickAddModal', () => {
         ))).toBe(false);
     });
 
+    it('keeps audio keyboard focus through startup so Enter can stop recording', async () => {
+        const starting = createDeferred();
+        const stopping = createDeferred();
+        (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+        tauriMocks.invoke.mockImplementation(async (command?: string) => {
+            if (command === 'start_audio_recording') return starting.promise;
+            if (command === 'stop_audio_recording') return stopping.promise;
+            return false;
+        });
+        act(() => useTaskStore.setState((state) => ({
+            settings: { ...state.settings, ai: { ...state.settings.ai, speechToText: {
+                enabled: true, provider: 'whisper', offlineModelPath: '/models/whisper.bin',
+            } } },
+        })));
+        renderQuickAddModal();
+        await act(async () => {
+            window.dispatchEvent(new CustomEvent('mindwtr:quick-add', { detail: { captureMode: 'audio' } }));
+        });
+        const recorder = screen.getByRole('button', { name: 'Start recording' });
+        expect(recorder).toHaveFocus();
+        await userEvent.keyboard('{Enter}');
+        await waitFor(() => expect(tauriMocks.invoke).toHaveBeenCalledWith('start_audio_recording'));
+        // Native disabled buttons lose browser focus; busy controls must retain it.
+        expect(recorder).not.toBeDisabled();
+        expect(recorder).toHaveAttribute('aria-disabled', 'true');
+        await userEvent.keyboard('{Enter}');
+        expect(tauriMocks.invoke.mock.calls.filter(([name]) => name === 'start_audio_recording')).toHaveLength(1);
+        await act(async () => { starting.resolve(); });
+        expect(screen.getByRole('button', { name: 'Stop recording' })).toHaveFocus();
+        await userEvent.keyboard('{Enter}');
+        await waitFor(() => expect(tauriMocks.invoke).toHaveBeenCalledWith('stop_audio_recording'));
+        await userEvent.keyboard('{Enter}');
+        expect(tauriMocks.invoke.mock.calls.filter(([name]) => name === 'stop_audio_recording')).toHaveLength(1);
+        // Settle the native operation with an empty capture after checking keyboard behavior.
+        await act(async () => { stopping.resolve(undefined); });
+    });
+
     it('serializes deferred start A cleanup before recording in reopened capture B', async () => {
         const startA = createDeferred();
         const calls: string[] = [];

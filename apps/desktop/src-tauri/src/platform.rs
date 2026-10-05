@@ -973,6 +973,7 @@ pub(crate) fn migrate_portable_attachments(
     Ok(result)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn link_folder_bookmark_for(raw: Option<&str>, attachment_id: &str) -> Option<String> {
     let map = serde_json::from_str::<Map<String, Value>>(raw?).ok()?;
     map.get(attachment_id)?.as_str().map(str::to_string)
@@ -980,6 +981,7 @@ fn link_folder_bookmark_for(raw: Option<&str>, attachment_id: &str) -> Option<St
 
 // An unreadable map is replaced: it only caches access the user can grant
 // again by re-linking the folder.
+#[cfg(any(target_os = "macos", test))]
 fn with_link_folder_bookmark(raw: Option<&str>, attachment_id: &str, bookmark: String) -> String {
     let mut map = raw
         .and_then(|raw| serde_json::from_str::<Map<String, Value>>(raw).ok())

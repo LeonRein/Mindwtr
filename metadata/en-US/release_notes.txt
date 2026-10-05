@@ -1,6 +1,1 @@
-- Waiting tasks show assigned people, and Focus planning is clearer.
-- Monthly repeats support positioned weekdays and skipping one fixed occurrence.
-- Calendar views gain Area filters and more accurate time lines.
-- Widgets follow your language and 12/24-hour setting.
-- Shortcuts can open saved lists and start Focus audio capture.
-- Saved filters, sync, storage, and recovery preserve newer edits more reliably.
+Organize Someday projects in sections, move selected tasks with Destination, and choose whether Today includes start dates. Optional archive retention defaults to Never. Calendar shows timed deadlines and daily/weekly repeats. Widgets show task contexts; audio capture keeps keyboard focus. Open UpNote links. Desktop adds built-in MCP access. Attachment saves, calendar recovery and iCloud sync are more reliable.

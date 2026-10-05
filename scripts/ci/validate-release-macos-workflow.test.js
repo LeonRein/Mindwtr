@@ -9,6 +9,14 @@ const loadSteps = () => {
   return workflow.jobs.macos.steps;
 };
 
+test("Intel macOS release builds and helper smoke checks run on Intel hardware", () => {
+  const workflow = parse(readFileSync(WORKFLOW_PATH, "utf8"));
+  const intel = workflow.jobs.macos.strategy.matrix.include.find(
+    (entry) => entry.rust_target === "x86_64-apple-darwin",
+  );
+  expect(intel.platform).toBe("macos-15-intel");
+});
+
 // Strips shell comment lines so assertions check actual invocations, not
 // prose explaining why a command is deliberately absent (e.g. a comment
 // that mentions `tauri bundle` while explaining that it must not run).

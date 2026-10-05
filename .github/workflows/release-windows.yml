@@ -229,17 +229,21 @@ jobs:
           GGML_F16C: "OFF"
           GGML_BMI2: "OFF"
 
+      - name: Smoke test standalone MCP helper without a JS runtime on PATH
+        shell: pwsh
+        run: node scripts/build-mcp-sidecar-smoke.mjs apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-pc-windows-msvc.exe
+
       # Authenticode signing via SignPath Foundation (#965). Runs only after
       # SIGNPATH_SIGNING_ENABLED is explicitly set to true and the SignPath
       # secrets are present. Until the project certificate is active, official
       # builds continue through the existing unsigned release path.
       #
-      # Two rounds, and the order matters. Round 1 signs the app exe BEFORE the
-      # installer is bundled, so the copy the installer extracts to Program
+      # App and MCP helper are signed BEFORE the installer is bundled,
+      # so the copy the installer extracts to Program
       # Files carries a signature; it also feeds the portable ZIP and the MSIX
       # layout. Round 2 signs the installer wrapper itself, which only exists
-      # after bundling. Each round is a separate SignPath submission, so
-      # release-signing asks for two approvals per release.
+      # after bundling. The app, helper, and installer are separate SignPath
+      # submissions and need three approvals under release-signing.
       - name: Stage unsigned app binary for signing
         id: stage-unsigned-exe
         if: ${{ vars.SIGNPATH_SIGNING_ENABLED == 'true' && github.repository == 'dongdongbh/Mindwtr' && env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != '' && (startsWith(github.ref, 'refs/tags/') || inputs.tag != '' || github.event.inputs.tag != '') }}
@@ -291,6 +295,57 @@ jobs:
             throw "Signature status $($sig.Status) on $exePath"
           }
           Write-Host "$exePath signed by $($sig.SignerCertificate.Subject) ($($sig.Status))"
+
+      # Reuse the existing single-PE SignPath configuration. The transport
+      # filename is mindwtr.exe; restore the helper filename after signing.
+      - name: Stage unsigned MCP helper for signing
+        if: ${{ steps.stage-unsigned-exe.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path signing-unsigned-mcp | Out-Null
+          Copy-Item "apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-pc-windows-msvc.exe" "signing-unsigned-mcp/mindwtr.exe"
+
+      - name: Upload unsigned MCP helper
+        id: upload-unsigned-mcp
+        if: ${{ steps.stage-unsigned-exe.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-unsigned-mcp
+          path: signing-unsigned-mcp/mindwtr.exe
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Submit SignPath signing request for MCP helper
+        if: ${{ steps.stage-unsigned-exe.outcome == 'success' }}
+        uses: SignPath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Mindwtr
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY || 'release-signing' }}
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.upload-unsigned-mcp.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: "1800"
+          output-artifact-directory: signing-signed-mcp
+
+      - name: Apply and verify signed MCP helper
+        if: ${{ steps.stage-unsigned-exe.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $helper = "apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-pc-windows-msvc.exe"
+          Copy-Item "signing-signed-mcp/mindwtr.exe" $helper -Force
+          $sig = Get-AuthenticodeSignature $helper
+          if ($null -eq $sig.SignerCertificate) { throw "MCP helper is unsigned" }
+          if ("${{ vars.SIGNPATH_SIGNING_POLICY || 'release-signing' }}" -eq 'release-signing' -and $sig.Status -ne 'Valid') {
+            throw "MCP helper signature status $($sig.Status)"
+          }
+          Copy-Item $helper "apps/desktop/src-tauri/target/release/mindwtr-mcp.exe" -Force
+
+      - name: Stage MCP helper alongside application binary
+        shell: pwsh
+        run: |
+          Copy-Item "apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-pc-windows-msvc.exe" "apps/desktop/src-tauri/target/release/mindwtr-mcp.exe" -Force
 
       - name: Bundle installer
         timeout-minutes: 20
@@ -408,6 +463,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$portableDir\profile\data" | Out-Null
 
           Copy-Item "$buildDir/mindwtr.exe" -Destination "$portableDir\mindwtr.exe"
+          Copy-Item "apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-pc-windows-msvc.exe" -Destination "$portableDir\mindwtr-mcp.exe"
           if (Test-Path "$buildDir/WebView2Loader.dll") {
             Copy-Item "$buildDir/WebView2Loader.dll" -Destination "$portableDir"
           }

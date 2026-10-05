@@ -97,7 +97,7 @@
     "test": "bun run --filter @mindwtr/core test && bun run --filter mindwtr test && bun run --filter mobile test && bun run --filter mindwtr-cloud test && bun run --filter mindwtr-mcp test",
     "verify": "bun run typecheck && bun run lint:all && bun run test && bun run native:test && bun run test:governance && bun run i18n:check && bun run schema:check && bun run docs:check-readme",
     "test:perf": "bun run --filter @mindwtr/core test:perf && MINDWTR_PERF_TEST=1 bun --cwd apps/desktop test src/components/views/ListView.performance.test.tsx src/components/views/TimelineView.performance.test.tsx && MINDWTR_PERF_TEST=1 bun --cwd apps/mobile test tests/large-store-performance.test.tsx",
-    "test:governance": "python3 scripts/ci/google-play-edit.test.py && python3 scripts/ci/android-play-release-plan.test.py && bun test scripts/ci scripts/migration scripts/*.test.ts",
+    "test:governance": "python3 scripts/ci/google-play-edit.test.py && python3 scripts/ci/android-play-release-plan.test.py && bun test scripts/ci scripts/migration scripts/*.test.ts scripts/build-mcp-sidecar.test.mjs",
     "lint:core": "bun run --filter @mindwtr/core lint",
     "lint:cloud": "bun run --filter mindwtr-cloud lint",
     "lint:node": "bun run lint:core && bun run lint:cloud",
@@ -112,7 +112,7 @@
     "typecheck:mobile": "bunx tsc --noEmit -p apps/mobile/tsconfig.json",
     "typecheck:mcp": "bun run --filter mindwtr-mcp typecheck",
     "schema:check": "bun run scripts/check-synced-field-parity.ts",
-    "native:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "native:test": "bun scripts/build-mcp-sidecar.mjs && cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
     "mobile:start": "bun run --filter mobile start",
     "mobile:android": "bun run --filter mobile android",
     "mobile:ios": "bun run --filter mobile ios",
@@ -204,7 +204,7 @@
     "webidl-conversions": "^8.0.0",
     "whatwg-url-without-unicode": "^8.0.0-3"
   },
-  "version": "1.3.3",
+  "version": "1.3.4",
   "op-sqlite": {
     "fts5": true
   },

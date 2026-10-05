@@ -17,6 +17,8 @@ modules:
         if requested_spec.startswith(("file:", "workspace:", "git+", "github:", "http:", "https:", "link:", "npm:")):
             continue
         locked = packages.get(f"node_modules/{dependency_name}")
+      - cargo --offline build --manifest-path apps/desktop/src-tauri/Cargo.toml --bins --features tauri/custom-protocol --release
+      - install -Dm755 apps/desktop/src-tauri/target/release/mindwtr /app/bin/mindwtr
     sources:
       - type: patch
         path: appstream-homepage.patch

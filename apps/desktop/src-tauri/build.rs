@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rustc-env=MINDWTR_TARGET_TRIPLE={}", std::env::var("TARGET").expect("Cargo TARGET"));
     #[cfg(target_os = "macos")]
     {
         cc::Build::new()

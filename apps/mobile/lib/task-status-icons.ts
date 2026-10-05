@@ -7,7 +7,7 @@ import {
     Clock3,
     Inbox,
     PauseCircle,
-    Sprout,
+    CalendarClock,
     type LucideIcon,
 } from 'lucide-react-native';
 import type { TaskStatus } from '@mindwtr/core';
@@ -37,5 +37,5 @@ export const TASK_STATUS_ICONS: Record<TaskStatus, LucideIcon> = {
 /** "Start later" sets a start time. */
 export const START_LATER_ICON: LucideIcon = Clock3;
 
-/** Incubate is Someday with a review date: something planted to come back to. */
-export const INCUBATE_ICON: LucideIcon = Sprout;
+/** Incubate is Someday with a review date: choose when to reconsider it. */
+export const INCUBATE_ICON: LucideIcon = CalendarClock;

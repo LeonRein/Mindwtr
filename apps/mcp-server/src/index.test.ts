@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ZodTypeAny } from 'zod';
 
 import { NotFoundError } from './errors.js';
-import { addTaskSchema, logError, parseArgs, parseBooleanFlag, registerMindwtrTools, resolveServerConfig, resolveServerModeFlags, updateTaskSchema } from './index.js';
+import { addTaskSchema, logError, parseArgs, parseBooleanFlag, registerMindwtrTools, resolveManagedServerConfig, resolveServerConfig, resolveServerModeFlags, updateTaskSchema } from './index.js';
 import { MAX_TASK_LIST_LIMIT } from './input-validation.js';
 import type { Area, Person, Project, Section, Task } from './queries.js';
 import type { MindwtrService } from './service.js';
@@ -711,5 +711,32 @@ describe('link attachment tool inputs', () => {
     expect(updateTaskSchema.safeParse({ id: 't', attachments: [{ title: 'Note', uri: 'https://example.com/a' }] }).success).toBe(true);
     expect(updateTaskSchema.safeParse({ id: 't', attachments: null }).success).toBe(true);
     expect(updateTaskSchema.safeParse({ id: 't', attachments: [{ kind: 'file', uri: 'x' }] }).success).toBe(false);
+  });
+});
+
+
+describe('app-managed MCP configuration', () => {
+  const env = {
+    MINDWTR_MCP_API_URL: 'http://127.0.0.1:34567',
+    MINDWTR_MCP_API_TOKEN: 'internal-test-token',
+    MINDWTR_MCP_HTTP_TOKEN: 'external-test-token-with-sufficient-length',
+  };
+  test('locks transport and backend while ignoring ambient standalone settings', () => {
+    const config = resolveManagedServerConfig({ ...env,
+      MINDWTR_MCP_CLOUD_URL: 'https://example.com', MINDWTR_MCP_CLOUD_TOKEN: 'ambient',
+      MINDWTR_MCP_DB: '/nonexistent.db', MINDWTR_MCP_HTTP_HOST: '0.0.0.0',
+    });
+    expect(config.backend).toBe('api');
+    expect(config.readonly).toBe(true);
+    expect(config.http?.host).toBe('127.0.0.1');
+    expect(config.http?.port).toBe(8722);
+  });
+  test('requires explicit write opt-in and rejects malformed configuration', () => {
+    expect(resolveManagedServerConfig({ ...env, MINDWTR_MCP_ALLOW_WRITE: 'true' }).readonly).toBe(false);
+    expect(resolveManagedServerConfig({ ...env, MINDWTR_MCP_ALLOW_WRITE: 'false' }).readonly).toBe(true);
+    for (const field of ['MINDWTR_MCP_API_URL', 'MINDWTR_MCP_API_TOKEN', 'MINDWTR_MCP_HTTP_TOKEN']) {
+      expect(() => resolveManagedServerConfig({ ...env, [field]: '' })).toThrow();
+    }
+    expect(() => resolveManagedServerConfig({ ...env, MINDWTR_MCP_ALLOW_WRITE: 'maybe' })).toThrow();
   });
 });

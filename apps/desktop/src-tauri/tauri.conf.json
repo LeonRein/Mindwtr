@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Mindwtr",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "identifier": "tech.dongdongbh.mindwtr",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "bun run dev:vite",
-    "beforeBuildCommand": "bun run build:vite"
+    "beforeDevCommand": "bun run dev:native",
+    "beforeBuildCommand": "bun run build:native"
   },
   "app": {
     "windows": [
@@ -31,6 +31,9 @@
   "bundle": {
     "active": true,
     "homepage": "https://mindwtr.app",
+    "externalBin": [
+      "binaries/mindwtr-mcp"
+    ],
     "linux": {
       "deb": {
         "files": {

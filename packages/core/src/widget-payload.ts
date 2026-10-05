@@ -74,10 +74,11 @@ export interface WidgetTaskItem {
     identityColor: string | null;
     // How the due label should read: overdue (warning), today (accent), normal.
     dueTone: WidgetDueTone;
+    // Existing task contexts, also shown in iOS widget rows. Omitted when empty.
+    contexts?: string[];
     // The rest is only read by the Android task sheet (#1173), so every field
     // is left out when it is empty: they ride every row of every list.
     description?: string;
-    contexts?: string[];
     tags?: string[];
     startLabel?: string;
     priorityLabel?: string;

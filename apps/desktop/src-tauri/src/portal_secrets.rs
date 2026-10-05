@@ -145,7 +145,7 @@ async fn execute(
                 return Err("Encrypted credential verification failed".to_owned());
             }
             log::info!(
-                "Portal credential write verified extra.releaseCheck=v1.3.3/flatpak-secret-portal"
+                "Portal credential write verified"
             );
             Ok(None)
         }

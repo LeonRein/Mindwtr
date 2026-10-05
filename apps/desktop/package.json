@@ -2,7 +2,7 @@
   "name": "mindwtr",
   "license": "AGPL-3.0-only",
   "private": true,
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "A complete Getting Things Done (GTD) productivity system for desktop - Mind Like Water",
   "author": {
     "name": "dongdongbh",
@@ -17,8 +17,11 @@
   "scripts": {
     "dev": "bunx tauri dev",
     "dev:vite": "vite",
+    "dev:native": "bun run build:mcp && bun run dev:vite",
     "build": "bunx tauri build",
     "build:vite": "tsc && vite build",
+    "build:mcp": "bun ../../scripts/build-mcp-sidecar.mjs",
+    "build:native": "bun run build:mcp && bun run build:vite",
     "lint": "../../node_modules/.bin/eslint . --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
     "test": "vitest run",

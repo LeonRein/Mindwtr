@@ -69,7 +69,10 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           path: release-source
-          sparse-checkout: apps/desktop/src-tauri/icons
+          sparse-checkout: |
+            apps/desktop/src-tauri/icons
+            apps/desktop/src-tauri/tauri.conf.json
+          sparse-checkout-cone-mode: false
 
       - name: Build MSIX from the existing binary
         shell: pwsh
@@ -77,12 +80,18 @@ jobs:
           MSIX_VERSION: ${{ steps.release.outputs.msix_version }}
           MSIX_FILE_NAME: ${{ steps.release.outputs.file_name }}
         run: |
+          $releaseConfig = Get-Content -Raw release-source/apps/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json
+          $legacyWithoutHelper = @($releaseConfig.bundle.externalBin) -notcontains 'binaries/mindwtr-mcp'
           ./scripts/ci/build-msstore-package.ps1 `
             -BinaryDirectory released-binary `
             -IconDirectory release-source/apps/desktop/src-tauri/icons `
-            -MsixVersion $env:MSIX_VERSION -OutputPath $env:MSIX_FILE_NAME
+            -MsixVersion $env:MSIX_VERSION -OutputPath $env:MSIX_FILE_NAME `
+            -AllowMissingMcpHelper:$legacyWithoutHelper
           $original = (Get-FileHash released-binary/mindwtr.exe).Hash
           if ((Get-FileHash msix-staging/mindwtr.exe).Hash -ne $original) { throw 'Store binary differs from the released binary' }
+          if (Test-Path released-binary/mindwtr-mcp.exe) {
+            if ((Get-FileHash msix-staging/mindwtr-mcp.exe).Hash -ne (Get-FileHash released-binary/mindwtr-mcp.exe).Hash) { throw 'Store MCP helper differs from the released helper' }
+          }
           $zipPath = Join-Path $env:RUNNER_TEMP 'msstore-flight.zip'
           Compress-Archive -Path $env:MSIX_FILE_NAME -DestinationPath $zipPath
           "MSIX version: $env:MSIX_VERSION. The executable is unchanged from the published release." >> $env:GITHUB_STEP_SUMMARY

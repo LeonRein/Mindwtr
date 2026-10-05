@@ -113,6 +113,7 @@ Versioned notes for desktop/mobile/core/cloud releases live in this folder.
 - [v1.3.1](./1.3.1.md)
 - [v1.3.2](./1.3.2.md)
 - [v1.3.3](./1.3.3.md)
+- [v1.3.4](./1.3.4.md)
 
 ## Store-Specific Notes
 

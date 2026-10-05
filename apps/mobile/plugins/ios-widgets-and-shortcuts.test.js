@@ -72,7 +72,6 @@ describe('ios-widgets-and-shortcuts', () => {
     expect(tasksSource).toContain('let sections: [MindwtrWidgetSection]?');
     expect(tasksSource).toContain('let lists: [String: MindwtrWidgetListPayload]?');
     expect(tasksSource).toContain('let listTitles: [String: String]?');
-    expect(tasksSource).toContain('let completionToken: String?');
     expect(tasksSource).toContain('let completeLabel: String?');
     expect(tasksSource).toContain('nonEmpty(completeLabel) ?? "Complete"');
     expect(tasksSource).toContain('pendingAction: pendingAction(for: item)');
@@ -186,7 +185,6 @@ describe('ios-widgets-and-shortcuts', () => {
     expect(compactSource).toContain('let sourceItems = focusItems(payload)');
     expect(compactSource).toContain('if sourceItems.isEmpty {');
     expect(compactSource).toContain('} else if !items.isEmpty {');
-    expect(compactSource).toContain('(available + metrics.rowSpacing) / (metrics.rowHeight + metrics.rowSpacing)');
   });
 
   it('copies the canonical action store and registers every new Swift source only in the widget target', () => {
@@ -201,6 +199,10 @@ describe('ios-widgets-and-shortcuts', () => {
           'utf8'
         )
       );
+      const taskItemSource = 'MindwtrWidgetTaskItem.swift';
+      expect(fs.readFileSync(path.join(temporaryRoot, taskItemSource), 'utf8')).toBe(
+        fs.readFileSync(path.join(mobileRoot, IOS_WIDGET_MODULE_FOLDER, taskItemSource), 'utf8')
+      );
 
       const calls = [];
       const xcodeProject = {
@@ -213,6 +215,7 @@ describe('ios-widgets-and-shortcuts', () => {
           'MindwtrTasksWidget.swift',
           'MindwtrTasksWidgetIntents.swift',
           SHARED_WIDGET_ACTION_STORE,
+          taskItemSource,
         ],
         groupKey: 'WIDGET_GROUP',
         targetUuid: 'WIDGET_TARGET',
@@ -222,11 +225,13 @@ describe('ios-widgets-and-shortcuts', () => {
         'MindwtrTasksWidget.swift',
         'MindwtrTasksWidgetIntents.swift',
         SHARED_WIDGET_ACTION_STORE,
+        taskItemSource,
       ]);
       expect(calls).toEqual([
         ['MindwtrTasksWidget.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
         ['MindwtrTasksWidgetIntents.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
         [SHARED_WIDGET_ACTION_STORE, { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
+        [taskItemSource, { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
       ]);
       expect(calls.some(([, options]) => options.target !== 'WIDGET_TARGET')).toBe(false);
     } finally {

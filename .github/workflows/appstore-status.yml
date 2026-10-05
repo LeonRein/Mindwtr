@@ -1,0 +1,62 @@
+name: App Store Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Marketing version to inspect (e.g. 1.3.4)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Read version and build states without changing App Store Connect
+        env:
+          VERSION: ${{ inputs.version }}
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/status-private-key.p8"
+          trap 'rm -f "$KEY_PATH"' EXIT
+          umask 077
+          bash scripts/ci/write-asc-private-key.sh "$IOS_ASC_PRIVATE_KEY" "$KEY_PATH"
+          ASC_JWT="$(node scripts/ci/generate-asc-jwt.js "${IOS_ASC_KEY_ID//[[:space:]]/}" "${IOS_ASC_ISSUER_ID//[[:space:]]/}" "$KEY_PATH")"
+          echo "::add-mask::$ASC_JWT"
+          export ASC_JWT
+          node --input-type=module <<'NODE'
+          const version = process.env.VERSION;
+          if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Expected a stable marketing version');
+          const get = async (path) => {
+            const response = await fetch(`https://api.appstoreconnect.apple.com/v1/${path}`, {
+              headers: { Authorization: `Bearer ${process.env.ASC_JWT}` },
+              signal: AbortSignal.timeout(30000),
+            });
+            if (!response.ok) throw new Error(`App Store Connect read failed: HTTP ${response.status}`);
+            return response.json();
+          };
+          const apps = await get('apps?filter[bundleId]=tech.dongdongbh.mindwtr');
+          if (apps.data?.length !== 1) throw new Error('Expected one production Mindwtr app');
+          const id = apps.data[0].id;
+          const versions = await get(`apps/${id}/appStoreVersions?limit=200&include=build`);
+          const selected = new Map((versions.included ?? []).map((build) => [build.id, build.attributes.version]));
+          console.log(JSON.stringify({ version, versions: versions.data.filter((item) => item.attributes.versionString === version).map((item) => ({
+            platform: item.attributes.platform, state: item.attributes.appStoreState,
+            selectedBuild: selected.get(item.relationships.build?.data?.id) ?? null,
+          })) }));
+          const builds = await get(`builds?filter[app]=${id}&sort=-uploadedDate&limit=50&include=preReleaseVersion`);
+          const marketing = new Map((builds.included ?? []).map((item) => [item.id, item.attributes]));
+          console.log(JSON.stringify({ version, builds: builds.data.filter((item) => marketing.get(item.relationships.preReleaseVersion?.data?.id)?.version === version).map((item) => ({
+            build: item.attributes.version, state: item.attributes.processingState, uploaded: item.attributes.uploadedDate,
+            platform: marketing.get(item.relationships.preReleaseVersion?.data?.id).platform,
+          })) }));
+          NODE

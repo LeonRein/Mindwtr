@@ -55,6 +55,19 @@ const captureParams = (delivered: Delivered) => {
     return call ? (call[1] as { params: Record<string, string> }).params : null;
 };
 
+describe('detailed capture shortcut routing', () => {
+    it.each([true, false])('distinguishes the new entry without changing existing system capture (initial=%s)', (initial) => {
+        expect(resolveSystemPath('mindwtr:///capture-quick?mode=text&entry=details', initial))
+            .toEqual({ kind: 'path', path: '/capture-quick?mode=text' });
+        expect(resolveSystemPath('mindwtr://capture-quick?mode=audio&entry=details&title=ignored', initial))
+            .toEqual({ kind: 'path', path: '/capture-quick?mode=text' });
+        expect(resolveSystemPath('mindwtr:///capture-quick?mode=text', initial))
+            .toEqual({ kind: 'quickCapture', path: '/capture-modal?origin=system' });
+        expect(resolveSystemPath('mindwtr:///capture-quick?entry=unknown', initial))
+            .toEqual({ kind: 'quickCapture', path: '/capture-modal?origin=system' });
+    });
+});
+
 describe('entry points: React Native parity', () => {
     it('parses every link as React Native did', () => {
         for (const entry of fixture.urls) {

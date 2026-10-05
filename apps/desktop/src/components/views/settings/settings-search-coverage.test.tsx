@@ -17,6 +17,7 @@ import { SettingsAiPage } from './SettingsAiPage';
 import { SettingsDataPage } from './SettingsDataPage';
 import { SettingsGtdPage } from './SettingsGtdPage';
 import { SettingsIntegrationsPage } from './SettingsIntegrationsPage';
+import { LanguageProvider } from '../../../contexts/language-context';
 import { SettingsMainPage } from './SettingsMainPage';
 import { SettingsManagePage } from './SettingsManagePage';
 import { SettingsNotificationsPage } from './SettingsNotificationsPage';
@@ -445,7 +446,7 @@ const PAGE_VARIANTS: Record<SettingsSearchPageId, ReactElement[]> = {
         <SettingsSyncPage key="dropbox" {...syncProps} syncBackend="cloud" cloudProvider="dropbox" />,
     ],
     data: [<SettingsDataPage key="data" {...dataProps} />],
-    integrations: [<SettingsIntegrationsPage key="integrations" {...integrationsProps} />],
+    integrations: [<LanguageProvider key="integrations"><SettingsIntegrationsPage {...integrationsProps} /></LanguageProvider>],
     ai: [
         <SettingsAiPage key="openai" {...aiProps} />,
         <SettingsAiPage key="anthropic" {...aiProps} aiProvider="anthropic" speechProvider="whisper" />,

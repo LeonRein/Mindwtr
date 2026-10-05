@@ -22,7 +22,7 @@ let package = Package(
                 "MindwtrIosWidget.podspec",
                 "MindwtrIosWidgetModule.swift",
             ],
-            sources: ["MindwtrWidgetActionStore.swift"]
+            sources: ["MindwtrWidgetActionStore.swift", "MindwtrWidgetTaskItem.swift"]
         ),
         .testTarget(
             name: "MindwtrWidgetActionStoreTests",

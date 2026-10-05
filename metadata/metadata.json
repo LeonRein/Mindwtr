@@ -30,7 +30,7 @@
           "列表、日历与看板视图，支持提醒与重复任务",
           "免费开源、无广告"
         ],
-        "ReleaseNotes": "• 等待中的任务会显示负责人，聚焦规划更清晰。\n• 每月重复支持指定第几个星期几，也可跳过单次计划。\n• 日历新增按领域筛选，时间线定位更准确。\n• 搜索和编辑导航更可靠。\n• 已存筛选、同步、存储与恢复能更好地保留较新的更改。",
+        "ReleaseNotes": "内置 MCP 连接 AI 客户端，默认只读。复制所选任务标题、关联文件夹并打开 UpNote 链接。“将来/也许”项目支持分区，“目标位置”批量移动任务。选择“今天”是否包含开始日期及可选归档保留期限。日历显示带时间的截止标记与每日、每周重复任务。全局录入快捷键在启动后保留；File Sync 附件上传和并发附件保存更安全。",
         "Images": [
           {
             "FileName": "2026-01-27_22-59-40.png",
@@ -82,7 +82,7 @@
           "List, calendar, and kanban views with reminders and repeating tasks",
           "Free and open source, no ads"
         ],
-        "ReleaseNotes": "• Waiting tasks show assigned people, and Focus planning is clearer.\n• Monthly repeats support positioned weekdays and skipping one fixed occurrence.\n• Calendar gains Area filters and more accurate time lines.\n• Search and editor navigation are more reliable.\n• Saved filters, sync, storage, and recovery preserve newer edits more safely.",
+        "ReleaseNotes": "Built-in MCP access connects AI clients with read-only defaults. Copy selected task titles, link folders and open UpNote links. Someday projects use sections; Destination moves selected tasks. Choose start dates in Today and optional archive retention. Calendar shows timed deadlines and daily/weekly repeats. Global quick add shortcuts survive startup; File Sync attachment uploads and concurrent attachment saves are safer.",
         "Images": [
           {
             "FileName": "2026-01-27_22-59-40.png",
@@ -131,7 +131,7 @@
           "Listen-, Kalender- und Kanban-Ansichten mit Erinnerungen und Wiederholungen",
           "Kostenlos und Open Source, ohne Werbung"
         ],
-        "ReleaseNotes": "• Wartende Aufgaben zeigen zugewiesene Personen; Fokus ist klarer.\n• Monatsserien unterstuetzen positionierte Wochentage und das Ueberspringen eines Termins.\n• Kalender bieten Bereichsfilter und genauere Zeitlinien.\n• Suche und Editor-Navigation sind zuverlaessiger.\n• Filter, Sync, Speicher und Wiederherstellung schuetzen neuere Aenderungen besser.",
+        "ReleaseNotes": "Eingebauter MCP-Zugriff verbindet KI-Clients standardmaessig nur lesend. Aufgabentitel kopieren, Ordner verknuepfen und UpNote-Links oeffnen. Irgendwann-Projekte nutzen Abschnitte; Ziel verschiebt Aufgaben. Startdaten fuer Heute und optionale Archivaufbewahrung waehlen. Der Kalender zeigt Fristen mit Uhrzeit und Serien. Globale Erfassungskuerzel bleiben nach dem Start erhalten; Dateisync und Anhangspeicherung werden sicherer.",
         "Images": [],
         "RecommendedHardware": [],
         "MinimumHardware": [],
@@ -161,7 +161,7 @@
           "Vues liste, calendrier et kanban, rappels et tâches répétées",
           "Gratuit et open source, sans publicité"
         ],
-        "ReleaseNotes": "• Les tâches en attente montrent la personne assignée et Focus est plus clair.\n• Les répétitions mensuelles gèrent les jours positionnés et le saut d’une occurrence.\n• Le calendrier ajoute les filtres par Domaine et des lignes de temps plus précises.\n• Recherche et navigation dans l’éditeur sont plus fiables.\n• Filtres, sync, stockage et récupération protègent mieux les changements récents.",
+        "ReleaseNotes": "MCP intégré connecte les clients IA en lecture seule par défaut. Copiez les titres, liez des dossiers et ouvrez les liens UpNote. Classez les projets Un jour en sections et déplacez les tâches avec Destination. Choisissez les dates de début dans Aujourd’hui et la conservation des archives. Le calendrier affiche échéances horaires et séries. Le raccourci global persiste au démarrage ; File Sync et les pièces jointes sont plus fiables.",
         "Images": [],
         "RecommendedHardware": [],
         "MinimumHardware": [],
@@ -190,7 +190,7 @@
           "Vistas de lista, calendario y kanban, con recordatorios y tareas repetidas",
           "Gratis y de código abierto, sin anuncios"
         ],
-        "ReleaseNotes": "• Las tareas en espera muestran la persona asignada y Enfoque es más claro.\n• Las repeticiones mensuales admiten días posicionados y omitir una fecha.\n• El calendario añade filtros por Área y líneas de tiempo más precisas.\n• La búsqueda y la navegación del editor son más fiables.\n• Filtros, sincronización, almacenamiento y recuperación conservan mejor los cambios nuevos.",
+        "ReleaseNotes": "MCP integrado conecta clientes de IA con acceso de solo lectura por defecto. Copia títulos, enlaza carpetas y abre enlaces de UpNote. Organiza proyectos de Algún día en secciones y mueve tareas con Destino. Elige fechas de inicio en Hoy y retención opcional del archivo. El calendario muestra plazos con hora y repeticiones. El atajo global se conserva al iniciar; mejoran las subidas con File Sync y el guardado de adjuntos.",
         "Images": [
           {
             "FileName": "2026-01-27_22-59-40.png",

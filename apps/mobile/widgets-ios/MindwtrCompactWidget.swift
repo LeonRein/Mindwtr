@@ -16,7 +16,7 @@ private struct MindwtrCompactWidgetView: View {
         GeometryReader { geometry in
             let sourceItems = focusItems(payload)
             let items = Array(sourceItems.prefix(visibleTaskLimit(
-                itemCount: sourceItems.count,
+                items: sourceItems,
                 height: geometry.size.height,
                 metrics: metrics
             )))
@@ -95,17 +95,19 @@ private struct MindwtrCompactWidgetView: View {
     }
 
     private func visibleTaskLimit(
-        itemCount: Int,
+        items: [MindwtrWidgetTaskItem],
         height: CGFloat,
         metrics: MindwtrCompactMetrics
     ) -> Int {
-        guard itemCount > 0 else { return 0 }
         let available = max(0, height - metrics.padding * 2 - metrics.headerHeight - metrics.spacing)
-        let fit = max(
-            0,
-            Int(floor((available + metrics.rowSpacing) / (metrics.rowHeight + metrics.rowSpacing)))
+        return MindwtrCompactTaskLayout.visibleTaskCount(
+            items: items,
+            availableHeight: Double(available),
+            titleRowHeight: Double(metrics.rowHeight),
+            contextRowHeight: Double(metrics.contextRowHeight),
+            rowSpacing: Double(metrics.rowSpacing),
+            limit: familyTaskCap
         )
-        return min(itemCount, min(familyTaskCap, fit))
     }
 
     private var familyTaskCap: Int {
@@ -130,14 +132,23 @@ private struct MindwtrCompactWidgetView: View {
             Text("•")
                 .foregroundColor(hexColor(item.priorityColor ?? palette.mutedText))
                 .accessibilityHidden(true)
-            Text(item.title)
-                .font(.system(size: metrics.taskSize))
-                .foregroundColor(hexColor(palette.text))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title)
+                    .font(.system(size: metrics.taskSize))
+                    .foregroundColor(hexColor(palette.text))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if let contextsLabel = item.contextsLabel {
+                    Text(contextsLabel)
+                        .font(.system(size: metrics.dateSize, weight: .medium))
+                        .foregroundColor(hexColor(palette.mutedText))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minHeight: metrics.rowHeight)
+        .frame(minHeight: metrics.rowHeight + (item.contextsLabel == nil ? 0 : metrics.contextRowHeight))
         .contentShape(Rectangle())
     }
 
@@ -170,6 +181,10 @@ private struct MindwtrCompactMetrics {
 
     var rowHeight: CGFloat {
         taskSize + rowSpacing + 3
+    }
+
+    var contextRowHeight: CGFloat {
+        dateSize + 3
     }
 
     static func resolve(for family: WidgetFamily, typeScale: CGFloat) -> MindwtrCompactMetrics {

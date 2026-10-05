@@ -1,9 +1,11 @@
 import { useCallback } from 'react';
+import { Platform } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTaskStore } from '@mindwtr/core';
 
 import { useQuickCapture } from '../../../contexts/quick-capture-context';
+import { logInfo } from '../../../lib/app-log';
 
 export default function CaptureQuickScreen() {
   const { openQuickCapture } = useQuickCapture();
@@ -24,7 +26,13 @@ export default function CaptureQuickScreen() {
 
       // Defer one frame so the tab layout/provider is fully focused before opening the sheet.
       const timer = setTimeout(() => {
-        openQuickCapture({ autoRecord });
+        openQuickCapture({ autoRecord, preserveDraft: true });
+        if (Platform.OS === 'android' && mode === 'text') {
+          void logInfo('Android detailed capture opened', {
+            scope: 'capture',
+            extra: { releaseCheck: 'v1.3.4/android-detailed-capture' },
+          });
+        }
         router.replace('/inbox');
       }, 0);
 

@@ -194,7 +194,7 @@ jobs:
             --check \
             "$worktree_dir/apps/desktop/package-lock.json"
 
-          python3 - "$GITHUB_WORKSPACE/flathub/tech.dongdongbh.mindwtr.node-sources.json" "$worktree_dir/apps/desktop/package-lock.json" "$worktree_dir/packages/core/package-lock.json" <<'PY'
+          python3 - "$GITHUB_WORKSPACE/flathub/tech.dongdongbh.mindwtr.node-sources.json" "$worktree_dir/apps/desktop/package-lock.json" "$worktree_dir/packages/core/package-lock.json" "$worktree_dir/apps/mcp-server/package-lock.json" <<'PY'
           import json
           import pathlib
           import sys

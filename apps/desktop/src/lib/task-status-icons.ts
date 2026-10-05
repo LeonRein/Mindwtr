@@ -7,7 +7,7 @@ import {
     Clock3,
     Inbox,
     PauseCircle,
-    Sprout,
+    CalendarClock,
     type LucideIcon,
 } from 'lucide-react';
 import type { TaskStatus } from '@mindwtr/core';
@@ -36,5 +36,5 @@ export const TASK_STATUS_ICONS: Record<TaskStatus, LucideIcon> = {
 /** "Start later" sets a start date, and the editor's Start Date field wears this glyph. */
 export const START_LATER_ICON: LucideIcon = Calendar;
 
-/** Incubate is Someday with a review date: something planted to come back to. */
-export const INCUBATE_ICON: LucideIcon = Sprout;
+/** Incubate is Someday with a review date: choose when to reconsider it. */
+export const INCUBATE_ICON: LucideIcon = CalendarClock;

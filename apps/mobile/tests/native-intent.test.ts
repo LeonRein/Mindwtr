@@ -151,6 +151,15 @@ describe('redirectSystemPath', () => {
         expect(redirectSystemPath({ path: 'mindwtr://open?area=area-1', initial: false })).toBe('/inbox');
     });
 
+    it.each([true, false])('routes the detailed launcher into the in-app sheet (initial=%s)', (initial) => {
+        expect(redirectSystemPath({ path: 'mindwtr:///capture-quick?mode=text&entry=details', initial }))
+            .toBe('/capture-quick?mode=text');
+        expect(redirectSystemPath({ path: 'mindwtr://capture-quick?entry=details&mode=audio&title=ignored', initial }))
+            .toBe('/capture-quick?mode=text');
+        expect(redirectSystemPath({ path: 'mindwtr:///capture-quick?entry=unknown', initial }))
+            .toBe('/capture-modal?origin=system');
+    });
+
     it('routes widget and system quick capture links through the reliable root modal', () => {
         expect(redirectSystemPath({ path: 'mindwtr:///capture-quick?mode=text', initial: true }))
             .toBe('/capture-modal?origin=system');

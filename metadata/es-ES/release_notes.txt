@@ -1,6 +1,1 @@
-- Las tareas en espera muestran la persona asignada y Enfoque es más claro.
-- Las repeticiones mensuales admiten días posicionados y omitir una fecha.
-- El calendario añade filtros por Área y líneas de tiempo más precisas.
-- Los widgets siguen el idioma y el formato de 12/24 horas.
-- Los atajos pueden abrir listas guardadas e iniciar captura de audio en Enfoque.
-- Filtros, sincronización, almacenamiento y recuperación conservan mejor los cambios nuevos.
+Organiza proyectos de Algún día en secciones, mueve tareas con Destino y elige si Hoy incluye fechas de inicio. La retención opcional del archivo está desactivada por defecto. El calendario muestra plazos con hora y repeticiones diarias o semanales. Los widgets muestran contextos; la captura de audio conserva el foco. Abre enlaces de UpNote. El escritorio integra MCP. Mejoran adjuntos, calendario y sync de iCloud.

@@ -456,9 +456,10 @@ test("desktop Rust pull requests check and test the native library on Windows", 
 
   expect(workflow.match(/- "apps\/desktop\/src-tauri\/\*\*"/g)).toHaveLength(2);
   expect(workflow).toContain("windows: ${{ steps.filter.outputs.windows }}");
-  expect(workflow).toMatch(
-    /apps\/desktop\/src-tauri\/\*\|\.github\/workflows\/native-platform-ci\.yml\)\n\s+windows=true/,
-  );
+  const windowsPaths = workflow.match(/([^\n]+)\)\n\s+windows=true/)?.[1].trim().split("|");
+  for (const path of ["apps/desktop/src-tauri/*", "apps/mcp-server/*", "scripts/build-mcp-sidecar*", ".bun-version", "packages/core/src/*", "package.json", "bun.lock", ".github/workflows/native-platform-ci.yml"]) {
+    expect(windowsPaths).toContain(path);
+  }
   expect(workflow).toContain('echo "windows=$windows" >> "$GITHUB_OUTPUT"');
 
   expect(windowsJob).toBeDefined();

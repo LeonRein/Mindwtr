@@ -5,6 +5,7 @@ import {
     buildAndroidWidgetPublication,
     buildWidgetPayload,
     createWidgetPayloadProjection,
+    IOS_WIDGET_FAMILY_CACHE_ITEMS,
     iosWidgetProjectionOptions,
     resolveWidgetLanguage,
 } from './widget-payload';
@@ -22,6 +23,50 @@ describe('resolveWidgetLanguage', () => {
         expect(resolveWidgetLanguage('en', undefined, 'es')).toBe('en');
         expect(resolveWidgetLanguage('en', 'de', 'es')).toBe('de');
         expect(resolveWidgetLanguage(null, undefined)).toBe('en');
+    });
+});
+
+describe('iOS widget task contexts', () => {
+    it('publishes existing contexts in every home-screen family alongside project and due metadata', () => {
+        const now = new Date().toISOString();
+        const contexts = ['@office', '@calls', '@电话'];
+        const data: AppData = {
+            tasks: [{
+                id: 'context-task', title: 'Task', status: 'next', tags: [], contexts,
+                projectId: 'project-1', isFocusedToday: true, dueDate: '2000-01-01',
+                createdAt: now, updatedAt: now,
+            }],
+            projects: [{
+                id: 'project-1', title: 'Launch', status: 'active', color: '#ABCDEF',
+                order: 0, tagIds: [], createdAt: now, updatedAt: now,
+            }],
+            sections: [], areas: [], settings: {} as AppSettings,
+        };
+        const projection = createWidgetPayloadProjection(data, 'en', iosWidgetProjectionOptions({}));
+        for (const maxItems of Object.values(IOS_WIDGET_FAMILY_CACHE_ITEMS)) {
+            // Exercise the JSON boundary used by the native widget cache.
+            const payload = JSON.parse(JSON.stringify(projection.build(maxItems)));
+            const row = payload.sections.flatMap((section: { items: unknown[] }) => section.items)[0];
+            expect(row).toMatchObject({
+                id: 'context-task', contexts, contextLabel: 'Launch', identityColor: '#ABCDEF',
+                dueTone: 'overdue', openUri: 'mindwtr://open?task=context-task',
+            });
+            expect(row.completionToken).toBeTruthy();
+        }
+        expect(data.tasks[0].contexts).toEqual(contexts);
+    });
+
+    it('keeps context-free cached rows small', () => {
+        const now = new Date().toISOString();
+        const data: AppData = {
+            tasks: [{
+                id: 'bare-task', title: 'Task', status: 'next', tags: [], contexts: [],
+                isFocusedToday: true, createdAt: now, updatedAt: now,
+            }],
+            projects: [], sections: [], areas: [], settings: {} as AppSettings,
+        };
+        const payload = createWidgetPayloadProjection(data, 'en', iosWidgetProjectionOptions({})).build(3);
+        expect(payload.items[0]).not.toHaveProperty('contexts');
     });
 });
 

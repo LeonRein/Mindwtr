@@ -559,7 +559,7 @@ function App() {
             if (applied && isLinuxRuntime() && (mode === 'system' || mode === 'system-oled')) {
                 void logInfo('Linux native system theme applied', {
                     scope: 'theme',
-                    extra: { releaseCheck: 'v1.3.3/linux-titlebar-theme', theme: nativeTheme ?? 'unknown' },
+                    extra: { theme: nativeTheme ?? 'unknown' },
                 });
             }
         });

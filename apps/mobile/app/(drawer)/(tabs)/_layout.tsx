@@ -747,13 +747,17 @@ export default function TabLayout() {
       return;
     }
     beginCaptureProfile();
-    setCaptureState((prev) => ({
-      visible: true,
-      openRequestId: prev.openRequestId + 1,
-      initialValue: options?.initialValue ?? '',
-      initialProps: withSelectedArea(options?.initialProps) ?? null,
-      autoRecord: options?.autoRecord ?? false,
-    }));
+    setCaptureState((prev) => {
+      // Repeated system entry points resume the sheet without resetting its draft.
+      if (options?.preserveDraft && prev.visible) return prev;
+      return {
+        visible: true,
+        openRequestId: prev.openRequestId + 1,
+        initialValue: options?.initialValue ?? '',
+        initialProps: withSelectedArea(options?.initialProps) ?? null,
+        autoRecord: options?.autoRecord ?? false,
+      };
+    });
   }, [openRouteQuickCapture, withSelectedArea]);
 
   const closeQuickCapture = useCallback(() => {

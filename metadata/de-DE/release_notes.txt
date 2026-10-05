@@ -1,6 +1,1 @@
-- Wartende Aufgaben zeigen zugewiesene Personen; Fokus ist klarer.
-- Monatsserien unterstuetzen positionierte Wochentage und das Ueberspringen eines Termins.
-- Kalender bieten Bereichsfilter und genauere Zeitlinien.
-- Widgets folgen Sprache und 12/24-Stunden-Einstellung.
-- Kurzbefehle oeffnen gespeicherte Listen und starten Audioerfassung im Fokus.
-- Filter, Sync, Speicher und Wiederherstellung schuetzen neuere Aenderungen besser.
+Irgendwann-Projekte in Abschnitten ordnen, Aufgaben per Ziel verschieben und Startdaten fuer Heute waehlen. Optionale Archivaufbewahrung ist standardmaessig aus. Der Kalender zeigt Fristen mit Uhrzeit und taegliche/woechentliche Serien. Widgets zeigen Kontexte; Audioerfassung behaelt den Tastaturfokus. UpNote-Links oeffnen. Der Desktop bietet eingebauten MCP-Zugriff. Anhaenge, Kalender und iCloud-Sync werden zuverlaessiger.

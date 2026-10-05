@@ -1933,7 +1933,7 @@ fn write_dropbox_tokens(app: &tauri::AppHandle, tokens: &DropboxTokenBundle) -> 
             state.token_fallback = None;
             Ok(())
         })?;
-        log::info!("Dropbox credentials verified in system keyring extra.releaseCheck=v1.3.3/flatpak-secret-service");
+        log::info!("Dropbox credentials verified in system keyring");
     } else {
         update_dropbox_credential_state(app, |state| {
             state.token_fallback = Some(payload.clone());

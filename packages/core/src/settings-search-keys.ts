@@ -155,6 +155,7 @@ export const SETTINGS_SEARCH_PAGE_KEYS: Record<SettingsSearchPageId, readonly Se
         { key: 'obsidianTaskNotesIncludeArchived', section: 'obsidianVault' },
         { key: 'obsidianNewTaskFormat', section: 'obsidianVault' },
         'emailCapture',
+        'mcpTitle',
         { key: 'emailCaptureHost', section: 'emailCapture' },
         { key: 'emailCapturePort', section: 'emailCapture' },
         { key: 'emailCaptureUsername', section: 'emailCapture' },
@@ -279,6 +280,7 @@ export const SETTINGS_SEARCH_INDEX: readonly SettingsSearchIndexEntry[] =
 // indexed on its own. Every key in SETTINGS_SEARCH_PAGE_KEYS must be either
 // resolvable on mobile or listed here — see settings-search-keys.test.ts.
 export const SETTINGS_SEARCH_MOBILE_EXCLUSIONS: Record<string, string> = {
+    mcpTitle: 'Bundled local MCP server is available in the desktop app only.',
     sandboxWorkspace: 'Sandbox workspace entry exists in desktop settings; mobile exposes it in its own settings screen.',
     featureTimeline: 'Timeline view exists on desktop only; the mobile GTD > Features screen has no row for it (#1145).',
     density: 'No adjustable list density setting on mobile.',

@@ -10,19 +10,6 @@ private let mindwtrWidgetPayloadKeyMedium = "mindwtr-ios-widget-payload-medium"
 private let mindwtrWidgetPayloadKeyLarge = "mindwtr-ios-widget-payload-large"
 private let mindwtrWidgetPayloadKeyExtraLarge = "mindwtr-ios-widget-payload-extra-large"
 
-struct MindwtrWidgetTaskItem: Decodable {
-    let id: String
-    let title: String
-    let statusLabel: String?
-    let dueLabel: String?
-    let dueTone: String?
-    let openUri: String?
-    let priorityColor: String?
-    let contextLabel: String?
-    let identityColor: String?
-    let completionToken: String?
-}
-
 struct MindwtrWidgetSection: Decodable {
     let key: String?
     let title: String
@@ -789,14 +776,14 @@ private struct MindwtrWidgetTaskRow: View {
                 .truncationMode(.tail)
 
             HStack(spacing: 4) {
-                if let contextLabel = nonEmpty(item.contextLabel) {
+                if let detailLabel = item.detailLabel {
                     if let identityColor = item.identityColor {
                         Circle()
                             .fill(hexColor(identityColor))
                             .frame(width: 5, height: 5)
                             .accessibilityHidden(true)
                     }
-                    Text(contextLabel)
+                    Text(detailLabel)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -807,6 +794,7 @@ private struct MindwtrWidgetTaskRow: View {
                     Text(dueLabel)
                         .foregroundColor(dueColor)
                         .lineLimit(1)
+                        .layoutPriority(1)
                 }
             }
             .font(.system(size: metrics.detailSize, weight: .medium))

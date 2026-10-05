@@ -5,7 +5,8 @@ param(
   [Parameter(Mandatory)][string]$OutputPath,
   [string]$IdentityName = 'DongdaLi.Mindwtr',
   [string]$Publisher = 'CN=76AC9B15-7A1B-49FF-9342-2BE80735A1E6',
-  [string]$PublisherDisplayName = 'Dongda Li'
+  [string]$PublisherDisplayName = 'Dongda Li',
+  [switch]$AllowMissingMcpHelper
 )
 $ErrorActionPreference = 'Stop'
 if ($MsixVersion -notmatch '^[1-9][0-9]*\.[0-9]+\.[0-9]+\.0$') { throw 'Invalid Store package version' }
@@ -16,6 +17,9 @@ Remove-Item -Recurse -Force $outDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 New-Item -ItemType Directory -Force -Path "$outDir\Assets" | Out-Null
 Copy-Item "$buildDir/mindwtr.exe" -Destination "$outDir\mindwtr.exe"
+if ((Test-Path "$buildDir/mindwtr-mcp.exe") -or -not $AllowMissingMcpHelper) {
+  Copy-Item "$buildDir/mindwtr-mcp.exe" -Destination "$outDir\mindwtr-mcp.exe"
+}
 if (Test-Path "$buildDir/WebView2Loader.dll") {
   Copy-Item "$buildDir/WebView2Loader.dll" -Destination "$outDir"
 }

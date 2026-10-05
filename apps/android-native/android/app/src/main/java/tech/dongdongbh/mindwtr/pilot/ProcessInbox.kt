@@ -143,7 +143,7 @@ private fun JSONObject.child(name: String): JSONObject? = if (!has(name) || isNu
 
 /** RN's CHOICE_ICONS (InboxStepFlow), keyed by core's choice icon. */
 private val CHOICE_ICONS = mapOf("done" to Lucide.CheckCircle2, "project" to Lucide.Folder, "later" to Lucide.Clock3,
-    "delegate" to Lucide.UserRound, "someday" to Lucide.CircleArrowUp, "incubate" to Lucide.Sprout, "reference" to Lucide.Book)
+    "delegate" to Lucide.UserRound, "someday" to Lucide.CircleArrowUp, "incubate" to Lucide.CalendarClock, "reference" to Lucide.Book)
 
 /** RN's step layout: the entry questions lay their choices out in two columns (InboxStepFlow renderPrompt). */
 private val GRID_STEPS = setOf("decisions", "actionable")
@@ -291,7 +291,7 @@ private fun InboxViewModel.CaptureCard(flow: InboxProcessing, locked: Boolean, s
         .padding(horizontal = 14.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         capture.text("returningLabel")?.let { label ->
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Lucide.Sprout, null, tint = c.secondaryText, modifier = Modifier.size(13.dp))
+                Icon(Lucide.CalendarClock, null, tint = c.secondaryText, modifier = Modifier.size(13.dp))
                 Text(label, style = rnText(12, 600), color = c.secondaryText, modifier = Modifier.padding(start = 4.dp))
             }
         }

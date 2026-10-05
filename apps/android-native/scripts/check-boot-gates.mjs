@@ -2835,7 +2835,7 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     for (const [scheme, applicationId] of [['mindwtr-native-dev', 'tech.dongdongbh.mindwtr.nativeclient.dev'], ['mindwtr-upgradetest', 'tech.dongdongbh.mindwtr.upgradetest'], ['mindwtr', 'tech.dongdongbh.mindwtr']]) {
         const { xml, strings } = buildShortcuts(scheme, applicationId);
         const rnXml = rnShortcuts.buildShortcutsXml(applicationId);
-        assert.deepEqual(ids(xml), ['capture', 'inbox', 'focus', 'waiting', 'someday', 'projects', 'review', 'calendar', 'add_task_inbox', 'open_focus', 'open_calendar']);
+        assert.deepEqual(ids(xml), ['capture', 'inbox', 'focus', 'waiting', 'someday', 'projects', 'review', 'calendar', 'add_task_inbox', 'add_task_details', 'open_focus', 'open_calendar']);
         assert.deepEqual(ids(xml), ids(rnXml));
         assert.deepEqual(capabilities(xml), capabilities(rnXml));
         assert.equal(strings, rnShortcuts.SHORTCUTS_STRINGS_XML);

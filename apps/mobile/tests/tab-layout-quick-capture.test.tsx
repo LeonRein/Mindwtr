@@ -486,6 +486,59 @@ describe('mobile tab quick capture', () => {
     expect(sheets[0]?.props.visible).toBe(true);
   });
 
+  it('resumes an active system capture without resetting the sheet session or metadata', () => {
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<TabLayout />);
+    });
+    act(() => {
+      tabProviderValue.current?.openQuickCapture({
+        initialValue: 'Unfinished draft',
+        initialProps: { projectId: 'project-1', status: 'waiting', tags: ['draft-tag'] },
+      });
+    });
+    const originalProps = getQuickCaptureSheets(tree)[0]?.props;
+
+    act(() => {
+      tabProviderValue.current?.openQuickCapture({ autoRecord: false, preserveDraft: true });
+      tabProviderValue.current?.openQuickCapture({ autoRecord: false, preserveDraft: true });
+    });
+    const resumedProps = getQuickCaptureSheets(tree)[0]?.props;
+    expect(resumedProps.openRequestId).toBe(originalProps.openRequestId);
+    expect(resumedProps.initialValue).toBe(originalProps.initialValue);
+    expect(resumedProps.initialProps).toBe(originalProps.initialProps);
+    expect(resumedProps.autoRecord).toBe(originalProps.autoRecord);
+
+    act(() => {
+      tabProviderValue.current?.openQuickCapture({ initialValue: 'Explicit new session' });
+    });
+    expect(getQuickCaptureSheets(tree)[0]?.props.openRequestId).toBeGreaterThan(originalProps.openRequestId);
+    expect(getQuickCaptureSheets(tree)[0]?.props.initialValue).toBe('Explicit new session');
+  });
+
+  it('opens one blank sheet for repeated batched system invocations and reopens after dismissal', () => {
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<TabLayout />);
+    });
+    act(() => {
+      tabProviderValue.current?.openQuickCapture({ autoRecord: false, preserveDraft: true });
+      tabProviderValue.current?.openQuickCapture({ autoRecord: false, preserveDraft: true });
+    });
+    expect(getQuickCaptureSheets(tree)).toHaveLength(1);
+    const firstProps = getQuickCaptureSheets(tree)[0]?.props;
+    expect(firstProps.openRequestId).toBe(1);
+    expect(firstProps.initialValue).toBe('');
+    expect(firstProps.initialProps).toBeUndefined();
+    expect(firstProps.autoRecord).toBe(false);
+
+    act(() => firstProps.onClose());
+    expect(getQuickCaptureSheets(tree)).toHaveLength(0);
+    act(() => tabProviderValue.current?.openQuickCapture({ autoRecord: false, preserveDraft: true }));
+    expect(getQuickCaptureSheets(tree)[0]?.props.openRequestId).toBe(2);
+    expect(getQuickCaptureSheets(tree)[0]?.props.initialValue).toBe('');
+  });
+
   it('scopes capture recovery and late-failure ownership to the active workspace', () => {
     let personalTree!: ReturnType<typeof create>;
     act(() => {

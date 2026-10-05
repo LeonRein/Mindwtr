@@ -911,22 +911,41 @@ fn merge_config(base: &mut AppConfigToml, overrides: AppConfigToml) {
     *base = object_as_config(merged);
 }
 
-pub(crate) fn read_config(app: &tauri::AppHandle) -> AppConfigToml {
+fn read_config_before_legacy_secret_migration(
+    app: &tauri::AppHandle,
+) -> Result<AppConfigToml, String> {
     let config_path = get_config_path(app);
     let secrets_path = get_secrets_path(app);
-    let mut config = match read_config_files_verified(&config_path, &secrets_path) {
+    let mut config = read_config_files_verified(&config_path, &secrets_path)?;
+    if get_sync_backend_state_path(app).exists() {
+        config.dropbox_tokens = None;
+        config.dropbox_promotion_journal = None;
+    }
+    Ok(config)
+}
+
+/// Result-returning read for capabilities that must revoke access when the
+/// device configuration cannot be verified. Caller owns the outer RMW lock;
+/// migration/publication take only the distinct credential lock internally.
+pub(crate) fn read_config_verified(app: &tauri::AppHandle) -> Result<AppConfigToml, String> {
+    let mut config = read_config_before_legacy_secret_migration(app)?;
+    migrate_legacy_secrets(app, &mut config)?;
+    Ok(config)
+}
+
+pub(crate) fn read_config(app: &tauri::AppHandle) -> AppConfigToml {
+    let mut config = match read_config_before_legacy_secret_migration(app) {
         Ok(config) => config,
         Err(error) => {
             log::error!("Config generation verification failed: {error}");
             return AppConfigToml::default();
         }
     };
-    if get_sync_backend_state_path(app).exists() {
-        config.dropbox_tokens = None;
-        config.dropbox_promotion_journal = None;
-    }
-    if keyring_enabled() {
-        migrate_legacy_secrets(app, &mut config);
+    if let Err(error) = migrate_legacy_secrets(app, &mut config) {
+        // Preserve this infallible legacy accessor's existing behavior while
+        // callers of read_config_verified can fail closed on publication.
+        log::warn!("Failed to clear migrated plaintext secrets from config.toml: {error}");
+        emit_keyring_fallback_warning(app, "Migrated secrets");
     }
     config
 }
@@ -947,6 +966,7 @@ const SECRET_FIELDS: &[&str] = &[
     "ai_key_gemini",
     "email_capture_password",
     "local_api_token",
+    "mcp_token",
 ];
 
 fn split_config_for_secrets(config: &AppConfigToml) -> (AppConfigToml, AppConfigToml) {
@@ -1070,7 +1090,7 @@ fn read_config_files_verified_unlocked(
     read_config_files_unlocked(config_path, secrets_path)
 }
 
-fn read_config_files_verified(
+pub(crate) fn read_config_files_verified(
     config_path: &Path,
     secrets_path: &Path,
 ) -> Result<AppConfigToml, String> {
@@ -1955,9 +1975,12 @@ where
     update_dropbox_credential_state_unlocked(app, update)
 }
 
-fn migrate_legacy_secrets(app: &tauri::AppHandle, config: &mut AppConfigToml) {
+fn migrate_legacy_secrets(
+    app: &tauri::AppHandle,
+    config: &mut AppConfigToml,
+) -> Result<(), String> {
     if !keyring_enabled() {
-        return;
+        return Ok(());
     }
     let mut migrated = false;
     if let Some(value) = config.webdav_password.clone() {
@@ -2006,14 +2029,10 @@ fn migrate_legacy_secrets(app: &tauri::AppHandle, config: &mut AppConfigToml) {
         // The secrets are in the keyring now, but this write is what removes
         // the plaintext copies from config.toml. Swallowing its failure left
         // them on disk silently, to be re-read (and re-migrated) every launch.
-        // read_config cannot fail, so say it out loud instead.
-        if let Err(error) =
-            write_config_files(&get_config_path(app), &get_secrets_path(app), config)
-        {
-            log::warn!("Failed to clear migrated plaintext secrets from config.toml: {error}");
-            emit_keyring_fallback_warning(app, "Migrated secrets");
-        }
+        // The legacy accessor warns; strict capabilities revoke on failure.
+        write_config_files(&get_config_path(app), &get_secrets_path(app), config)?;
     }
+    Ok(())
 }
 
 fn keyring_service(app: &tauri::AppHandle) -> String {
@@ -3256,6 +3275,9 @@ mod tests {
             dropbox_promotion_journal: Some("dropbox-journal-secret".to_string()),
             sync_cloud_provider: Some("dropbox".to_string()),
             link_folder_bookmarks: Some("{\"a1\":\"Ym9va21hcms=\"}".to_string()),
+            mcp_enabled: Some("true".to_string()),
+            mcp_allow_write: Some("false".to_string()),
+            mcp_token: Some("managed-mcp-token-value".to_string()),
         }
     }
 

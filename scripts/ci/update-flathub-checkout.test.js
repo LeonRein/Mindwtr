@@ -3,6 +3,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import process from "node:process";
 
 const tempRoots = [];
 const script = resolve("scripts/ci/update-flathub-checkout.sh");
@@ -66,6 +67,15 @@ test("updates an unpatched Flathub manifest fixture", () => {
   expect(updated).toContain("- VITE_ANALYTICS_RELEASE_VERSION=1.2.5");
   expect(updated).toContain("- VITE_DROPBOX_APP_KEY=fixture-key");
   expect(updated).toContain("- VITE_FEEDBACK_ENDPOINT_URL=https://feedback.fixture/");
+  expect(updated).toContain('https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-linux-x64-baseline.zip');
+  expect(updated).toContain('sha256: 6bddacd6a65855698b9816f2d74871eda4dd0b7fa921140c6445248f94a742fd');
+  expect(updated).toContain('only-arches: [aarch64]');
+  expect(updated).toContain('npm ci --prefix=.flatpak-mcp-install --offline --omit=optional --ignore-scripts');
+  const reactPeer = 'ln -sfn ../../../apps/desktop/node_modules/react packages/core/node_modules/react';
+  expect(updated).toContain(reactPeer);
+  expect(updated.indexOf(reactPeer)).toBeLessThan(updated.indexOf('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs'));
+  expect(updated).toContain('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs');
+  expect(updated).toContain('/app/bin/mindwtr-mcp');
 });
 
 test("is idempotent after the workspace repair block has been patched", () => {

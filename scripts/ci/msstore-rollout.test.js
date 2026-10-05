@@ -193,6 +193,24 @@ test('status is read-only and reports the current published rollout', async () =
   expect(calls.map(call => call.method)).toEqual(['GET', 'GET', 'GET']);
 });
 
+test('status reads the exact pending submission without rollout requests or mutations', async () => {
+  for (const status of ['Certification', 'CommitStarted']) {
+    const app = { lastPublishedApplicationSubmission: { id: '777' }, pendingApplicationSubmission: { id: submissionId } };
+    const { calls, run } = fixture({ app, submission: { status } });
+    expect(await run()).toEqual({ submissionId, action: 'status', status, percentage: null, open: false, pendingSubmissionId: submissionId });
+    expect(calls).toEqual([{ method: 'GET', path: appPath }, { method: 'GET', path: submissionPath }]);
+    for (const action of ['increase', 'halt', 'finalize']) {
+      const mutation = fixture({ app, submission: { status } });
+      await expect(mutation.run({ action, percentage: 20 })).rejects.toThrow('not the current last published');
+      expect(mutation.calls).toEqual([{ method: 'GET', path: appPath }]);
+    }
+    const unrelated = fixture({ app: { ...app, pendingApplicationSubmission: { id: '888' } }, submission: { status } });
+    await expect(unrelated.run()).rejects.toThrow('not the current last published');
+    const wrong = fixture({ app, submission: { id: '888', status } });
+    await expect(wrong.run()).rejects.toThrow('must be Published');
+  }
+});
+
 test('status without a submission ID discovers production and reports whether it is open', async () => {
   for (const [status, open] of [
     ['PackageRolloutInProgress', true],

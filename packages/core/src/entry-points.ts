@@ -50,7 +50,14 @@ export function resolveSystemPath(path: string, initial: boolean): SystemPathRou
         if (isOpenFeatureUrl(path)) return { kind: 'openFeature', path: resolveOpenFeaturePath(parseOpenFeatureUrl(path)?.feature ?? null) };
         if (isEntityOpenUrl(path)) return { kind: 'entityOpen', path: '/inbox' };
         if (isShortcutCaptureUrl(path)) return { kind: 'capture', path: '/inbox' };
-        if (isQuickCaptureUrl(path)) return { kind: 'quickCapture', path: '/capture-modal?origin=system' };
+        if (isQuickCaptureUrl(path)) {
+            // The detailed launcher entry opens an unsaved in-app sheet. Existing
+            // widget/tile/control links retain their background-returning modal.
+            if (new URL(path).searchParams.get('entry') === 'details') {
+                return { kind: 'path', path: '/capture-quick?mode=text' };
+            }
+            return { kind: 'quickCapture', path: '/capture-modal?origin=system' };
+        }
     } catch {
         // Never throws; fall through to the original path.
     }

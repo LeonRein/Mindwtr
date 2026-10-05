@@ -322,7 +322,7 @@ pub(crate) fn start_portal_theme_watcher(app: tauri::AppHandle) {
                 for _ in signals {
                     if let Some(theme) = get_system_theme_preference() {
                         log::info!(
-                            "Linux portal theme change resolved extra.releaseCheck=v1.3.3/linux-portal-theme-signal theme={theme}"
+                            "Linux portal theme change resolved theme={theme}"
                         );
                         let _ = app.emit("system-theme-portal-changed", theme);
                     }

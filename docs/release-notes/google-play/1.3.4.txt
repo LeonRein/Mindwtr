@@ -1,0 +1,15 @@
+<en-US>
+Organize Someday projects in sections and choose a Destination for selected tasks. Optional archive retention defaults to Never. Today can include start dates; Calendar shows timed deadlines and daily/weekly repeats. Add task… opens detailed capture from the launcher. Reminders, widget links, attachment saves and encrypted sync recover more safely. UpNote links open from notes and attachments.
+</en-US>
+<de-DE>
+Irgendwann-Projekte in Abschnitten ordnen und ausgewaehlte Aufgaben per Ziel verschieben. Optionale Archivaufbewahrung ist standardmaessig aus. Heute kann Startdaten einbeziehen; der Kalender zeigt Fristen mit Uhrzeit und taegliche/woechentliche Serien. Add task… oeffnet die detaillierte Erfassung. Erinnerungen, Widget-Links, Anhaenge und verschluesselter Sync werden zuverlaessiger. UpNote-Links lassen sich oeffnen.
+</de-DE>
+<es-ES>
+Organiza proyectos de Algún día en secciones y mueve tareas con Destino. La retención opcional del archivo está desactivada por defecto. Hoy puede incluir fechas de inicio; el calendario muestra plazos con hora y repeticiones diarias o semanales. Add task… abre la captura detallada. Mejoran recordatorios, enlaces de widgets, guardado de adjuntos y sync cifrada. Abre enlaces de UpNote.
+</es-ES>
+<fr-FR>
+Classez les projets Un jour en sections et déplacez les tâches avec Destination. La conservation facultative des archives est désactivée par défaut. Aujourd’hui peut inclure les dates de début ; le calendrier affiche les échéances horaires et les séries quotidiennes ou hebdomadaires. Add task… ouvre la saisie détaillée. Rappels, liens de widgets, pièces jointes et sync chiffrée sont plus fiables. Ouvrez les liens UpNote.
+</fr-FR>
+<zh-CN>
+将“将来/也许”项目归入分区，通过“目标位置”批量移动任务。可选归档保留期限默认关闭。“今天”可选择包含开始日期；日历显示带时间的截止标记和每日、每周重复任务。启动器新增 Add task… 详细录入入口。提醒、小组件链接、附件保存与加密同步恢复更可靠。支持打开笔记及附件中的 UpNote 链接。
+</zh-CN>

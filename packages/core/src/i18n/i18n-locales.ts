@@ -282,7 +282,9 @@ export const LOCALES = {
         // Re-pin to the 2482 keys currently present after English grew to 2735 keys;
         // the old 2444 floor fell below the 90% brand-name check ceiling.
         // Three translated UpNote link recovery strings raise the commitment with English.
-        translatedKeyFloor: 2490,
+        // Includes the local MCP integration strings; pin to the actual translated count
+        // so English growth does not reclassify deliberate protocol and brand names.
+        translatedKeyFloor: 2523,
     },
     it: {
         loadSync: () => require('./locales/it') as typeof import('./locales/it'),

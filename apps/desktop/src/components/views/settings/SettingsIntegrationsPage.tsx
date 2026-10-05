@@ -4,6 +4,7 @@ import type { SystemCalendarPermissionStatus, SystemCalendarPushTarget } from '.
 import { SettingsCalendarPage } from './SettingsCalendarPage';
 import { SettingsEmailCaptureSection } from './SettingsEmailCaptureSection';
 import { SettingsObsidianSection } from './SettingsObsidianSection';
+import { SettingsMcpSection } from './SettingsMcpSection';
 
 type Labels = {
     calendarIntegrationGuideTitle: string;
@@ -262,6 +263,7 @@ export function SettingsIntegrationsPage({
                 isTauri={isTauri}
                 showSaved={showSaved}
             />
+            <SettingsMcpSection isTauri={isTauri} />
         </div>
     );
 }

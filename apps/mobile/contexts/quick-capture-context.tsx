@@ -6,6 +6,7 @@ export type QuickCaptureOptions = {
   initialValue?: string;
   autoRecord?: boolean;
   returnTo?: string;
+  preserveDraft?: boolean;
 };
 
 type QuickCaptureContextValue = {

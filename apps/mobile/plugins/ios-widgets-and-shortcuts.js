@@ -14,6 +14,7 @@ const WIDGETS_FOLDER = 'widgets-ios';
 const APP_INTENTS_FOLDER = 'ios-app-intents';
 const IOS_WIDGET_MODULE_FOLDER = path.join('modules', 'ios-widget', 'ios');
 const SHARED_WIDGET_ACTION_STORE = 'MindwtrWidgetActionStore.swift';
+const SHARED_WIDGET_FILES = [SHARED_WIDGET_ACTION_STORE, 'MindwtrWidgetTaskItem.swift'];
 const APP_GROUP = 'group.tech.dongdongbh.mindwtr';
 const SHORTCUT_URL_KEY = 'url';
 const SIRI_CAPTURE_SHORTCUTS_PROVIDER = 'MindwtrSiriCaptureShortcuts';
@@ -56,16 +57,14 @@ const copyRecursive = (sourceDir, targetDir) => {
 };
 
 const copySharedWidgetActionStore = (projectRoot, targetDir) => {
-  const sourcePath = path.join(
-    projectRoot,
-    IOS_WIDGET_MODULE_FOLDER,
-    SHARED_WIDGET_ACTION_STORE
-  );
-  if (!fs.existsSync(sourcePath)) {
-    throw new Error(`[ios-widgets-and-shortcuts] Missing shared widget action store: ${sourcePath}`);
-  }
   fs.mkdirSync(targetDir, { recursive: true });
-  fs.copyFileSync(sourcePath, path.join(targetDir, SHARED_WIDGET_ACTION_STORE));
+  for (const name of SHARED_WIDGET_FILES) {
+    const sourcePath = path.join(projectRoot, IOS_WIDGET_MODULE_FOLDER, name);
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`[ios-widgets-and-shortcuts] Missing shared widget source: ${sourcePath}`);
+    }
+    fs.copyFileSync(sourcePath, path.join(targetDir, name));
+  }
   return SHARED_WIDGET_ACTION_STORE;
 };
 

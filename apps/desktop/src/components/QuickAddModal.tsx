@@ -1471,7 +1471,9 @@ export function QuickAddModal({ standaloneWindow = false }: QuickAddModalProps) 
                                 )}
                                 aria-label={audioButtonLabel}
                                 autoFocus
-                                disabled={recordingBusy}
+                                // Keep focus while startup is busy so Enter can stop the recording.
+                                // onClick ignores activation until the operation finishes.
+                                aria-disabled={recordingBusy}
                             >
                                 {audioButtonLabel}
                             </button>

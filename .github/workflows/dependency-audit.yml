@@ -101,6 +101,7 @@ jobs:
             bun scripts/ci/validate-mobile-npm-audit.js "$mobile_audit_report"
           fi
           npm audit --prefix packages/core --audit-level=low
+          npm audit --prefix apps/mcp-server --audit-level=low
           eas_audit_report="$RUNNER_TEMP/eas-npm-audit.json"
           if ! npm audit --prefix tools/eas-cli --audit-level=low --json > "$eas_audit_report"; then
             bun scripts/ci/validate-npm-audit.js "$eas_audit_report" eas
