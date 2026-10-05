@@ -13,6 +13,8 @@
 //       the task into the phone's database with no screen and no foreground trigger, and the job queues its next run;
 //   (3) a capture intent while the app is closed: the capture job stores it and sends it, the folder holds it before the job
 //       reports success (its "finished" line comes first);
+//   (3b) a capture while a scheduled run is still syncing with a slow server (every answer 25 s): the capture is in the phone's
+//       database within 15 s, before that run ends; the capture job ends only after the uploads settle;
 //   (4) the server down (503): a closed-app capture stays on the phone, core records the failure, nothing reaches the server;
 //       a forced scheduled run inside the cooldown is skipped ("skipped during failure cooldown") and sends no request; the job
 //       stays queued; the server back, the next capture's run uploads both and clears the failure record;
@@ -284,8 +286,9 @@ try {
     const reconciles = count(allLogs(), 'Native Android background sync schedule=on');
     sh('input keyevent KEYCODE_HOME');
     await sleep(2_000);
+    // The app comes back where it was left (Settings › Sync).
     device.launch(ACTIVITY);
-    await waitFor('the Inbox again', onInbox, 30_000);
+    await waitFor('the app in front again', () => front().includes(`${PKG}/`), 30_000);
     // Leaving and resuming each reconcile (core's triggers).
     await until('the leave\'s and the resume\'s reconcile', () => count(allLogs(), 'Native Android background sync schedule=on') >= reconciles + 2, 30_000, 1_000);
     const afterResume = unfinished(SYNC_WORK);
@@ -320,6 +323,28 @@ try {
     const ingestAt = job3.findIndex((line) => line.includes(INGEST_JOB[1]));
     check(finishedAt >= 0 && finishedAt < ingestAt, '(3) core\'s capture run finished (success) before the capture job reported success');
     check(serverTitles().includes(title(3)), `(3) the folder holds the capture "${title(3)}"`);
+
+    // (3b) A capture during a slow scheduled run: stored at once, the sync waited for after.
+    dav.state.delayMs = 25_000;
+    await killApp();
+    const syncJobs3b = count(allLogs(), ...SYNC_JOB);
+    const started3b = count(allLogs(), RUN_STARTED);
+    await until('(3b) JobScheduler to run the sync job', async () => {
+        const [queued] = unfinished(SYNC_WORK);
+        if (queued?.job !== undefined && queued?.job !== null) sh(`cmd jobscheduler run -f ${PKG} ${queued.job}`);
+        await sleep(4_000);
+        return count(allLogs(), RUN_STARTED) > started3b;
+    }, 90_000, 1_000);
+    const ingests3b = count(allLogs(), ...INGEST_JOB);
+    const sentAt = Date.now();
+    check(captureIntent(title(7)) === -1, '(3b) a capture while the scheduled run syncs with the slow server: RESULT_OK');
+    await until('(3b) the capture in the phone\'s database', () => phoneTitles().includes(title(7)), 15_000, 1_000);
+    const landedMs = Date.now() - sentAt;
+    check(count(allLogs(), ...SYNC_JOB) === syncJobs3b && count(allLogs(), ...INGEST_JOB) === ingests3b,
+        `(3b) the capture was stored ${Math.round(landedMs / 1000)} s after the intent, while the scheduled run and the capture job were still waiting on the server`);
+    await until('(3b) both jobs to end', () => count(allLogs(), ...SYNC_JOB) > syncJobs3b && count(allLogs(), ...INGEST_JOB) > ingests3b, 420_000, 3_000);
+    check(serverTitles().includes(title(7)), '(3b) once the server answered, the capture reached the folder before its job ended');
+    dav.state.delayMs = 0;
 
     // (4) The server down: the capture stays on the phone, the failure is recorded, a scheduled run sits out the cooldown.
     dav.state.down = true;
@@ -389,6 +414,15 @@ try {
     }
     console.log('DEVICE_RESULT pass');
 } catch (error) {
+    // Sync Off again, so a failed run leaves no WebDAV backend (and no scheduled job) on a dead port for the next check.
+    try {
+        dav.state.down = false;
+        dav.state.delayMs = 0;
+        if (!front().includes(`${PKG}/`)) device.launch(ACTIVITY);
+        await openSync();
+        await tapTag('sync-backend-off', (current) => current.some((node) => node.text === en['settings.syncOff']), 'Sync off');
+        await toTabs();
+    } catch (offError) { console.log(`warn - Sync could not be set Off after the failure: ${offError.message}`); }
     try {
         console.log(`evidence - app log (background sync):\n${allLogs().split('\n').filter((line) => /background sync|core work|queue drain|\[sync\]|sync started|Core action/.test(line))
             .slice(-60).map((line) => line.slice(0, 300)).join('\n')}`);
