@@ -372,6 +372,8 @@ body = body[:sources.end()] + '\n'.join(lines) + '\n' + body[sources.end():]
 commands = re.search(r'^(?P<indent> *)build-commands:\s*\n', body, flags=re.MULTILINE)
 indent = commands.group('indent') + '  '
 build = [
+    # Core's React peer lives in the separate desktop install, not above core.
+    'ln -sfn ../../../apps/desktop/node_modules/react packages/core/node_modules/react',
     'mkdir -p .flatpak-mcp-install',
     'cp apps/mcp-server/package.json apps/mcp-server/package-lock.json .flatpak-mcp-install/',
     'npm ci --prefix=.flatpak-mcp-install --offline --omit=optional --ignore-scripts --legacy-peer-deps --workspaces=false',

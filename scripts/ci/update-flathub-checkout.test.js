@@ -71,6 +71,9 @@ test("updates an unpatched Flathub manifest fixture", () => {
   expect(updated).toContain('sha256: 6bddacd6a65855698b9816f2d74871eda4dd0b7fa921140c6445248f94a742fd');
   expect(updated).toContain('only-arches: [aarch64]');
   expect(updated).toContain('npm ci --prefix=.flatpak-mcp-install --offline --omit=optional --ignore-scripts');
+  const reactPeer = 'ln -sfn ../../../apps/desktop/node_modules/react packages/core/node_modules/react';
+  expect(updated).toContain(reactPeer);
+  expect(updated.indexOf(reactPeer)).toBeLessThan(updated.indexOf('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs'));
   expect(updated).toContain('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs');
   expect(updated).toContain('/app/bin/mindwtr-mcp');
 });
