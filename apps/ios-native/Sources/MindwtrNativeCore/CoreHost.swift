@@ -541,6 +541,30 @@ private final class Engine: @unchecked Sendable {
     private var unresolvedAppLockRecovery = false
     private var closed = false
     private var pending: PendingCommand?
+    // One Engine turn binds the existing detached owner, independent editor and
+    // normal journal. It never grants attachment cleanup or persists a capability.
+    private final class RetainedOrdinaryTurn {
+        let owner: NativeAttachmentDraftStore.VersionedSnapshot
+        let fingerprint: String
+        let session: String
+        let runtime: JSContext
+        let jobs: NativeAttachmentFileJobs
+        let generation: UInt64
+        let replaying: Bool
+        var editor: EditorDraftStore.OwnedCheckpoint?
+        var journal: MixedSaveFileBinding?
+        var command: PendingCommand?
+        var preparationAllowed = false
+        init(owner: NativeAttachmentDraftStore.VersionedSnapshot, fingerprint: String, session: String,
+             runtime: JSContext, jobs: NativeAttachmentFileJobs, generation: UInt64,
+             editor: EditorDraftStore.OwnedCheckpoint?, journal: MixedSaveFileBinding?, command: PendingCommand?) {
+            self.owner = owner; self.fingerprint = fingerprint; self.session = session
+            self.runtime = runtime; self.jobs = jobs; self.generation = generation
+            self.editor = editor; self.journal = journal; self.command = command; self.replaying = command != nil
+        }
+    }
+    private var retainedOrdinaryTurn: RetainedOrdinaryTurn?
+    private var ordinaryMutationDepth = 0
     // Authorizes one interactive Commit; after journaling, the journal owns exact replay.
     private var preparedSomedaySectionTaskEnvelope: Data?
     private var confirmedTaskCancellationEnvelope: String?
@@ -809,6 +833,9 @@ private final class Engine: @unchecked Sendable {
         case .rejected(let message):
             guard isDefiniteRejection(message, method: saved.method) else { throw HostFailure("Invalid terminal command journal") }
         case nil: break
+        }
+        if attachmentDraftEvidence, ![Self.ownedDiscardMethod, Self.ownedSaveMethod, Self.mixedSaveMethod].contains(saved.method) {
+            try validateRetainedOrdinaryCommand(saved)
         }
         return saved
     }
@@ -1152,7 +1179,19 @@ private final class Engine: @unchecked Sendable {
             let sqlite = try SQLiteBridge(url: databaseURL)
             database = sqlite
             #if DEBUG
-            sqlite.faults = faults
+            let guardedFaults = HostIOFaults()
+            guardedFaults.beforeSQL = { [unowned self] sql in
+                try self.requireRetainedOrdinaryTurn(requirePreparation: true)
+                try self.faults?.beforeSQL?(sql)
+                try self.requireRetainedOrdinaryTurn(requirePreparation: true)
+            }
+            guardedFaults.afterSQL = { [unowned self] sql in
+                try self.faults?.afterSQL?(sql)
+                try self.requireRetainedOrdinaryTurn(requirePreparation: true)
+            }
+            guardedFaults.checkpoint = { [unowned self] in try self.faults?.checkpoint?() }
+            guardedFaults.afterIntegrity = { [unowned self] in try self.faults?.afterIntegrity?() }
+            sqlite.faults = guardedFaults
             #endif
             try sqlite.prepareRecovery(at: databaseURL.appendingPathExtension("prewrite"))
             recoveryActivationPending = pending != nil
@@ -1634,6 +1673,154 @@ private final class Engine: @unchecked Sendable {
     private func requireNoAttachmentDraft() throws {
         guard !attachmentDraftEvidence else { throw HostFailure("Attachment draft ownership requires exact recovery") }
     }
+    private static let retainedOrdinaryFailure = HostFailure("Retained attachment cleanup requires an exact ordinary owner")
+
+    private static func retainedAttemptMatches(_ a: EditorDraftAttempt?, _ b: EditorDraftAttempt?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case (.some(let a), .some(let b)): return ownedEqual(a, b)
+        default: return false
+        }
+    }
+    private static func retainedCommandMatches(_ a: PendingCommand, _ b: PendingCommand) -> Bool {
+        a.version == b.version && ownedEqual(a.method, b.method) && ownedEqual(a.argumentsJSON, b.argumentsJSON)
+            && retainedAttemptMatches(a.editorDraft, b.editorDraft)
+    }
+    private func detachedOrdinaryOwner() throws -> (NativeAttachmentDraftStore.VersionedSnapshot, String, String) {
+        guard let owner = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else {
+            throw Self.retainedOrdinaryFailure
+        }
+        switch owner.record {
+        case .legacy(let record):
+            return (owner, try NativeAttachmentDraftStore.ownedDiscardFingerprint(record), record.session.sessionID)
+        case .mixed(let record):
+            return (owner, try NativeAttachmentDraftStore.ownedMixedDiscardFingerprint(record), record.session.sessionID)
+        }
+    }
+    private func retainedOrdinaryJournalBinding() throws -> MixedSaveFileBinding? {
+        let before = try ownedDiscardIdentity(journalURL)
+        let bytes = try readJournalBytes(maximumBytes: nil, failure: Self.retainedOrdinaryFailure, singleLink: true)
+        guard before == (try ownedDiscardIdentity(journalURL)), (bytes == nil) == (before == nil) else {
+            throw Self.retainedOrdinaryFailure
+        }
+        guard let bytes, let before else { return nil }
+        return .init(bytes: bytes, identity: before)
+    }
+    private func validateOrdinaryEditorAttempt(_ attempt: EditorDraftAttempt, editor: EditorDraftStore.OwnedCheckpoint) throws {
+        guard ["saveDraft", "checklistSave", "boardAction", "taskDelete", "taskPromote"].contains(attempt.method),
+              Self.ownedDiscardUUID(attempt.id) != nil, Self.ownedDiscardUUID(attempt.sessionID) != nil,
+              editor.attempt == attempt, Self.ownedEqual(editor.snapshot.sessionID, attempt.sessionID),
+              Self.ownedEqual(editor.snapshot.taskID, attempt.taskID), editor.snapshot.generation == attempt.generation,
+              let raw = try arguments(attempt.method, attempt.argumentsJSON).first as? String,
+              let request = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              Self.editorRequestTaskID(attempt.method, request) == attempt.taskID,
+              attempt.method != "taskDelete" || request["source"] as? String != "reference",
+              attempt.method != "saveDraft" || request["scheduleBase"] != nil else { throw Self.retainedOrdinaryFailure }
+    }
+    private func ordinaryJournalArguments(_ command: PendingCommand) throws -> [Any] {
+        if command.method == "projectLifecycleCommit" { return try projectLifecycleJournalArguments(command) }
+        return try journalArguments(command, retainedOrdinary: true)
+    }
+    // Cold structural parsing happens after library lock/jobs acquisition and
+    // before a runtime exists. It validates current evidence, not a historical
+    // sidecar hash which the unchanged ordinary journal never recorded.
+    private func validateRetainedOrdinaryCommand(_ command: PendingCommand) throws {
+        guard !closed, lockFD >= 0, let jobs = attachmentJobs else { throw Self.retainedOrdinaryFailure }
+        jobs.drain()
+        let (_, _, session) = try detachedOrdinaryOwner()
+        let editor = try editorDrafts.readOwnedCheckpoint()
+        if let editor {
+            guard !Self.ownedEqual(editor.snapshot.sessionID, session) else { throw Self.retainedOrdinaryFailure }
+            if let attempt = editor.attempt {
+                guard command.editorDraft == attempt else { throw Self.retainedOrdinaryFailure }
+                try validateOrdinaryEditorAttempt(attempt, editor: editor)
+            }
+        }
+        _ = try ordinaryJournalArguments(command)
+    }
+    @discardableResult
+    private func beginRetainedOrdinaryTurn(command: PendingCommand? = nil,
+                                           attempt: EditorDraftAttempt? = nil) throws -> Bool {
+        if retainedOrdinaryTurn != nil { try requireRetainedOrdinaryTurn(); return false }
+        guard attachmentDraftEvidence else { return false }
+        guard started, !closed, lockFD >= 0, let runtime = context, let jobs = attachmentJobs,
+              command != nil || (pending == nil && !recoveryActivationPending) else { throw Self.retainedOrdinaryFailure }
+        jobs.drain()
+        let (owner, fingerprint, session) = try detachedOrdinaryOwner()
+        let editor = try editorDrafts.readOwnedCheckpoint(), journal = try retainedOrdinaryJournalBinding()
+        if let editor {
+            guard !Self.ownedEqual(editor.snapshot.sessionID, session) else { throw Self.retainedOrdinaryFailure }
+            if let frozen = editor.attempt {
+                guard frozen == (command?.editorDraft ?? attempt) else { throw Self.retainedOrdinaryFailure }
+                try validateOrdinaryEditorAttempt(frozen, editor: editor)
+            }
+        }
+        if let command {
+            guard let current = pending, Self.retainedCommandMatches(current, command) else { throw Self.retainedOrdinaryFailure }
+            _ = try ordinaryJournalArguments(command)
+            if let journal {
+                let actual = try JSONDecoder().decode(PendingCommand.self, from: journal.bytes)
+                guard Self.retainedCommandMatches(actual, command) else { throw Self.retainedOrdinaryFailure }
+            }
+        } else { guard journal == nil else { throw Self.retainedOrdinaryFailure } }
+        let turn = RetainedOrdinaryTurn(owner: owner, fingerprint: fingerprint, session: session,
+            runtime: runtime, jobs: jobs, generation: attachmentGeneration, editor: editor, journal: journal, command: command)
+        turn.preparationAllowed = command != nil
+        retainedOrdinaryTurn = turn
+        try requireRetainedOrdinaryTurn()
+        return true
+    }
+    private func requireRetainedOrdinaryTurn(requirePreparation: Bool = false, checkingJournal: Bool = true) throws {
+        guard let turn = retainedOrdinaryTurn else {
+            if ordinaryMutationDepth > 0 { try requireNoAttachmentDraft() }
+            return
+        }
+        guard started, !closed, lockFD >= 0, context === turn.runtime, attachmentJobs === turn.jobs,
+              attachmentGeneration == turn.generation, !requirePreparation || turn.preparationAllowed,
+              turn.command != nil || (pending == nil && (!recoveryActivationPending || turn.replaying)) else { throw Self.retainedOrdinaryFailure }
+        let (owner, fingerprint, session) = try detachedOrdinaryOwner()
+        guard turn.owner.matches(owner), Self.ownedEqual(fingerprint, turn.fingerprint), Self.ownedEqual(session, turn.session) else { throw Self.retainedOrdinaryFailure }
+        if checkingJournal { guard try retainedOrdinaryJournalBinding() == turn.journal else { throw Self.retainedOrdinaryFailure } }
+        let editor = try editorDrafts.readOwnedCheckpoint()
+        if let expected = turn.editor {
+            guard let editor, expected.matches(editor), !Self.ownedEqual(editor.snapshot.sessionID, turn.session) else {
+                throw Self.retainedOrdinaryFailure
+            }
+        } else { guard editor == nil else { throw Self.retainedOrdinaryFailure } }
+        if let command = turn.command {
+            guard let current = pending, current.version == command.version,
+                  Self.ownedEqual(current.method, command.method), Self.ownedEqual(current.argumentsJSON, command.argumentsJSON),
+                  Self.retainedAttemptMatches(current.editorDraft, command.editorDraft) else { throw Self.retainedOrdinaryFailure }
+        }
+    }
+    private func allowRetainedOrdinaryPreparation() throws {
+        try requireRetainedOrdinaryTurn()
+        retainedOrdinaryTurn?.preparationAllowed = true
+    }
+    private func requireOrdinaryEditorMutation() throws {
+        if retainedOrdinaryTurn != nil { try requireRetainedOrdinaryTurn() }
+        else { try requireNoAttachmentDraft() }
+    }
+    private func refreshOrdinaryEditor(snapshot: EditorDraftSnapshot?, attempt: EditorDraftAttempt?) throws {
+        guard let turn = retainedOrdinaryTurn else { return }
+        let actual = try editorDrafts.readOwnedCheckpoint()
+        if let snapshot {
+            guard let actual, Self.ownedEqual(actual.snapshot, snapshot), Self.retainedAttemptMatches(actual.attempt, attempt),
+                  !Self.ownedEqual(actual.snapshot.sessionID, turn.session) else { throw Self.retainedOrdinaryFailure }
+        } else { guard actual == nil else { throw Self.retainedOrdinaryFailure } }
+        turn.editor = actual
+        try requireRetainedOrdinaryTurn()
+    }
+    private func requireRawAttachmentRead(_ json: String, installer: Bool = false) throws {
+        guard attachmentDraftEvidence else { return }
+        guard json.utf8.count <= (installer ? 64 * 1024 : 24 * 1024 * 1024),
+              let raw = try NativeJSON.jsonObject(with: Data(json.utf8)) as? [String: Any], let operation = raw["op"] as? String,
+              installer ? operation == "hash" : ["barrier", "sha256", "getInfo", "readDirectory", "readBytes",
+                "readBytesRange", "sha256File"].contains(operation) else { throw Self.retainedOrdinaryFailure }
+        // The existing adapter still owns full arity/URI/range grammar. Unknown
+        // operations and all raw mutations fail before queue admission.
+    }
+
     private func attachmentDraftCoordinator() throws -> NativeAttachmentDraftCoordinator {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil, !recoveryActivationPending, let jobs = attachmentJobs else {
@@ -3801,6 +3988,33 @@ private final class Engine: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft recovery is not settled") }
         guard let current = try editorDrafts.read() else { return nil }
+        if attachmentDraftEvidence, (try? detachedOrdinaryOwner()) != nil {
+            let owns = try beginRetainedOrdinaryTurn(attempt: current.attempt)
+            defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
+            try requireRetainedOrdinaryTurn()
+            if let attempt = current.attempt {
+                guard try ownedJournalIsAbsent() else { throw Self.retainedOrdinaryFailure }
+                try editorDrafts.thaw(attempt)
+                try refreshOrdinaryEditor(snapshot: current.snapshot, attempt: nil)
+            }
+            try requireRetainedOrdinaryTurn()
+            return current.snapshot
+        }
+        if attachmentDraftEvidence {
+            // Preserve the historical owned-editor read/reconcile path, but a
+            // foreign independent editor cannot borrow a corrupt, decided or
+            // otherwise nonqualified owner's presence to reopen ordinary work.
+            guard let owner = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else {
+                throw Self.retainedOrdinaryFailure
+            }
+            let session: NativeAttachmentDraftStore.Session
+            switch owner.record {
+            case .legacy(let record): session = record.session
+            case .mixed(let record): session = record.session
+            }
+            guard Self.ownedEqual(current.snapshot.sessionID, session.sessionID),
+                  Self.ownedEqual(current.snapshot.taskID, session.taskID) else { throw Self.retainedOrdinaryFailure }
+        }
         if let attempt = current.attempt {
             if attempt.method == "attachmentDraftSave" {
                 try reconcileUnjournaledOwnedSave(snapshot: current.snapshot, attempt: attempt)
@@ -3817,6 +4031,17 @@ private final class Engine: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft is not ready") }
         if attachmentDraftEvidence {
+            if (try? detachedOrdinaryOwner()) != nil {
+                let owns = try beginRetainedOrdinaryTurn()
+                defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
+                guard let turn = retainedOrdinaryTurn, !Self.ownedEqual(snapshot.sessionID, turn.session) else {
+                    throw Self.retainedOrdinaryFailure
+                }
+                try requireRetainedOrdinaryTurn()
+                try editorDrafts.checkpoint(snapshot)
+                try refreshOrdinaryEditor(snapshot: snapshot, attempt: nil)
+                return
+            }
             guard let loaded = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else {
                 throw HostFailure("Attachment draft ownership requires exact recovery")
             }
@@ -3833,14 +4058,23 @@ private final class Engine: @unchecked Sendable {
             }
             return
         }
+        try requireNoAttachmentDraft()
         try editorDrafts.checkpoint(snapshot)
+        try requireNoAttachmentDraft()
     }
 
     func discardEditorDraft(expectedSession: String) throws {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor Save must settle before discard") }
-        try requireNoAttachmentDraft()
+        let owns = try beginRetainedOrdinaryTurn()
+        defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
+        if let turn = retainedOrdinaryTurn {
+            guard let editor = turn.editor, editor.attempt == nil,
+                  Self.ownedEqual(editor.snapshot.sessionID, expectedSession) else { throw Self.retainedOrdinaryFailure }
+        }
+        try requireOrdinaryEditorMutation()
         try editorDrafts.discard(sessionID: expectedSession)
+        try refreshOrdinaryEditor(snapshot: nil, attempt: nil)
     }
 
     func discardCorruptEditorDraft() throws {
@@ -3882,7 +4116,9 @@ private final class Engine: @unchecked Sendable {
         guard started, !closed, pending == nil, ["saveDraft", "checklistSave", "boardAction", "taskDelete", "taskPromote"].contains(method) else {
             throw HostFailure("Editor Save is not ready")
         }
-        try requireNoAttachmentDraft()
+        let owns = try beginRetainedOrdinaryTurn()
+        defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
+        try requireOrdinaryEditorMutation()
         let args = try arguments(method, argumentsJSON)
         guard let encoded = args.first as? String,
               let request = try NativeJSON.jsonObject(with: Data(encoded.utf8)) as? [String: Any],
@@ -3896,13 +4132,19 @@ private final class Engine: @unchecked Sendable {
         }
         let attempt = try editorDrafts.freeze(sessionID: expectedSession, generation: expectedGeneration,
                                               method: method, argumentsJSON: argumentsJSON)
+        try refreshOrdinaryEditor(snapshot: current.snapshot, attempt: attempt)
         let value: String
         do {
             value = try call(method, argumentsJSON: argumentsJSON, editorAttempt: attempt)
         } catch {
             // A command that never entered the journal, or a definite refusal,
             // cannot have written. Keep uncertain attempts frozen for exact replay.
-            if pending == nil { try requireNoAttachmentDraft(); try editorDrafts.thaw(attempt) }
+            if pending == nil {
+                try requireOrdinaryEditorMutation()
+                guard try ownedJournalIsAbsent() else { throw Self.retainedOrdinaryFailure }
+                try editorDrafts.thaw(attempt)
+                try refreshOrdinaryEditor(snapshot: current.snapshot, attempt: nil)
+            }
             throw error
         }
         // A prepared draft no-op returns before a journal exists. Cleanup errors
@@ -3912,9 +4154,11 @@ private final class Engine: @unchecked Sendable {
             #if DEBUG
             try faults?.editorDraftRemove?()
             #endif
-            try requireNoAttachmentDraft()
+            try requireOrdinaryEditorMutation()
             try editorDrafts.removeMatching(attempt)
+            try refreshOrdinaryEditor(snapshot: nil, attempt: nil)
         }
+        try requireRetainedOrdinaryTurn()
         return value
     }
 
@@ -4191,7 +4435,13 @@ private final class Engine: @unchecked Sendable {
     private func call(_ method: String, argumentsJSON: String, editorAttempt: EditorDraftAttempt?) throws -> String {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, !recoveryActivationPending else { throw HostFailure("Core host is not ready; retry startup") }
-        if Self.mutations.contains(method) { try requireNoAttachmentDraft() }
+        let mutation = Self.mutations.contains(method)
+        let ownsRetainedTurn = mutation ? try beginRetainedOrdinaryTurn(attempt: editorAttempt) : false
+        if mutation { ordinaryMutationDepth += 1 }
+        defer {
+            if mutation { ordinaryMutationDepth -= 1 }
+            if ownsRetainedTurn && pending == nil { retainedOrdinaryTurn = nil }
+        }
         if editorAttempt == nil, ["taskCompletion", "taskCompletionUndo"].contains(method) {
             let completionRequest: [String: Any]?
             if method == "taskCompletion" {
@@ -4920,6 +5170,7 @@ private final class Engine: @unchecked Sendable {
         }
         let command: PendingCommand
         if ["somedaySectionMoveWrite", "somedaySectionMoveUndo"].contains(method) {
+            try allowRetainedOrdinaryPreparation()
             do {
                 switch try prepareSomedaySectionMove(method: method, arguments: args) {
                 case .noop(let value): return value
@@ -4927,6 +5178,7 @@ private final class Engine: @unchecked Sendable {
                 }
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectFocusWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectFocusPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -4967,6 +5219,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectFocusValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "taskFocusWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("taskFocusPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5104,6 +5357,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("savedSearchValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectRenameWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectRenamePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5144,6 +5398,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectRenameValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectFlowWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectFlowPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5183,6 +5438,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectFlowValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectTaskSortWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectTaskSortPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5220,6 +5476,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectTaskSortValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectTaskOrderWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectTaskOrderPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5253,6 +5510,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectTaskOrderValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectNotesWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectNotesWritePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5294,6 +5552,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectNotesWriteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectTagsWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectTagsWritePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5334,6 +5593,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectTagsWriteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectAttachmentWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectAttachmentWritePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5372,6 +5632,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectAttachmentWriteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectStatusWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectStatusPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5416,6 +5677,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectStatusValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectDateWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectDatePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5458,6 +5720,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectDateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectAreaWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectAreaPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5665,6 +5928,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("managePersonDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "areaDelete" || method == "manageAreaDelete" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("areaDeletePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5686,6 +5950,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("areaDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "areaOrder" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("areaOrderPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5722,6 +5987,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("areaOrderValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "areaColor" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("areaColorPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5743,6 +6009,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("areaColorValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "areaRename" || method == "manageAreaEdit" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("areaRenamePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5802,6 +6069,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("managePersonCreateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "areaCreate" || method == "manageAreaCreate" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("areaCreatePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5838,6 +6106,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("areaCreateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectSectionCreate" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectSectionCreatePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5862,6 +6131,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectSectionCreateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectSectionRename" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectSectionRenamePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5896,6 +6166,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectSectionRenameValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectSectionDelete" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectSectionDeletePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5920,6 +6191,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectSectionDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectSectionOrder" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectSectionOrderPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5944,6 +6216,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectSectionOrderValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectCreate" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("projectCreatePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -5974,12 +6247,15 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectCreateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if ["taskCompletion", "taskCompletionUndo"].contains(method) {
+            try allowRetainedOrdinaryPreparation()
             do { command = try prepareTaskCompletionCommand(method, args: args) }
             catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "referenceTasksMoveWrite" {
+            try allowRetainedOrdinaryPreparation()
             do { command = try prepareReferenceTasksMoveCommand(arguments: args) }
             catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "referenceTasksAddTagWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 switch try prepareReferenceTasksAddTagCommand(arguments: args) {
                 case .noop(let result): return result
@@ -5987,6 +6263,7 @@ private final class Engine: @unchecked Sendable {
                 }
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "referenceTasksRemoveTagWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 switch try prepareReferenceTasksRemoveTagCommand(arguments: args) {
                 case .noop(let result): return result
@@ -5994,6 +6271,7 @@ private final class Engine: @unchecked Sendable {
                 }
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if let prefix = Self.archivedRestorePrefix(method), method == prefix + "Write" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 switch try prepareArchivedRestoreCommand(prefix: prefix, arguments: args) {
                 case .noop(let result): return result
@@ -6002,6 +6280,7 @@ private final class Engine: @unchecked Sendable {
             }
             catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if let prefix = Self.historyTaskWritePrefix(method), method == prefix + "Write" || ["referenceTaskBackdate", "referenceTaskDestination", "referenceProjectNextAction"].contains(method) {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let action = prefix == "referenceProjectNextAction" ? "Reference project next action" : prefix == "referenceTaskDestination" ? "Reference destination" : prefix == "referenceTaskBackdate" ? "Reference completion time" : prefix == "doneTaskStatus" ? "Done status"
                     : prefix == "archiveTaskCompletedAt" ? "Archive completion time" : "Done completion time"
@@ -6041,6 +6320,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke(prefix + "Validate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if let prefix = Self.archivedTasksDeletePrefix(method), method == prefix + "Write" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let encoded = prefix == "archivedTasksDeleteUndo" ? confirmedArchivedTasksDeleteEnvelope : args.first as? String
                 let value = encoded.flatMap { try? NativeJSON.jsonObject(with: Data($0.utf8)) as? [String: Any] }
@@ -6052,6 +6332,7 @@ private final class Engine: @unchecked Sendable {
             }
             catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "taskDelete" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let submitted = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6076,6 +6357,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("taskDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "taskPromote" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let submitted = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6097,6 +6379,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("validatePreparedTaskPromotion", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "taskDeleteUndo" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let encodedRequest = args.first as? String,
                       let request = try NativeJSON.jsonObject(with: Data(encodedRequest.utf8)) as? [String: Any],
@@ -6121,6 +6404,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("taskDeleteUndoValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "trashTaskRestoreWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let submitted = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6141,6 +6425,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("trashTaskRestoreValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "trashProjectRestoreWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let submitted = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6161,6 +6446,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("trashProjectRestoreValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectDeleteWrite" || method == "projectDeleteUndo" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let request = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6192,6 +6478,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke(undo ? "projectDeleteUndoValidate" : "projectDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectDuplicateWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let request = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6212,6 +6499,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectDuplicateValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "projectLifecycleWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let request = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any] else {
@@ -6232,6 +6520,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("projectLifecycleValidate", arguments: projectLifecycleJournalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "taskCancellationUndo" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let encodedRequest = args.first as? String,
                       let request = try NativeJSON.jsonObject(with: Data(encodedRequest.utf8)) as? [String: Any],
@@ -6256,6 +6545,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("taskCancellationUndoValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if ["checklistSave", "checklistReset"].contains(method) {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke(method == "checklistSave" ? "checklistSavePrepare" : "checklistResetPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6288,6 +6578,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("checklistPreparedValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if ["inboxCommit", "inboxSkip"].contains(method) {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke(method == "inboxCommit" ? "inboxCommitPrepare" : "inboxSkipPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6313,6 +6604,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("inboxPreparedValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "mindSweepAdd" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("mindSweepPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6329,6 +6621,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("mindSweepValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "calendarDelete" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("calendarDeletePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6345,6 +6638,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("calendarDeleteValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "calendarUnschedule" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("calendarUnschedulePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6374,6 +6668,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke("calendarUnscheduleValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "calendarComposerSave" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 guard let original = args.first as? String,
                       let submitted = try NativeJSON.jsonObject(with: Data(original.utf8)) as? [String: Any],
@@ -6405,6 +6700,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try invoke(creating ? "calendarComposerCreateValidate" : "calendarComposerValidate", arguments: journalArguments(command))
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "boardAction" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("boardPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6428,6 +6724,7 @@ private final class Engine: @unchecked Sendable {
                 _ = try journalArguments(command)
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "captureSubmit" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("capturePrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6440,6 +6737,7 @@ private final class Engine: @unchecked Sendable {
                 command = PendingCommand(version: 2, method: "captureCommit", argumentsJSON: encoded)
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else if method == "reviewTaskWrite" {
+            try allowRetainedOrdinaryPreparation()
             do {
                 switch try prepareReviewTaskWrite(args) {
                 case .noop(let value): return value
@@ -6452,6 +6750,7 @@ private final class Engine: @unchecked Sendable {
                   let inputJSON = args.first as? String,
                   let input = try NativeJSON.jsonObject(with: Data(inputJSON.utf8)) as? [String: Any],
                   input["scheduleBase"] != nil {
+            try allowRetainedOrdinaryPreparation()
             do {
                 let value = try invoke("draftPrepare", arguments: args)
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -6475,6 +6774,12 @@ private final class Engine: @unchecked Sendable {
             } catch { throw CoreHostRejection(message: error.localizedDescription) }
         } else {
             command = PendingCommand(version: 2, method: method, argumentsJSON: argumentsJSON)
+            if retainedOrdinaryTurn != nil { _ = try ordinaryJournalArguments(command); try allowRetainedOrdinaryPreparation() }
+        }
+        if let turn = retainedOrdinaryTurn {
+            try requireRetainedOrdinaryTurn(requirePreparation: true)
+            _ = try ordinaryJournalArguments(command)
+            turn.command = command
         }
         pending = command
         try persist(command)
@@ -6589,6 +6894,14 @@ private final class Engine: @unchecked Sendable {
             try attachmentDraftHooks?.boundary?(.afterSaveCommit)
             #endif
             return try finishOwnedSave(command, with: .success(value))
+        }
+        _ = try beginRetainedOrdinaryTurn(command: command)
+        ordinaryMutationDepth += 1
+        defer {
+            ordinaryMutationDepth -= 1
+            // A retry may reuse the original warm binding. Settlement releases
+            // it only after terminal/editor/journal cleanup finishes.
+            if pending == nil { retainedOrdinaryTurn = nil }
         }
         if let terminal = command.terminal {
             if command.method == "referenceTasksMoveCommit", case .success(let value) = terminal {
@@ -7027,9 +7340,17 @@ private final class Engine: @unchecked Sendable {
         // Once persisted, restart can clean up without entering core again.
         pending = finished
         try persist(finished)
+        if retainedOrdinaryTurn != nil, case .success = terminal {
+            try requireRetainedOrdinaryTurn(requirePreparation: true)
+            NSLog("Native iOS retained attachment cleanup preserved during ordinary write releaseCheck=v1.3.5/ios-retained-cleanup-ordinary-work outcome=confirmed")
+            #if DEBUG
+            faults?.commandDiagnostic?("retainedCleanupOrdinaryApplied")
+            #endif
+            try requireRetainedOrdinaryTurn()
+        }
         // Both removal after success and thaw after definite refusal belong to
         // this exact editor proof. Retain the terminal journal on a conflict.
-        if command.editorDraft != nil { try requireNoAttachmentDraft() }
+        if command.editorDraft != nil { try requireOrdinaryEditorMutation() }
         if command.method == "backupDocumentCommit", case .success = terminal {
             try backupOperationFiles.complete(backupOperationReference(command))
         }
@@ -7037,8 +7358,9 @@ private final class Engine: @unchecked Sendable {
             #if DEBUG
             try faults?.editorDraftRemove?()
             #endif
-            try requireNoAttachmentDraft()
+            try requireOrdinaryEditorMutation()
             try editorDrafts.removeMatching(attempt)
+            try refreshOrdinaryEditor(snapshot: nil, attempt: nil)
         }
         try clearPending()
         if command.method == "backupDocumentCommit" {
@@ -7050,8 +7372,10 @@ private final class Engine: @unchecked Sendable {
             try? backupOperationFiles.discard(backupOperationReference(command), provenRejected: rejected)
         }
         if let attempt = command.editorDraft, case .rejected = terminal {
-            try requireNoAttachmentDraft()
+            try requireOrdinaryEditorMutation()
+            let snapshot = retainedOrdinaryTurn?.editor?.snapshot
             try editorDrafts.thaw(attempt)
+            try refreshOrdinaryEditor(snapshot: snapshot, attempt: nil)
         }
         if command.method == "draftCommit", case .success = terminal {
 #if DEBUG
@@ -10525,14 +10849,16 @@ private final class Engine: @unchecked Sendable {
         }
     }
 
-    private func journalArguments(_ command: PendingCommand, checkingEditorSnapshot: Bool = true) throws -> [Any] {
-        if command.method == Self.mixedSaveMethod { return [try mixedSaveJournal(command).envelopeJSON] }
-        if command.method == Self.ownedSaveMethod { return [try ownedSaveJournal(command).envelopeJSON] }
+    private func journalArguments(_ command: PendingCommand, checkingEditorSnapshot: Bool = true, retainedOrdinary: Bool = false) throws -> [Any] {
+        if command.method == Self.mixedSaveMethod { guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }; return [try mixedSaveJournal(command).envelopeJSON] }
+        if command.method == Self.ownedSaveMethod { guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }; return [try ownedSaveJournal(command).envelopeJSON] }
         if command.method == "backupDocumentCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             _ = try backupOperationReference(command)
             return [try backupEncoded(backupOperationReference(command))]
         }
         if command.method == "dataSetting" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.editorDraft == nil else { throw HostFailure("Invalid Data setting journal") }
             return try arguments(command.method, command.argumentsJSON)
         }
@@ -10675,14 +11001,15 @@ private final class Engine: @unchecked Sendable {
                 throw HostFailure("Editor draft journal is missing its frozen snapshot")
             }
         }
-        if let args = try journalSettingsAndProjectSectionArguments(command) { return args }
+        if let args = try journalSettingsAndProjectSectionArguments(command, retainedOrdinary: retainedOrdinary) { return args }
         if let args = try journalProjectArguments(command) { return args }
         if let args = try journalAreaAndPreparedTaskArguments(command) { return args }
-        return try journalLegacyAndCaptureArguments(command)
+        return try journalLegacyAndCaptureArguments(command, retainedOrdinary: retainedOrdinary)
     }
 
-    private func journalSettingsAndProjectSectionArguments(_ command: PendingCommand) throws -> [Any]? {
+    private func journalSettingsAndProjectSectionArguments(_ command: PendingCommand, retainedOrdinary: Bool = false) throws -> [Any]? {
         if command.method == "appLockCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 49_152,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 8_192,
@@ -10700,6 +11027,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "gtdWorkflowCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10722,6 +11050,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "generalPreferenceCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 49_152,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 8_192,
@@ -10738,6 +11067,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "manageTaxonomyCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10754,6 +11084,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "managePersonEditCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10770,6 +11101,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "managePersonDeleteCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10786,6 +11118,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "managePersonCreateCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10820,6 +11153,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "focusOrderCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 2_100_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10837,6 +11171,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "focusSavedFilterCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 2_100_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -10854,6 +11189,7 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         if command.method == "savedSearchCommit" {
+            guard !retainedOrdinary else { throw Self.retainedOrdinaryFailure }
             guard command.argumentsJSON.utf8.count <= 2_100_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
                   args[0].utf8.count <= 2_000_000,
@@ -11482,10 +11818,13 @@ private final class Engine: @unchecked Sendable {
         }
     }
 
-    private func journalLegacyAndCaptureArguments(_ command: PendingCommand) throws -> [Any] {
+    private func journalLegacyAndCaptureArguments(_ command: PendingCommand, retainedOrdinary: Bool = false) throws -> [Any] {
         // These commands store a final state. Text drafts also carry the exact
         // base values; core accepts an applied edit or refuses an intervening one.
         if ["complete", "setAreaFilter", "saveDraft", "calendarPreference", "focusGroupWrite", "taskListSortWrite", "unassignedAreaColorWrite", "somedaySectionCreateWrite", "somedaySectionRenameWrite", "somedaySectionDeleteWrite", "somedaySectionOrderWrite", "somedaySectionTaskCommit"].contains(command.method) {
+            // Only these existing final-state task routes are ordinary. The
+            // remaining branch members write preferences/global section settings.
+            guard !retainedOrdinary || ["complete", "saveDraft"].contains(command.method) else { throw Self.retainedOrdinaryFailure }
             // A raw schedule intent was never a supported legacy journal. It
             // must not be reparsed/reprepared under a different clock or zone.
             return try arguments(command.method, command.argumentsJSON, allowPreparedDates: false)
@@ -13937,19 +14276,55 @@ private final class Engine: @unchecked Sendable {
             try DurableFile.write(data, to: journalURL, privateDraft: true)
             return
         }
+        if let turn = retainedOrdinaryTurn {
+            try requireRetainedOrdinaryTurn(requirePreparation: true)
+            _ = try ordinaryJournalArguments(command)
+            guard let expected = turn.command, Self.retainedCommandMatches(expected, command) else { throw Self.retainedOrdinaryFailure }
+        }
         #if DEBUG
         try faults?.journalWrite?()
         #endif
-        try DurableFile.write(JSONEncoder().encode(command), to: journalURL)
+        try requireRetainedOrdinaryTurn(requirePreparation: true)
+        let bytes = try JSONEncoder().encode(command)
+        do { try DurableFile.write(bytes, to: journalURL) }
+        catch {
+            // Only this exact attempted write may have become visible before a
+            // directory-sync ACK was lost. Preserve the same warm owner/editor;
+            // retry must re-ACK these bytes, never adopt another ordinary plan.
+            if let turn = retainedOrdinaryTurn {
+                try requireRetainedOrdinaryTurn(checkingJournal: false)
+                let actual = try retainedOrdinaryJournalBinding()
+                if actual?.bytes == bytes { turn.journal = actual }
+            }
+            throw error
+        }
+        if let turn = retainedOrdinaryTurn {
+            try requireRetainedOrdinaryTurn(checkingJournal: false)
+            guard let actual = try retainedOrdinaryJournalBinding(), actual.bytes == bytes else { throw Self.retainedOrdinaryFailure }
+            turn.journal = actual
+            try requireRetainedOrdinaryTurn()
+        }
     }
 
     private func clearPending() throws {
+        try requireRetainedOrdinaryTurn()
         #if DEBUG
         try faults?.journalRemove?()
         #endif
-        if pending?.editorDraft != nil { try requireNoAttachmentDraft() }
-        try DurableFile.remove(journalURL)
+        if pending?.editorDraft != nil { try requireOrdinaryEditorMutation() }
+        try requireRetainedOrdinaryTurn()
+        do { try DurableFile.remove(journalURL) }
+        catch {
+            if let turn = retainedOrdinaryTurn {
+                try requireRetainedOrdinaryTurn(checkingJournal: false)
+                if try retainedOrdinaryJournalBinding() == nil { turn.journal = nil }
+            }
+            throw error
+        }
+        retainedOrdinaryTurn?.journal = nil
+        retainedOrdinaryTurn?.command = nil
         pending = nil
+        try requireRetainedOrdinaryTurn()
     }
 
     func localAttachmentRequest(name: String, requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
@@ -14012,6 +14387,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func invoke(_ method: String, arguments: [Any], localCancellation: NativeAttachmentCancellation? = nil) throws -> String {
+        try requireRetainedOrdinaryTurn(requirePreparation: true)
         guard let context, let host = context.objectForKeyedSubscript("MindwtrHost") else { throw HostFailure("Core runtime unavailable") }
         invoking = true
         defer { invoking = false; scheduleAttachmentIdle(immediate: true) }
@@ -14076,8 +14452,10 @@ private final class Engine: @unchecked Sendable {
                 }
                 if !ok { throw HostFailure(envelope["error"] as? String ?? "Core command failed") }
                 guard let value = envelope["value"] else { throw HostFailure("Core response has no value") }
+                try requireRetainedOrdinaryTurn(requirePreparation: true)
                 return String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
             }
+            try requireRetainedOrdinaryTurn(requirePreparation: true)
             let delay = context.objectForKeyedSubscript("__nextTimerDelay")?.call(withArguments: [])?.toDouble() ?? 1
             try checkException()
             Thread.sleep(forTimeInterval: delay.isFinite && delay > 0 ? min(delay, 10) / 1_000 : 0.001)
@@ -14118,18 +14496,27 @@ private final class Engine: @unchecked Sendable {
         }
     }
 
+    private func ordinaryGuardedSQL(_ sql: String, parameters: String? = nil) throws -> String {
+        try requireRetainedOrdinaryTurn(requirePreparation: true)
+        let result: String
+        if let parameters { result = try requireDatabase().execute(sql, parametersJSON: parameters) }
+        else { result = try requireDatabase().execute(sql) }
+        try requireRetainedOrdinaryTurn(requirePreparation: true)
+        return result
+    }
+
     private func installBridge(_ context: JSContext) {
         let run: @convention(block) (String, String) -> String? = { [weak self] sql, parameters in
             guard let self else { return "!MindwtrNativeError:Native database unavailable" }
-            return self.guarded { _ = try self.requireDatabase().execute(sql, parametersJSON: parameters); return nil }
+            return self.guarded { _ = try self.ordinaryGuardedSQL(sql, parameters: parameters); return nil }
         }
         let all: @convention(block) (String, String) -> String = { [weak self] sql, parameters in
             guard let self else { return "!MindwtrNativeError:Native database unavailable" }
-            return self.guarded { try self.requireDatabase().execute(sql, parametersJSON: parameters) } ?? "[]"
+            return self.guarded { try self.ordinaryGuardedSQL(sql, parameters: parameters) } ?? "[]"
         }
         let exec: @convention(block) (String) -> String? = { [weak self] sql in
             guard let self else { return "!MindwtrNativeError:Native database unavailable" }
-            return self.guarded { _ = try self.requireDatabase().execute(sql); return nil }
+            return self.guarded { _ = try self.ordinaryGuardedSQL(sql); return nil }
         }
         let logFile: @convention(block) (JSValue, JSValue) -> String = { [weak self] operation, text in
             guard let self, operation.isString, text.isString else { return "!MindwtrNativeError:Diagnostics file operation unavailable" }
@@ -14237,11 +14624,11 @@ private final class Engine: @unchecked Sendable {
         if let jobs = attachmentJobs {
             let fileCall: @convention(block) (JSValue) -> String = { [weak self] request in
                 guard let self, request.isString, let json = request.toString() else { return "!MindwtrNativeError:Attachment file request is invalid" }
-                return self.guarded { try jobs.submit(json) } ?? "!MindwtrNativeError:Attachment file operation is unavailable"
+                return self.guarded { try self.requireRawAttachmentRead(json); return try jobs.submit(json) } ?? "!MindwtrNativeError:Attachment file operation is unavailable"
             }
             let installerCall: @convention(block) (JSValue) -> String = { [weak self] request in
                 guard let self, request.isString, let json = request.toString() else { return "!MindwtrNativeError:Attachment installer request is invalid" }
-                return self.guarded { try jobs.submit(json, installer: true) } ?? "!MindwtrNativeError:Attachment file operation is unavailable"
+                return self.guarded { try self.requireRawAttachmentRead(json, installer: true); return try jobs.submit(json, installer: true) } ?? "!MindwtrNativeError:Attachment file operation is unavailable"
             }
             let abort: @convention(block) (JSValue) -> Void = { request in
                 guard request.isString, let id = request.toString() else { return }; jobs.abort(id)
@@ -14249,7 +14636,7 @@ private final class Engine: @unchecked Sendable {
             let directories: @convention(block) () -> String = { jobs.directoriesJSON }
             let delete: @convention(block) (JSValue) -> String? = { [weak self] request in
                 guard let self, request.isString, let uri = request.toString() else { return "!MindwtrNativeError:Attachment file request is invalid" }
-                return self.guarded { try jobs.deleteNow(uri); return nil }
+                return self.guarded { try self.requireNoAttachmentDraft(); try jobs.deleteNow(uri); return nil }
             }
             let next: @convention(block) () -> String = { jobs.next() }
             let body: @convention(block) () -> String = { jobs.body() }
@@ -14280,6 +14667,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func releaseRuntime() {
+        retainedOrdinaryTurn = nil
         attachmentGeneration &+= 1
         attachmentIdlePump?.cancel(); attachmentIdlePump = nil
         // No file/installer worker survives release of the library lock.
