@@ -233,7 +233,7 @@ final class NativeAttachmentDraftCoordinator {
         try projection(record, payload: snapshot.payloadJSON)
         let pending = checkpointRecord(record, checkpoint: record.session.checkpoint,
             advance: .init(before: record.session.checkpoint, after: snapshot))
-        try preflightAdvance(pending)
+        try preflightAdvanceAdmission(pending)
         #if DEBUG
         try hooks?.boundary?(.beforeAdvanceIntent)
         #endif
@@ -244,6 +244,7 @@ final class NativeAttachmentDraftCoordinator {
         try hooks?.boundary?(.afterAdvanceIntent)
         #endif
         _ = try finishAdvance(pending)
+        acknowledge("discard-capacity", "confirmed")
         acknowledge("checkpoint", "confirmed")
     }
 
@@ -270,6 +271,26 @@ final class NativeAttachmentDraftCoordinator {
         // Before intent, only the pending record can pass retained-write checks;
         // the settled record requires that intent already present on disk.
         try store.preflight(record)
+    }
+    /// Reserve future Discard only before a new intent is admitted. Recovery
+    /// must finish an older recorded pair under its original capacity checks.
+    private func preflightAdvanceAdmission(_ record: Store.Record) throws {
+        try preflightAdvance(record)
+        guard let advance = record.checkpointAdvance else { throw Self.failure }
+        let settled = checkpointRecord(record, checkpoint: advance.after, advance: nil)
+        let discardID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        let request = try Self.json(["version": 1, "requestId": discardID,
+            "sessionID": advance.after.sessionID, "generation": advance.after.generation])
+        let reply = try Self.json(["version": 1, "status": "cleanupPending",
+            "requestId": discardID, "sessionID": advance.after.sessionID])
+        for phase in [Store.DiscardPhase.decided, .detached] {
+            let future = Store.Record(version: settled.version,
+                session: .init(sessionID: settled.session.sessionID, taskID: settled.session.taskID,
+                    state: .cleanupPending, checkpoint: advance.after), operations: settled.operations,
+                discard: .init(requestId: discardID, requestJSON: request, expected: advance.after,
+                    phase: phase, replyJSON: phase == .detached ? reply : nil), checkpointAdvance: nil)
+            guard try JSONEncoder().encode(future).count <= Store.maximumBytes else { throw Self.failure }
+        }
     }
     private func finishAdvance(_ record: Store.Record) throws -> Store.Record {
         guard record.version == 2, let advance = record.checkpointAdvance else { throw Self.failure }

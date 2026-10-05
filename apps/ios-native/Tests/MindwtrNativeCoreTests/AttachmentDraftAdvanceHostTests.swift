@@ -601,4 +601,144 @@ final class AttachmentDraftAdvanceHostTests: XCTestCase {
         _ = try await cold.recoverAttachmentDraft(expectedSession: initial.sessionID)
         same(try latest(), after); XCTAssertNil(try record().checkpointAdvance)
     }
+
+    private struct DiscardCapacityFixture {
+        let host: CoreHost
+        let accepted: NativeAttachmentDraftStore.Record
+        let fitting: EditorDraftSnapshot
+        let over: EditorDraftSnapshot
+        let files: [URL: Data]
+        let domain: String
+    }
+    private func advanceCapacityCandidates(_ record: NativeAttachmentDraftStore.Record,
+                                           after: EditorDraftSnapshot) throws -> [NativeAttachmentDraftStore.Record] {
+        let pending = NativeAttachmentDraftStore.Record(version: 2, session: record.session,
+            operations: record.operations, checkpointAdvance: .init(before: record.session.checkpoint, after: after))
+        let settled = NativeAttachmentDraftStore.Record(version: 2,
+            session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID, state: .active, checkpoint: after),
+            operations: record.operations)
+        let id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        let request = try json(["version": 1, "requestId": id, "sessionID": after.sessionID, "generation": after.generation])
+        let reply = try json(["version": 1, "status": "cleanupPending", "requestId": id, "sessionID": after.sessionID])
+        let discards = [NativeAttachmentDraftStore.DiscardPhase.decided, .detached].map { phase in
+            NativeAttachmentDraftStore.Record(version: 2,
+                session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID, state: .cleanupPending, checkpoint: after),
+                operations: record.operations, discard: .init(requestId: id, requestJSON: request, expected: after,
+                    phase: phase, replyJSON: phase == .detached ? reply : nil))
+        }
+        return [pending, settled] + discards
+    }
+    private func discardCapacityFixture() async throws -> DiscardCapacityFixture {
+        let (host, initial) = try await seed(extra: String(repeating: "x", count: 320_000))
+        try await begin(host, initial)
+        let input = try source()
+        // Actual shared preparation and native publication retain the complete
+        // large opaque initial payload in five immutable Add operations.
+        for _ in 0..<5 { _ = try await host.addAttachmentDraft(requestJSON: addRequest(latest(), source: input)) }
+        let small = try edited(latest(), generation: latest().generation + 7)
+        try await host.checkpointEditorDraft(small)
+        let accepted = try record()
+        func grown(_ padding: Int) -> EditorDraftSnapshot {
+            .init(sessionID: small.sessionID, taskID: small.taskID, generation: small.generation + 9,
+                payloadJSON: String(repeating: "\n", count: padding) + small.payloadJSON)
+        }
+        // Leading JSON whitespace remains exact raw input. Each newline gains
+        // an escaping byte under Codable; no payload normalization is allowed.
+        var lower = 0, upper = max(1_000_000 - small.payloadJSON.utf8.count, 0)
+        while lower < upper {
+            let middle = lower + (upper - lower + 1) / 2
+            let detached = try XCTUnwrap(advanceCapacityCandidates(accepted, after: grown(middle)).last)
+            if try encoded(detached).count <= NativeAttachmentDraftStore.maximumBytes { lower = middle }
+            else { upper = middle - 1 }
+        }
+        XCTAssertGreaterThan(lower, 0)
+        XCTAssertLessThan(lower, 1_000_000 - small.payloadJSON.utf8.count)
+        let fitting = grown(lower), over = grown(lower + 1)
+        let fit = try advanceCapacityCandidates(accepted, after: fitting), exceed = try advanceCapacityCandidates(accepted, after: over)
+        for candidate in fit { XCTAssertLessThanOrEqual(try encoded(candidate).count, NativeAttachmentDraftStore.maximumBytes) }
+        for candidate in exceed.prefix(2) { XCTAssertLessThanOrEqual(try encoded(candidate).count, NativeAttachmentDraftStore.maximumBytes) }
+        XCTAssertGreaterThan(try encoded(XCTUnwrap(exceed.last)).count, NativeAttachmentDraftStore.maximumBytes)
+        try editor.preflightCheckpoint(over)
+        var files = [input: try Data(contentsOf: input)]
+        for operation in accepted.operations {
+            let target = try XCTUnwrap(URL(string: operation.targetURI)); files[target] = try Data(contentsOf: target)
+        }
+        return .init(host: host, accepted: accepted, fitting: fitting, over: over, files: files, domain: try domain())
+    }
+    private func discardCapacityMarkers() throws -> Int {
+        let log = root.appendingPathComponent("logs/mindwtr.log")
+        let text = FileManager.default.fileExists(atPath: log.path) ? try String(contentsOf: log) : ""
+        return text.components(separatedBy: "\"operation\":\"discard-capacity\"").count - 1
+    }
+    private func preservedCapacityFiles(_ expected: [URL: Data], file: StaticString = #filePath, line: UInt = #line) throws {
+        for (url, data) in expected { XCTAssertEqual(try Data(contentsOf: url), data, file: file, line: line) }
+    }
+
+    func testFutureDiscardCapacityRefusesNewAdvanceBeforeIntentButFittingAdvanceDiscardsCold() async throws {
+        let fixture = try await discardCapacityFixture(), host = fixture.host
+        let sidecar = try Data(contentsOf: store.url), checkpoint = try Data(contentsOf: editor.url)
+        let proofs = try encoded(fixture.accepted.operations), markers = try discardCapacityMarkers()
+        XCTAssertGreaterThan(markers, 0)
+        var entered = false
+        let hooks = AttachmentDraftHostHooks(); hooks.boundary = { if $0 == .beforeAdvanceIntent { entered = true } }
+        await host.configureAttachmentDraftHost(hooks)
+        await fail { try await host.checkpointEditorDraft(fixture.over) }
+        XCTAssertFalse(entered); XCTAssertNil(try record().checkpointAdvance)
+        XCTAssertEqual(try Data(contentsOf: store.url), sidecar); XCTAssertEqual(try Data(contentsOf: editor.url), checkpoint)
+        same(try latest(), fixture.accepted.session.checkpoint)
+        XCTAssertEqual(try discardCapacityMarkers(), markers); XCTAssertEqual(try domain(), fixture.domain)
+        try preservedCapacityFiles(fixture.files)
+        await clear(host)
+        try await host.checkpointEditorDraft(fixture.fitting)
+        same(try latest(), fixture.fitting); same(try record().session.checkpoint, fixture.fitting)
+        XCTAssertNil(try record().checkpointAdvance); XCTAssertEqual(try encoded(record().operations), proofs)
+        XCTAssertEqual(try discardCapacityMarkers(), markers + 1)
+        let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
+        XCTAssertTrue(log.contains("v1.3.5/ios-owned-discard-capacity"))
+        XCTAssertFalse(log.contains(fixture.fitting.payloadJSON)); XCTAssertFalse(log.contains("Private.txt")); XCTAssertFalse(log.contains("file:///"))
+        await host.close(); let cold = core(); _ = try await cold.start()
+        let request = try discardRequest(fixture.fitting), reply = try await cold.discardAttachmentDraft(requestJSON: request)
+        XCTAssertEqual(try object(reply)["status"] as? String, "cleanupPending")
+        XCTAssertEqual(try record().discard?.phase, .detached); XCTAssertNil(try editor.read())
+        same(try XCTUnwrap(record().discard?.expected), fixture.fitting)
+        XCTAssertEqual(try encoded(record().operations), proofs); XCTAssertEqual(try domain(), fixture.domain)
+        XCTAssertEqual(try discardCapacityMarkers(), markers + 1); try preservedCapacityFiles(fixture.files)
+        await cold.close(); let detached = core(); _ = try await detached.start()
+        let repeated = try await detached.discardAttachmentDraft(requestJSON: request)
+        XCTAssertEqual(Data(repeated.utf8), Data(reply.utf8)); XCTAssertEqual(try discardCapacityMarkers(), markers + 1)
+        XCTAssertEqual(try encoded(record().operations), proofs); try preservedCapacityFiles(fixture.files)
+    }
+
+    func testOlderPendingAdvanceCompletesExactOwedCheckpointWithoutRetroactiveDiscardBudget() async throws {
+        let fixture = try await discardCapacityFixture(), host = fixture.host
+        let candidates = try advanceCapacityCandidates(fixture.accepted, after: fixture.over)
+        let pending = try XCTUnwrap(candidates.first), proofs = try encoded(fixture.accepted.operations)
+        let markers = try discardCapacityMarkers()
+        await host.close()
+        // This is a structurally valid old intent: both old encoded admission
+        // forms fit, even though its future detached Discard does not. Seed only
+        // the real private intent through the same store's retained-write checks.
+        try store.write(pending)
+        same(try latest(), fixture.accepted.session.checkpoint)
+        let cold = core(); _ = try await cold.start()
+        _ = try await cold.recoverAttachmentDraft(expectedSession: fixture.over.sessionID)
+        same(try latest(), fixture.over); same(try record().session.checkpoint, fixture.over)
+        XCTAssertNil(try record().checkpointAdvance); XCTAssertEqual(try encoded(record().operations), proofs)
+        XCTAssertEqual(try discardCapacityMarkers(), markers); XCTAssertEqual(try domain(), fixture.domain)
+        try preservedCapacityFiles(fixture.files)
+        // Exact acknowledged retry remains compatible; a new generation must
+        // satisfy today's admission and may not inherit a capacity promise.
+        try await cold.checkpointEditorDraft(fixture.over)
+        let retained = try Data(contentsOf: store.url), checkpoint = try Data(contentsOf: editor.url)
+        let later = EditorDraftSnapshot(sessionID: fixture.over.sessionID, taskID: fixture.over.taskID,
+            generation: fixture.over.generation + 1, payloadJSON: fixture.over.payloadJSON)
+        await fail { try await cold.checkpointEditorDraft(later) }
+        XCTAssertEqual(try Data(contentsOf: store.url), retained); XCTAssertEqual(try Data(contentsOf: editor.url), checkpoint)
+        XCTAssertEqual(try discardCapacityMarkers(), markers); XCTAssertEqual(try domain(), fixture.domain)
+        try preservedCapacityFiles(fixture.files)
+        await cold.close(); let restarted = core(); _ = try await restarted.start()
+        _ = try await restarted.recoverAttachmentDraft(expectedSession: fixture.over.sessionID)
+        same(try latest(), fixture.over); XCTAssertEqual(try encoded(record().operations), proofs)
+        XCTAssertEqual(try discardCapacityMarkers(), markers); try preservedCapacityFiles(fixture.files)
+    }
 }

@@ -3114,11 +3114,14 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
-                    || operation === 'discard' && outcome === 'retained')) return {};
+                    || operation === 'discard' && outcome === 'retained'
+                    || operation === 'discard-capacity' && outcome === 'confirmed')) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { releaseCheck: operation === 'save' ? 'v1.3.5/ios-attachment-owned-save' : 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
+                    context: { releaseCheck: operation === 'save' ? 'v1.3.5/ios-attachment-owned-save'
+                        : operation === 'discard-capacity' ? 'v1.3.5/ios-owned-discard-capacity'
+                            : 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
             } catch { /* Diagnostics cannot invalidate a durable acknowledgment. */ }
             return {};
         });
