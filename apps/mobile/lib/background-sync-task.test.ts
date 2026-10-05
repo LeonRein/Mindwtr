@@ -372,6 +372,8 @@ describe('mobile background sync task', () => {
 
       expect(await run).toBe(backgroundTaskMock.BackgroundTaskResult.Failed);
       expect(syncServiceMock.abortMobileSync).toHaveBeenCalledTimes(1);
+      // The deadline's own abort: a lifecycle abort would queue a follow-up cycle that runs once timers resume.
+      expect(syncServiceMock.abortMobileSync).toHaveBeenCalledWith('deadline');
       expect(storageAdapterMock.quiesceMobileStorage).toHaveBeenCalledTimes(1);
       // A run this long is written even with debug logging off.
       expect(appLogMock.logWarn).toHaveBeenCalledWith('Mobile background sync run took longer than a minute', expect.objectContaining({
