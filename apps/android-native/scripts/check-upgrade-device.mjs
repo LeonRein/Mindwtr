@@ -206,10 +206,19 @@ const checkLedger = (label, after) => {
     check(entries.length > 0 && entries.every(([, id, value]) => /^\d+$/.test(id) && /^(armed|fired):\d+$/.test(value)) && other === '',
         `(${label}) the native reminder ledger holds only alarm ids and their times (${entries.length})`);
 };
+// The native app's owed-upload count (pass S4a, CoreWork.owedUploads): its own new file, written when a drain stores queued items
+// (a capture RN left), so a closed-app capture job that dies still sends them. Allowed only as a new file holding that one count.
+const OWED_UPLOADS = 'shared_prefs/mindwtr-background-sync.xml';
+const checkOwedUploads = (label, after) => {
+    if (!after.has(OWED_UPLOADS)) return;
+    const text = runAs(`cat ${OWED_UPLOADS}`);
+    const other = text.replace(/<\?xml[^>]*>|<\/?map\s*\/?>|<int name="owedUploads" value="\d+" \/>/g, '').trim();
+    check(/<int name="owedUploads" value="\d+" \/>/.test(text) && other === '', `(${label}) the native owed-upload count file holds only its count`);
+};
 const differences = (before, after, { changedOk = () => false, newOk = () => false } = {}) => [
     ...[...before].filter(([path, hash]) => !isPlatformState(path) && !changedOk(path) && after.get(path) !== hash)
         .map(([path]) => `${after.has(path) ? 'changed' : 'removed'} ${path}`),
-    ...[...after.keys()].filter((path) => !before.has(path) && !isPlatformState(path) && !newOk(path) && path !== LEDGER).map((path) => `new ${path}`),
+    ...[...after.keys()].filter((path) => !before.has(path) && !isPlatformState(path) && !newOk(path) && path !== LEDGER && path !== OWED_UPLOADS).map((path) => `new ${path}`),
 ];
 const isDatabase = (path) => /^files\/SQLite\/mindwtr\.db(-wal|-shm)?$/.test(path);
 
@@ -542,6 +551,7 @@ const scenarioUpgrade = async () => {
         newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` || isAsyncStorage(path) || isRnCheckpoint(path) || isWidgetPayload(path),
     });
     checkLedger('1', after);
+    checkOwedUploads('1', after);
     check(changed.length === 0, `(1) every other non-database file is unchanged but RN's widget payload (${[...before.keys()].filter((path) => !isDatabase(path)).length} files)${shortList(changed)}`);
     verifyWidgetPayload('1', widgetsBefore, published);
     return { t, pre, queued };
@@ -845,6 +855,7 @@ const scenarioMissingWithBackup = async () => {
     });
     check(changed.length === 0, `(5b) every other file is unchanged but RN's widget payload${shortList(changed)}`);
     checkLedger('5b', after);
+    checkOwedUploads('5b', after);
     verifyWidgetPayload('5b', widgetsBefore, published);
 };
 

@@ -338,8 +338,10 @@ try {
         check(task.status === 'next' && JSON.parse(task.contexts ?? '[]').includes(`@${context}`),
             `(2d) CoreWork stored the capture at once, read as quick-add: next, @${context}`);
         await sleep(2000);
-        check(stored(title(4)).length === 1 && stored(title(5)).length === 1 && count(allLogs(), ...INGESTED) > jobs,
-            '(2d) each capture is stored once, by CoreWork\'s ingest job');
+        check(stored(title(4)).length === 1 && stored(title(5)).length === 1, '(2d) each capture is stored once');
+        // The ingest job ends once its capture sync settled (pass S4a), which can be after the store write.
+        await waitUntil('CoreWork\'s ingest job to end', () => count(allLogs(), ...INGESTED) > jobs, 300_000, 2_000);
+        check(stored(title(4)).length === 1 && stored(title(5)).length === 1, '(2d) each capture is stored once, by CoreWork\'s ingest job');
         check(queued().length === before.length, '(2d) their queue files are gone');
     }
 
