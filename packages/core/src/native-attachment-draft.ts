@@ -1,4 +1,4 @@
-import { preparePickedAttachment, persistPreparedPickedAttachment, type PreparedPickedAttachment } from './attachment-editor-model';
+import { preparePickedAttachment, persistPreparedPickedAttachment, softDeleteAttachment, type PreparedPickedAttachment } from './attachment-editor-model';
 import { getManagedAttachmentFileName } from './mobile-attachment-files';
 import { readNativeAttachments, readNativeTaskLinkHalf } from './native-host-contract-attachments';
 import { taskEditValuesEqual } from './json-value-equality';
@@ -38,6 +38,25 @@ export type NativeAttachmentDraftPrepareInput = NativeAttachmentDraftLineageInpu
 export type NativeAttachmentDraftLineageInputV2 = Omit<NativeAttachmentDraftLineageInput, 'version'> & { version: 2 };
 export type NativeAttachmentDraftPrepareInputV2 = Omit<NativeAttachmentDraftPrepareInput, 'version'> & { version: 2 };
 export type NativeAttachmentDraftLineageV2 = Omit<NativeAttachmentDraftLineage, 'version'> & { version: 2 };
+export type NativeAttachmentDraftRemovePrepared = Readonly<{
+    version: 1; kind: 'prepared-file-remove'; taskID: string; requestId: string; attachmentId: string;
+    removedAt: string; beforePayloadJSON: string; afterPayloadJSON: string;
+}>;
+export type NativeAttachmentDraftOperationV3 = Readonly<
+    { kind: 'add'; operation: NativeAttachmentDraftPrepared }
+    | { kind: 'remove'; operation: NativeAttachmentDraftRemovePrepared }
+>;
+export type NativeAttachmentDraftLineageInputV3 = {
+    version: 3; taskID: string; initialPayloadJSON: string; beforePayloadJSON: string;
+    priorOperations: readonly NativeAttachmentDraftOperationV3[]; managedDirectoryURI: string;
+};
+export type NativeAttachmentDraftPrepareInputV3 = NativeAttachmentDraftLineageInputV3 & {
+    requestId: string; picked: NativeAttachmentDraftPicked; measuredSize: number;
+};
+export type NativeAttachmentDraftRemoveInputV3 = NativeAttachmentDraftLineageInputV3 & {
+    requestId: string; attachmentId: string;
+};
+export type NativeAttachmentDraftLineageV3 = Omit<NativeAttachmentDraftLineage, 'version'> & { version: 3 };
 export type NativeAttachmentDraftRefusal = { kind: 'refused'; message: string };
 export type NativeAttachmentDraftCompleteInput = { prepared: NativeAttachmentDraftPrepared };
 export type NativeAttachmentDraftAdded = Readonly<{
@@ -325,6 +344,13 @@ Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
     const additionalFields = { requestId: requestID(object.requestId), picked: picked(object.picked), measuredSize: size(object.measuredSize) };
     const captured = { ...captureLineage(object, additionalFields, version), ...additionalFields };
     if ((version === 1 ? validateLineage(captured) : validateLineageV2(captured)).has(captured.requestId)) invalid();
+    return prepareCapturedAdd(captured, deps);
+}
+
+// Both sealed legacy and mixed histories use the same picked-file policy and metadata producer.
+async function prepareCapturedAdd(captured: { taskID: string; beforePayloadJSON: string; requestId: string;
+    picked: NativeAttachmentDraftPicked; measuredSize: number; managedDirectoryURI: string },
+    deps: NativeAttachmentDraftDependencies): Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
     const before = payload(captured.beforePayloadJSON, captured.taskID);
     if (before.attachments.length >= 1_000 || before.attachments.some((item) => item.id === captured.requestId)) invalid();
     const { assertEditable, t } = deps;
@@ -372,4 +398,148 @@ Promise<NativeAttachmentDraftAdded | NativeAttachmentDraftRefusal> {
     if (result.kind === 'refused') return result;
     return Object.freeze({ version: 1, kind: 'added', taskID: frozen.taskID, requestId: frozen.requestId,
         afterPayloadJSON: frozen.afterPayloadJSON, attachment: frozen.attachment });
+}
+
+
+const requestIDV3 = (value: unknown): string => {
+    if (typeof value !== 'string' || value.length !== 36) invalid();
+    return requestID(value);
+};
+const attachmentIDV3 = (value: unknown): string => {
+    // readNativeAttachments bounds IDs by UTF-16 length, not UTF-8 bytes.
+    if (typeof value !== 'string' || !value || value.length > 500) invalid();
+    return value as string;
+};
+const REMOVE_FIELDS = ['version', 'kind', 'taskID', 'requestId', 'attachmentId', 'removedAt',
+    'beforePayloadJSON', 'afterPayloadJSON'];
+const LINEAGE_V3_FIELDS = ['version', 'taskID', 'initialPayloadJSON', 'beforePayloadJSON',
+    'priorOperations', 'managedDirectoryURI'];
+
+// V3 inspects only parsed JSON: no caller getters, toJSON or custom prototypes can run.
+const payloadV3 = (encoded: unknown, taskID: string): ReturnType<typeof payload> => {
+    const value = payload(encoded, taskID);
+    let nodes = 0;
+    const visit = (entry: unknown, depth: number): void => {
+        if (++nodes > 100_000 || depth > 64) invalid();
+        if (entry !== null && typeof entry === 'object') {
+            for (const key of Object.keys(entry)) {
+                if (key === '__proto__' || key === 'prototype' || key === 'constructor') invalid();
+                visit((entry as Record<string, unknown>)[key], depth + 1);
+            }
+        }
+    };
+    visit(value.object, 0);
+    return value;
+};
+const removeShape = (value: unknown): NativeAttachmentDraftRemovePrepared => {
+    if (!exact(value, REMOVE_FIELDS)) invalid();
+    const input = value as Record<string, unknown>;
+    if (input.version !== 1 || input.kind !== 'prepared-file-remove') invalid();
+    const removedAt = text(input.removedAt, 100, true);
+    try { if (new Date(removedAt).toISOString() !== removedAt) invalid(); } catch { return invalid(); }
+    const captured: NativeAttachmentDraftRemovePrepared = Object.freeze({ version: 1, kind: 'prepared-file-remove',
+        taskID: text(input.taskID, 500, true), requestId: requestIDV3(input.requestId),
+        attachmentId: attachmentIDV3(input.attachmentId), removedAt,
+        beforePayloadJSON: text(input.beforePayloadJSON, PAYLOAD_BYTES, true),
+        afterPayloadJSON: text(input.afterPayloadJSON, PAYLOAD_BYTES, true) });
+    jsonBytes(captured, PREPARED_BYTES);
+    return captured;
+};
+const validateRemoveFrozen = (value: NativeAttachmentDraftRemovePrepared): void => {
+    const before = payloadV3(value.beforePayloadJSON, value.taskID), after = payloadV3(value.afterPayloadJSON, value.taskID);
+    const selected = before.attachments.find((item) => item.id === value.attachmentId);
+    if (!selected || selected.kind !== 'file' || selected.deletedAt
+        || !same(after.object, { ...before.object,
+            attachments: softDeleteAttachment(before.attachments, value.attachmentId, value.removedAt) })) invalid();
+};
+
+/** Pure historical projection, not a claim that any file was copied or is owned. */
+export function readNativeAttachmentDraftRemoveFrozen(input: unknown): NativeAttachmentDraftRemovePrepared {
+    const captured = removeShape(input);
+    validateRemoveFrozen(captured);
+    return captured;
+}
+
+const captureLineageV3 = (object: Record<string, unknown>, additionalFields: object = {}): NativeAttachmentDraftLineageInputV3 => {
+    const operations = object.priorOperations;
+    if (object.version !== 3 || !Array.isArray(operations) || Object.getPrototypeOf(operations) !== Array.prototype
+        || operations.length > 128 || Reflect.ownKeys(operations).length !== operations.length + 1) invalid();
+    const captured: NativeAttachmentDraftLineageInputV3 = { version: 3, taskID: text(object.taskID, 500, true),
+        initialPayloadJSON: text(object.initialPayloadJSON, PAYLOAD_BYTES, true),
+        beforePayloadJSON: text(object.beforePayloadJSON, PAYLOAD_BYTES, true),
+        managedDirectoryURI: fileURI(object.managedDirectoryURI, true), priorOperations: [] };
+    const copied: NativeAttachmentDraftOperationV3[] = [];
+    let bytes = jsonBytes({ ...captured, ...additionalFields }, PREPARE_BYTES);
+    for (let index = 0; index < (operations as unknown[]).length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(operations, String(index));
+        if (!descriptor?.enumerable || !own(descriptor, 'value') || !exact(descriptor.value, ['kind', 'operation'])) invalid();
+        const entry = descriptor!.value as Record<string, unknown>;
+        const operation: NativeAttachmentDraftOperationV3 = entry.kind === 'add'
+            ? Object.freeze({ kind: 'add', operation: frozenShape(entry.operation) })
+            : entry.kind === 'remove' ? Object.freeze({ kind: 'remove', operation: removeShape(entry.operation) }) : invalid();
+        bytes += jsonBytes(operation, PREPARED_BYTES) + (index ? 1 : 0);
+        if (bytes > PREPARE_BYTES) invalid();
+        copied.push(operation);
+    }
+    return { ...captured, priorOperations: Object.freeze(copied) };
+};
+const validateLineageV3 = (captured: NativeAttachmentDraftLineageInputV3): Set<string> => {
+    const initial = payloadV3(captured.initialPayloadJSON, captured.taskID);
+    if (!same(initial.object.attachmentsBase, initial.attachments)) invalid();
+    let previous = initial.attachments;
+    const ids = new Set<string>();
+    for (const entry of captured.priorOperations) {
+        const prior = entry.operation;
+        requestIDV3(prior.requestId);
+        const before = payloadV3(prior.beforePayloadJSON, captured.taskID);
+        if (prior.taskID !== captured.taskID || ids.has(prior.requestId)
+            || !same(before.object.attachmentsBase, initial.object.attachmentsBase) || !same(before.attachments, previous)) invalid();
+        if (entry.kind === 'add') {
+            validateFrozen(entry.operation);
+            if (entry.operation.managedDirectoryURI !== captured.managedDirectoryURI) invalid();
+        } else validateRemoveFrozen(entry.operation);
+        ids.add(prior.requestId);
+        previous = payloadV3(prior.afterPayloadJSON, captured.taskID).attachments;
+    }
+    const latest = payloadV3(captured.beforePayloadJSON, captured.taskID);
+    if (!same(latest.object.attachmentsBase, initial.object.attachmentsBase) || !same(latest.attachments, previous)) invalid();
+    return ids;
+};
+
+export function validateNativeAttachmentDraftLineageV3(input: unknown): NativeAttachmentDraftLineageV3 {
+    if (!exact(input, LINEAGE_V3_FIELDS)) invalid();
+    const captured = captureLineageV3(input as Record<string, unknown>);
+    validateLineageV3(captured);
+    return Object.freeze({ version: 3, taskID: captured.taskID, payloadJSON: captured.beforePayloadJSON });
+}
+
+export async function prepareNativeAttachmentDraftAddV3(input: unknown, deps: NativeAttachmentDraftDependencies):
+Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
+    if (!exact(input, [...LINEAGE_V3_FIELDS, 'requestId', 'picked', 'measuredSize'])) invalid();
+    const object = input as Record<string, unknown>;
+    const fields = { requestId: requestIDV3(object.requestId), picked: picked(object.picked), measuredSize: size(object.measuredSize) };
+    const captured = { ...captureLineageV3(object, fields), ...fields };
+    if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
+    return prepareCapturedAdd(captured, deps);
+}
+
+export function prepareNativeAttachmentDraftRemoveV3(input: unknown, deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftRemovePrepared {
+    if (!exact(input, [...LINEAGE_V3_FIELDS, 'requestId', 'attachmentId'])) invalid();
+    const object = input as Record<string, unknown>;
+    const fields = { requestId: requestIDV3(object.requestId), attachmentId: attachmentIDV3(object.attachmentId) };
+    const captured = { ...captureLineageV3(object, fields), ...fields };
+    if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
+    const before = payloadV3(captured.beforePayloadJSON, captured.taskID);
+    const selected = before.attachments.find((item) => item.id === captured.attachmentId);
+    if (!selected || selected.kind !== 'file' || selected.deletedAt) invalid();
+    const { assertEditable } = deps;
+    assertEditable(captured.taskID);
+    const removedAt = new Date().toISOString();
+    const afterPayloadJSON = JSON.stringify({ ...before.object,
+        attachments: softDeleteAttachment(before.attachments, captured.attachmentId, removedAt) });
+    const frozen = readNativeAttachmentDraftRemoveFrozen({ version: 1, kind: 'prepared-file-remove', taskID: captured.taskID,
+        requestId: captured.requestId, attachmentId: captured.attachmentId, removedAt,
+        beforePayloadJSON: captured.beforePayloadJSON, afterPayloadJSON });
+    assertEditable(captured.taskID);
+    return frozen;
 }
