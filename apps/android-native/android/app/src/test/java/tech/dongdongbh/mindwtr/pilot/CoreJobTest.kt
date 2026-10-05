@@ -17,6 +17,7 @@ class CoreJobTest {
     private var syncWanted = true
     private var appActive = false
     private var nextStored = true
+    private var ensured = true
 
     private val calls = object : CoreJob.Calls {
         override fun recover(): Boolean {
@@ -46,28 +47,62 @@ class CoreJobTest {
         post = { events += "post ${it.getString("title")}" },
         refreshWidgets = { events += "widgets" },
         syncAgain = { events += "again"; nextStored },
+        ensureSync = { events += "ensure"; ensured },
         log = { message, fields -> lines += "$message ${fields.optString("job")} ${fields.optString("outcome")} ${fields.optString("error")}".trim() })
 
     private val lines = mutableListOf<String>()
 
     @Test fun theHostBootsBeforeTheJobAndWidgetsRefreshAfterIt() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure", "widgets"), events)
     }
 
     // #1257: what a capture job stored while the app was closed is sent before the job ends (core's capture run), never after.
     @Test fun aCaptureJobSendsWhatItStoredBeforeItEnds() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure", "widgets"), events)
         assertEquals(listOf("Native Android core work ingest success"), lines)
     }
 
-    @Test fun aCaptureWhoseSyncFailsIsStillStoredAndLeavesTheRetryToTheSyncJob() {
-        // The capture is committed; core recorded the failed upload, and the scheduled job sends it after its cooldown.
-        syncFailure = IllegalStateException("Core backgroundSync timed out")
+    // Review S4a 2: a capture job succeeds only once its upload is owned: sent, or failed and recorded with the scheduled job in
+    // WorkManager to retry it (the first native start after RN's may be a capture, with no screen to schedule it).
+    @Test fun aCaptureJobMakesSureTheScheduledJobExistsWhenCoreWantsIt() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("sync capture", "ensure"), events.filter { it == "sync capture" || it == "ensure" })
+        events.clear()
+        syncWanted = false
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
         assertEquals(listOf("boot", "recover", "drain", "sync capture", "widgets"), events)
-        assertEquals(listOf("Native Android core work ingest success Core backgroundSync timed out"), lines)
+    }
+
+    @Test fun aCaptureWhoseScheduledJobIsNotStoredRetries() {
+        ensured = false
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure"), events)
+    }
+
+    @Test fun aCaptureWhoseSyncThrowsRetriesItsUpload() {
+        // The capture is committed; the retry sends it (the count it owes survives in OwedUploads).
+        syncFailure = IllegalStateException("Core backgroundSync timed out")
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "sync capture"), events)
+        assertEquals(listOf("Native Android core work ingest retry Core backgroundSync timed out"), lines)
+    }
+
+    @Test fun whatTheDrainsStoredIsOwedUntilARunSettlesItAcrossProcessDeath() {
+        var stored = 0
+        val first = OwedUploads(read = { stored }, write = { stored = it })
+        first.add(2)
+        // A new process reads the same store.
+        val restarted = OwedUploads(read = { stored }, write = { stored = it })
+        val owed = restarted.owed()
+        assertEquals(2, owed)
+        // A capture stored while that run went on stays owed.
+        restarted.add(1)
+        restarted.settle(owed)
+        assertEquals(1, restarted.owed())
+        first.add(0)
+        assertEquals(1, stored)
     }
 
     @Test fun theSyncJobRunsCoresScheduledRunThenQueuesItsNext() {

@@ -26,7 +26,6 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -192,9 +191,6 @@ internal object ProcessCoreHost {
         if (now) startSync(app, runtime)
     }
 
-    /** What the queue drains stored since CoreWork's last background run took it (core's capture run sends it). */
-    private val imported = AtomicInteger(0)
-    fun takeImported(): Int = imported.getAndSet(0)
 
     /** Whether MainActivity is resumed (RN's AppState "active"). */
     val appActive get() = appState == "active"
@@ -423,7 +419,8 @@ internal object ProcessCoreHost {
         }
         return try {
             val ingested = runtime.ingestPendingCaptures(UUID.randomUUID().toString()).optInt("ingested")
-            imported.addAndGet(ingested)
+            // A count not stored only means the capture waits for the scheduled job: the drain itself stands.
+            runCatching { CoreWork.owedUploads(app).add(ingested) }.onFailure { Log.w(CoreHost.TAG, "Native Android owed upload count not stored", it) }
             runtime.logLine("Native Android queue drain", JSONObject().put("outcome", "drained").put("ingested", ingested))
             drained
         } catch (error: Throwable) {

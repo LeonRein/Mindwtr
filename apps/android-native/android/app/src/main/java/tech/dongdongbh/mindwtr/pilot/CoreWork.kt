@@ -108,6 +108,14 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
          */
         fun cancelRnSync(context: Context): Operation = WorkManager.getInstance(context).cancelUniqueWork(RN_SYNC_WORK)
 
+        /** What the queue drains stored and no background run settled yet (core's capture run sends it), in this app's preferences. */
+        internal fun owedUploads(context: Context) = context.getSharedPreferences(BACKGROUND_SYNC_PREFS, Context.MODE_PRIVATE).let { prefs ->
+            OwedUploads(read = { prefs.getInt(OWED_UPLOADS_KEY, 0) },
+                write = { check(prefs.edit().putInt(OWED_UPLOADS_KEY, it).commit()) { "The owed upload count was not stored" } })
+        }
+        private const val BACKGROUND_SYNC_PREFS = "mindwtr-background-sync"
+        private const val OWED_UPLOADS_KEY = "owedUploads"
+
         private fun syncRequest() = OneTimeWorkRequest.Builder(CoreWork::class.java)
             .setInputData(Data.Builder().putString(JOB, CoreJob.SYNC).build())
             .setInitialDelay(SYNC_INTERVAL_MINUTES, TimeUnit.MINUTES)
@@ -161,11 +169,13 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
                     override fun reminderDone(requestId: String, taskId: String) = host.reminderDone(requestId, taskId)
                     override fun reminderSnooze(json: String) = host.reminderSnooze(json)
                     override fun backgroundSync(trigger: String): JSONObject {
-                        // What the drains stored goes with this run, unless the app is in front: its own triggers send it.
-                        val stored = ProcessCoreHost.takeImported()
+                        // What the drains stored goes with this run, unless the app is in front: its own triggers send it. It stays
+                        // owed until the run settled (a throw keeps it for the retry).
+                        val owed = owedUploads(app)
+                        val stored = owed.owed()
                         // The network state, which no screen gave this process (sync's triggers start with the first screen).
                         runCatching { host.syncNetwork(HostNetwork(app) {}.state()) }
-                        return host.backgroundSync(trigger, if (ProcessCoreHost.appActive) 0 else stored)
+                        return host.backgroundSync(trigger, if (ProcessCoreHost.appActive) 0 else stored).also { owed.settle(stored) }
                     }
                     override fun appActive() = ProcessCoreHost.appActive
                 }
@@ -180,7 +190,9 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
             log = log,
             // Not once WorkManager stopped this run (sync turned off cancels the chain). Stored, or this run retries.
             syncAgain = { isStopped || runCatching { syncAgain(app).result.get(STORE_WAIT_SECONDS, TimeUnit.SECONDS) }
-                .onFailure { Log.w(CoreHost.TAG, "Native Android sync job not queued again", it) }.isSuccess })
+                .onFailure { Log.w(CoreHost.TAG, "Native Android sync job not queued again", it) }.isSuccess },
+            // A capture's upload owned: the scheduled job stored (KEEP: one queued or running stays as it is).
+            ensureSync = { runCatching { scheduleSyncStored(app, true) }.onFailure { Log.w(CoreHost.TAG, "Native Android sync job not stored", it) }.isSuccess })
         return when (outcome) {
             CoreJob.Outcome.Success -> Result.success()
             CoreJob.Outcome.Retry -> Result.retry()

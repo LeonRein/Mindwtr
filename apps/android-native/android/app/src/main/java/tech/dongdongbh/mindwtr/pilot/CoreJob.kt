@@ -63,15 +63,17 @@ internal object CoreJob {
      * A reminder's Done and Snooze are journaled core commands whose request UUID makes every try the same request, so they retry
      * until core answers, unless core refuses the input itself (INVALID_INPUT). Snooze's alarm is made in the engine against core's
      * native state, once per request however many tries; Done plans the alarms again, as the store changed.
-     * A capture job (INGEST) then sends what the drains stored and waits for that sync: a failed upload is core's recorded failure,
-     * which the sync job retries, so the job still succeeds (the capture is stored). The sync job (SYNC) runs core's scheduled run,
+     * A capture job (INGEST) then sends what the drains stored and waits for that sync. It succeeds only once that upload is owned:
+     * sent, or failed and recorded by core with the scheduled sync job stored to retry it ([ensureSync], when core wants the job:
+     * the first native start after RN's may be this job, with no screen to schedule it). A run that throws, or a job not stored,
+     * retries; what the drains stored stays owed (OwedUploads), so the retry sends it. The sync job (SYNC) runs core's scheduled run,
      * none while the app is in front (as RN's Expo worker), then [syncAgain] queues its next run unless core says sync is no longer
      * wanted; a run that failed outright, or a next run WorkManager did not store ([syncAgain] false), retries in place, so the
      * chain never breaks.
      * [log] gets one line per run, its fields apart (the job, its outcome, a failure's code: never a task's words).
      */
     fun run(name: String?, input: Map<String, String?>, boot: () -> Calls, post: (JSONObject) -> Unit, refreshWidgets: () -> Unit,
-            log: (String, JSONObject) -> Unit, syncAgain: () -> Boolean = { true }): Outcome {
+            log: (String, JSONObject) -> Unit, syncAgain: () -> Boolean = { true }, ensureSync: () -> Boolean = { true }): Outcome {
         val line = JSONObject().put("job", name ?: JSONObject.NULL)
         if (name !in JOBS) {
             log(LINE, line.put("outcome", "unknown"))
@@ -82,11 +84,7 @@ internal object CoreJob {
             val host = boot()
             if (!host.recover() || !host.drain()) Outcome.Retry
             else when (name) {
-                INGEST -> {
-                    runCatching { host.backgroundSync("capture") }
-                        .onFailure { line.put("error", (it.message ?: it.javaClass.simpleName).substringBefore(':')) }
-                    Outcome.Success
-                }
+                INGEST -> if (host.backgroundSync("capture").optBoolean("schedule") && !ensureSync()) Outcome.Retry else Outcome.Success
                 SYNC -> {
                     val again = if (host.appActive()) {
                         line.put("skipped", "foreground")
@@ -125,5 +123,25 @@ internal object CoreJob {
         log(LINE, line.put("outcome", outcome.name.lowercase()))
         if (outcome == Outcome.Success) refreshWidgets()
         return outcome
+    }
+}
+
+/**
+ * What the queue drains stored and no background run has settled yet (#1257): kept across process death in [read] and [write]
+ * (ProcessCoreHost's preferences), so a capture job that died or retried after its drain still sends the capture. A run takes
+ * [owed] before it starts and [settle]s that many once it settled; what a drain stored meanwhile stays owed. JVM-tested (CoreJobTest).
+ */
+internal class OwedUploads(private val read: () -> Int, private val write: (Int) -> Unit) {
+    // One lock for every instance: a drain and a job's run each make their own over the same preferences.
+    private companion object { val LOCK = Any() }
+
+    fun add(count: Int) = synchronized(LOCK) {
+        if (count > 0) write(read() + count)
+    }
+
+    fun owed(): Int = synchronized(LOCK) { read() }
+
+    fun settle(count: Int) = synchronized(LOCK) {
+        if (count > 0) write(maxOf(0, read() - count))
     }
 }
