@@ -111,6 +111,17 @@ public final class CoreHost: @unchecked Sendable {
             try await perform { try $0.addAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
+    func addProviderAttachmentV3(selectedURL: URL, expectedSession: String, expectedGeneration: Int,
+                                 requestId: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.addProviderAttachmentV3(selectedURL: selectedURL, expectedSession: expectedSession,
+                expectedGeneration: expectedGeneration, requestId: requestId, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
@@ -476,6 +487,20 @@ private final class Engine: @unchecked Sendable {
     private var database: SQLiteBridge?
     private var attachmentJobs: NativeAttachmentFileJobs?
     private var attachmentGeneration: UInt64 = 0
+    private struct ProviderCopyTurn {
+        let receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt
+        let session: String
+        let requestId: String
+        let generation: UInt64
+        let runtime: JSContext
+        let jobs: NativeAttachmentFileJobs
+        let beforeRecord: NativeAttachmentDraftStore.VersionedSnapshot
+        let beforeEditor: EditorDraftStore.OwnedCheckpoint
+    }
+    // ponytail: only warm creation provenance authorizes scratch retirement.
+    // A crash may leave an unproven copy <=50 MiB; total accumulation is not
+    // bounded, and this library-backed cache has no guaranteed OS reclamation.
+    private var providerCopy: ProviderCopyTurn?
     private var attachmentIdlePump: DispatchWorkItem?
     private var invoking = false
     #if DEBUG
@@ -1562,7 +1587,8 @@ private final class Engine: @unchecked Sendable {
         #endif
         return coordinator
     }
-    private func attachmentDraftCoordinatorV3(cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentDraftCoordinator {
+    private func attachmentDraftCoordinatorV3(cancellation: NativeAttachmentCancellation,
+                                               additionalOwner: (() throws -> Void)? = nil) throws -> NativeAttachmentDraftCoordinator {
         dispatchPrecondition(condition: .onQueue(queue))
         try cancellation.check()
         guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0, try ownedJournalIsAbsent(),
@@ -1576,6 +1602,8 @@ private final class Engine: @unchecked Sendable {
                   try self.ownedJournalIsAbsent() else {
                 throw HostFailure("Attachment draft recovery is not ready")
             }
+            try additionalOwner?()
+            try cancellation.check()
         }) { [unowned self] method, arguments in try self.invoke(method, arguments: arguments) }
         #if DEBUG
         coordinator.hooks = attachmentDraftHooks
@@ -1603,8 +1631,117 @@ private final class Engine: @unchecked Sendable {
     func addAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).addV3(requestJSON, cancellation: cancellation) }
     }
+    private func requireProviderOwner(_ turn: ProviderCopyTurn) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0,
+              context === turn.runtime, attachmentGeneration == turn.generation, attachmentJobs === turn.jobs,
+              try ownedJournalIsAbsent() else { throw HostFailure("Attachment provider owner is unavailable") }
+    }
+    private func requireProviderBefore(_ turn: ProviderCopyTurn) throws {
+        try requireProviderOwner(turn)
+        guard let actual = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(),
+              turn.beforeRecord.matches(actual), let editor = try editorDrafts.readOwnedCheckpoint(),
+              turn.beforeEditor.matches(editor) else { throw HostFailure("Attachment provider owner is unavailable") }
+    }
+    private func finishProviderCopy(_ turn: ProviderCopyTurn, completed: Bool, recovered: Bool = false) throws {
+        turn.jobs.drain(); try requireProviderOwner(turn)
+        let store = NativeAttachmentDraftStore(databaseURL: databaseURL)
+        guard let binding = try store.readVersioned(), case .mixed(let record) = binding.record,
+              record.session.state == .active, record.discard == nil, record.checkpointAdvance == nil,
+              record.operations.allSatisfy({ $0.checkpointed }),
+              Self.ownedEqual(record.session.sessionID, turn.session),
+              Self.ownedEqual(record.session.taskID, turn.beforeEditor.snapshot.taskID),
+              let editor = try editorDrafts.readOwnedCheckpoint(), editor.attempt == nil,
+              Self.ownedEqual(editor.snapshot, record.session.checkpoint) else {
+            throw HostFailure("Attachment provider cleanup is unavailable")
+        }
+        if completed {
+            if let entry = record.operations.first(where: { $0.requestId == turn.requestId }) {
+                guard case .add(let op) = entry, op.phase == .checkpointed, op.replyJSON != nil,
+                      turn.receipt.matches(.init(sourceURI: op.source.sourceURI, sha256: op.source.sha256,
+                        size: op.source.size, identity: op.source.identity, cacheRootIdentity: op.source.cacheRootIdentity,
+                        parentIdentity: op.source.parentIdentity)) else { throw HostFailure("Attachment provider cleanup is unavailable") }
+            } else {
+                // A confirmed ordinary recovery may settle a warm pre-intent
+                // refusal. It still cannot grant authority over borrowed bytes.
+                guard recovered else { throw HostFailure("Attachment provider cleanup is unavailable") }
+            }
+        } else {
+            try requireProviderBefore(turn)
+            guard !record.operations.contains(where: { $0.requestId == turn.requestId }) else {
+                throw HostFailure("Attachment provider cleanup is unavailable")
+            }
+        }
+        func check() throws {
+            try requireProviderOwner(turn)
+            guard let actual = try store.readVersioned(), binding.matches(actual),
+                  let actualEditor = try editorDrafts.readOwnedCheckpoint(), editor.matches(actualEditor) else {
+                throw HostFailure("Attachment provider cleanup is unavailable")
+            }
+        }
+        _ = try turn.jobs.retireProviderSource(turn.receipt, requireOwner: check)
+        providerCopy = nil
+    }
+    func addProviderAttachmentV3(selectedURL: URL, expectedSession: String, expectedGeneration: Int,
+                                 requestId: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation {
+            try cancellation.check()
+            guard selectedURL.isFileURL, expectedSession.utf8.count == 36, requestId.utf8.count == 36,
+                  UUID(uuidString: expectedSession)?.uuidString.lowercased() == expectedSession,
+                  UUID(uuidString: requestId)?.uuidString.lowercased() == requestId,
+                  expectedGeneration > 0, expectedGeneration < 9_007_199_254_740_990,
+                  providerCopy == nil else { throw HostFailure("Attachment provider admission is unavailable") }
+            let coordinator = try attachmentDraftCoordinatorV3(cancellation: cancellation)
+            _ = try coordinator.beginV3(session: expectedSession, generation: expectedGeneration, cancellation: cancellation)
+            let store = NativeAttachmentDraftStore(databaseURL: databaseURL)
+            guard let before = try store.readVersioned(), case .mixed(let record) = before.record,
+                  record.session.state == .active, record.discard == nil, record.checkpointAdvance == nil,
+                  record.operations.allSatisfy({ $0.checkpointed }),
+                  !record.operations.contains(where: { $0.requestId == requestId }),
+                  let editor = try editorDrafts.readOwnedCheckpoint(), editor.attempt == nil,
+                  Self.ownedEqual(editor.snapshot, record.session.checkpoint),
+                  let runtime = context, let jobs = attachmentJobs else { throw HostFailure("Attachment provider admission is unavailable") }
+            let generation = attachmentGeneration
+            let receipt = try jobs.copyProviderSource(selectedURL, cancellation: cancellation)
+            let turn = ProviderCopyTurn(receipt: receipt, session: expectedSession, requestId: requestId,
+                generation: generation, runtime: runtime, jobs: jobs, beforeRecord: before, beforeEditor: editor)
+            providerCopy = turn
+            do {
+                try cancellation.check(); try requireProviderBefore(turn)
+                try jobs.requireProviderSource(receipt)
+                let request = try Self.ownedJSON(["version": 1, "requestId": requestId, "sessionID": expectedSession,
+                    "generation": expectedGeneration, "picked": ["uri": receipt.sourceURI, "name": receipt.fileName,
+                        "mimeType": receipt.mimeType as Any? ?? NSNull(), "size": receipt.size] as [String: Any]])
+                let ownedAdd = try attachmentDraftCoordinatorV3(cancellation: cancellation,
+                    additionalOwner: { try jobs.requireProviderSource(receipt) })
+                let reply = try ownedAdd.addV3(request, cancellation: cancellation)
+                // Preserve the returned durable Add acknowledgment, including
+                // cancellation or lost sync ACK during optional scratch cleanup.
+                try? finishProviderCopy(turn, completed: true)
+                providerCopy = nil
+                // No diagnostic JSC callback may replace evidence between the
+                // trusted Add acknowledgment and cleanup's exact binding capture.
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["provider-add", "confirmed"])
+                return reply
+            } catch {
+                // Exact unchanged bytes/inodes, not catch text, prove no intent.
+                // Unknown/post-checkpoint outcomes keep the receipt for recovery.
+                try? finishProviderCopy(turn, completed: false)
+                throw error
+            }
+        }
+    }
     func recoverAttachmentDraftV3(expectedSession: String, cancellation: NativeAttachmentCancellation) throws -> String {
-        try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation) }
+        try attachmentDraftOperation {
+            let reply = try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation)
+            if let turn = providerCopy, Self.ownedEqual(turn.session, expectedSession) {
+                try? finishProviderCopy(turn, completed: true, recovered: true)
+                // Recovery's accepted outcome is also independent of best-effort
+                // scratch cleanup. No receipt is reconstructed after restart.
+                providerCopy = nil
+            }
+            return reply
+        }
     }
 
     private static func ownedEqual(_ lhs: String, _ rhs: String) -> Bool { Data(lhs.utf8) == Data(rhs.utf8) }

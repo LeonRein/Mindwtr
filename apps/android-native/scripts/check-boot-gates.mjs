@@ -4761,6 +4761,23 @@ const poll = async (state, id) => {
         assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('add-mixed', 'confirmed'))).ok, true);
         assert.equal(android.logText, null);
     });
+    await check('provider Add acknowledgment is iOS-only, fixed, and independent of optional diagnostics', async () => {
+        const local = makeState(0, [], 'ios');
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('provider-add', 'confirmed'))).ok, true);
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-attachment-provider-add', operation: 'provider-add', outcome: 'confirmed' });
+        const before = local.logText;
+        for (const outcome of ['retained', 'replayed', 'removed', 'settled', '']) {
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('provider-add', outcome))).ok, true);
+        }
+        assert.equal(local.logText, before);
+        local.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('provider-add', 'confirmed'))).ok, true);
+        assert.equal(local.logText, before);
+        const android = makeState(0);
+        assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('provider-add', 'confirmed'))).ok, true);
+        assert.equal(android.logText, null);
+    });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);

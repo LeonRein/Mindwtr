@@ -2,15 +2,17 @@ import Foundation
 import Darwin
 import CryptoKit
 import CoreFoundation
+import UniformTypeIdentifiers
 
 enum NativeAttachmentFilesError: LocalizedError, Equatable {
-    case invalidRequest, unavailable, missing, tooLarge
+    case invalidRequest, unavailable, missing, tooLarge, providerTooLarge
     var errorDescription: String? {
         switch self {
         case .invalidRequest: return "Attachment file request is invalid"
         case .unavailable: return "Attachment file operation is unavailable"
         case .missing: return "ENOENT: no such file or directory"
         case .tooLarge: return "Attachment file exceeds the bridge byte limit"
+        case .providerTooLarge: return "Attachment file exceeds the upload byte limit"
         }
     }
 }
@@ -26,6 +28,31 @@ final class NativeAttachmentFiles {
         let identity: String
         let cacheRootIdentity: String
         let parentIdentity: String
+    }
+    /// Creation authority is minted here, never decoded from a borrowed proof.
+    struct ProviderCacheCopyReceipt: Sendable {
+        fileprivate let proof: CacheSourceProof
+        fileprivate let modificationSeconds: Int64
+        fileprivate let modificationNanoseconds: Int64
+        fileprivate let changeSeconds: Int64
+        fileprivate let changeNanoseconds: Int64
+        fileprivate let mode: mode_t
+        let fileName: String
+        let mimeType: String?
+        var sourceURI: String { proof.sourceURI }
+        var size: Int64 { proof.size }
+        fileprivate init(proof: CacheSourceProof, generation: stat, fileName: String, mimeType: String?) {
+            self.proof = proof; self.fileName = fileName; self.mimeType = mimeType
+            modificationSeconds = Int64(generation.st_mtimespec.tv_sec)
+            modificationNanoseconds = Int64(generation.st_mtimespec.tv_nsec)
+            changeSeconds = Int64(generation.st_ctimespec.tv_sec)
+            changeNanoseconds = Int64(generation.st_ctimespec.tv_nsec); mode = generation.st_mode
+        }
+        func matches(_ source: CacheSourceProof) -> Bool {
+            proof.sourceURI == source.sourceURI && proof.sha256 == source.sha256 && proof.size == source.size
+                && proof.identity == source.identity && proof.cacheRootIdentity == source.cacheRootIdentity
+                && proof.parentIdentity == source.parentIdentity
+        }
     }
     struct ReservedAttachmentStageProof: Sendable {
         let stageURI: String
@@ -68,6 +95,7 @@ final class NativeAttachmentFiles {
         case unsafeEntry(targetURI: String)
     }
     static let maximumBytes = 16 * 1024 * 1024
+    static let maximumProviderBytes: Int64 = 50 * 1024 * 1024
     private static let chunkBytes = 64 * 1024
     private let libraryRoot: URL
     private let documents: URL
@@ -289,6 +317,173 @@ final class NativeAttachmentFiles {
     }
 
     /// Native-only evidence for a future durable copy intent, not editor ownership.
+    func copyProviderSource(_ selectedURL: URL, checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
+        guard selectedURL.isFileURL else { throw NativeAttachmentFilesError.invalidRequest }
+        _ = try Self.filePath(selectedURL.absoluteString)
+        try checkCancellation()
+        let accessed = selectedURL.startAccessingSecurityScopedResource()
+        defer { if accessed { selectedURL.stopAccessingSecurityScopedResource() } }
+        var coordinationError: NSError?
+        var result: Result<ProviderCacheCopyReceipt, Error>?
+        NSFileCoordinator().coordinate(readingItemAt: selectedURL, options: .withoutChanges, error: &coordinationError) { url in
+            result = Result { try self.copyCoordinatedProviderSource(url, fallbackName: selectedURL.lastPathComponent,
+                                                                   checkCancellation: checkCancellation) }
+        }
+        if coordinationError != nil {
+            if let result, case .success(let receipt) = result { _ = try? retireProviderSource(receipt, checkCancellation: {}) }
+            throw NativeAttachmentFilesError.unavailable
+        }
+        guard let result else { throw NativeAttachmentFilesError.unavailable }
+        do { return try result.get() }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as NativeAttachmentFilesError { throw error }
+        catch { throw NativeAttachmentFilesError.unavailable }
+    }
+
+    private func copyCoordinatedProviderSource(_ url: URL, fallbackName: String,
+                                             checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
+        try checkCancellation()
+        let sourcePath = try Self.filePath(url.absoluteString)
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        let sourceParentPath = sourceURL.deletingLastPathComponent().path
+        let sourceParent = Parent(fd: try Self.openAbsoluteDirectory(sourceParentPath), leaf: sourceURL.lastPathComponent)
+        defer { Darwin.close(sourceParent.fd) }
+        let input = try openFile(sourceParent); defer { Darwin.close(input) }
+        let before = try Self.regular(input)
+        guard before.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
+        guard before.st_size <= Self.maximumProviderBytes else { throw NativeAttachmentFilesError.providerTooLarge }
+        func validateSource() throws {
+            let namedParent = try Self.openAbsoluteDirectory(sourceParentPath); defer { Darwin.close(namedParent) }
+            guard try Self.identity(namedParent) == Self.identity(sourceParent.fd),
+                  try Self.unchanged(before, Self.regular(input)), try Self.unchanged(before, Self.named(sourceParent)),
+                  try Self.regular(input).st_nlink == 1, try Self.named(sourceParent).st_nlink == 1 else {
+                throw NativeAttachmentFilesError.unavailable
+            }
+        }
+        let metadata = try? url.resourceValues(forKeys: [.nameKey, .contentTypeKey])
+        let fileName = metadata?.name.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
+        let mimeType = metadata?.contentType?.preferredMIMEType
+        try validateSource()
+        let leaf = UUID().uuidString.lowercased(), partial = UUID().uuidString.lowercased()
+        let path = Reference(cache: true, components: [leaf]), partialPath = Reference(cache: true, components: [partial])
+        let parent = try openParent(path); defer { Darwin.close(parent.fd) }
+        let output = Darwin.openat(parent.fd, partial, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        guard output >= 0 else { throw NativeAttachmentFilesError.unavailable }
+        defer { Darwin.close(output) }
+        let created = try Self.identity(output)
+        var promoted = false, complete = false
+        defer {
+            if !complete {
+                // A pathname is insufficient even in a failure defer: ancestors
+                // and the exact created single-link inode must still match.
+                let cleanupPath = promoted ? path : partialPath
+                let named = Parent(fd: parent.fd, leaf: promoted ? leaf : partial)
+                if (try? verify(named, path: cleanupPath)) != nil,
+                   let current = try? Self.named(named), let retained = try? Self.regular(output),
+                   Identity(current) == created, Identity(retained) == created,
+                   current.st_nlink == 1, retained.st_nlink == 1,
+                   current.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) {
+                    _ = Darwin.unlinkat(named.fd, named.leaf, 0)
+                    _ = Darwin.fsync(named.fd)
+                }
+            }
+        }
+        func validateOutput() throws {
+            let named = Parent(fd: parent.fd, leaf: promoted ? leaf : partial)
+            try verify(named, path: promoted ? path : partialPath)
+            let retained = try Self.regular(output), current = try Self.named(named)
+            guard Identity(retained) == created, Self.unchanged(retained, current),
+                  retained.st_nlink == 1, current.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
+        }
+        func check() throws {
+            try validateSource(); try validateOutput(); try checkCancellation(); try validateSource(); try validateOutput()
+        }
+        try check()
+        let partialURL = cache.appendingPathComponent(partial)
+        #if os(iOS)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                              ofItemAtPath: partialURL.path)
+        try check()
+        #endif
+        var privateURL = partialURL, attributes = URLResourceValues()
+        attributes.isExcludedFromBackup = true
+        try privateURL.setResourceValues(attributes)
+        try check()
+        #if DEBUG
+        try afterSourceOpened?()
+        #endif
+        try check()
+        var written: Int64 = 0
+        let content = try hashContents(input, checkCancellation: check) { bytes in
+            guard written <= Self.maximumProviderBytes - Int64(bytes.count) else {
+                throw NativeAttachmentFilesError.providerTooLarge
+            }
+            try check(); try Self.write(output, bytes); written += Int64(bytes.count)
+        }
+        try check()
+        guard content.size == before.st_size, written == content.size else { throw NativeAttachmentFilesError.unavailable }
+        #if DEBUG
+        try beforeStageSync?()
+        #endif
+        try check()
+        guard Darwin.fsync(output) == 0, Darwin.fcntl(output, F_FULLFSYNC) == 0 else { throw NativeAttachmentFilesError.unavailable }
+        let filled = try Self.regular(output)
+        #if DEBUG
+        try beforePublish?()
+        #endif
+        try check()
+        guard try Self.unchanged(filled, Self.regular(output)),
+              Darwin.renameatx_np(parent.fd, partial, parent.fd, leaf, UInt32(RENAME_EXCL)) == 0 else {
+            throw NativeAttachmentFilesError.unavailable
+        }
+        promoted = true
+        try check()
+        guard Darwin.fsync(parent.fd) == 0 else { throw NativeAttachmentFilesError.unavailable }
+        try check()
+        let uri = cache.appendingPathComponent(leaf).absoluteString
+        let observed = try snapshotCacheSource(uri, checkCancellation: check)
+        try check()
+        guard observed.identity == Self.token(created), observed.sha256 == content.sha256, observed.size == content.size,
+              observed.cacheRootIdentity == Self.token(cacheIdentity),
+              observed.parentIdentity == (try Self.token(Self.identity(parent.fd))) else {
+            throw NativeAttachmentFilesError.unavailable
+        }
+        complete = true
+        return ProviderCacheCopyReceipt(proof: observed, generation: try Self.regular(output), fileName: fileName, mimeType: mimeType)
+    }
+
+    /// A cheap immutable-generation fence for the existing Add owner checks.
+    /// Content was hashed at minting; same-inode writes change the bound ctime.
+    func requireProviderSource(_ receipt: ProviderCacheCopyReceipt) throws {
+        let proof = receipt.proof, path = try reference(proof.sourceURI)
+        guard path.cache, path.components.count == 1, proof.cacheRootIdentity == Self.token(cacheIdentity),
+              proof.parentIdentity == proof.cacheRootIdentity else { throw NativeAttachmentFilesError.invalidRequest }
+        let parent = try openParent(path); defer { Darwin.close(parent.fd) }
+        let fd = try openFile(parent); defer { Darwin.close(fd) }
+        let before = try Self.regular(fd)
+        try stable(fd, before: before, parent: parent, path: path)
+        guard Self.token(Identity(before)) == proof.identity, before.st_size == proof.size,
+              before.st_nlink == 1, try Self.named(parent).st_nlink == 1,
+              before.st_mode == receipt.mode,
+              Int64(before.st_mtimespec.tv_sec) == receipt.modificationSeconds,
+              Int64(before.st_mtimespec.tv_nsec) == receipt.modificationNanoseconds,
+              Int64(before.st_ctimespec.tv_sec) == receipt.changeSeconds,
+              Int64(before.st_ctimespec.tv_nsec) == receipt.changeNanoseconds else {
+            throw NativeAttachmentFilesError.unavailable
+        }
+    }
+
+    /// Caller must first settle/drain all consumers in the same library turn.
+    func retireProviderSource(_ receipt: ProviderCacheCopyReceipt,
+                              checkCancellation: () throws -> Void) throws -> BaselineAttachmentRetirementOutcome {
+        let proof = receipt.proof, path = try reference(proof.sourceURI)
+        guard path.cache, path.components.count == 1, proof.cacheRootIdentity == Self.token(cacheIdentity),
+              proof.parentIdentity == proof.cacheRootIdentity else { throw NativeAttachmentFilesError.invalidRequest }
+        return try retireGeneration(path: path,
+            proof: .init(sha256: proof.sha256, size: proof.size, identity: proof.identity, directoryIdentity: proof.parentIdentity),
+            retainDifferent: true, checkCancellation: checkCancellation)
+    }
+
     func snapshotCacheSource(_ uri: String, checkCancellation: () throws -> Void = {}) throws -> CacheSourceProof {
         let path = try reference(uri)
         guard path.cache, !path.components.isEmpty else { throw NativeAttachmentFilesError.invalidRequest }

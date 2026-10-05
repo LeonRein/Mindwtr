@@ -411,6 +411,34 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
         mutationLock.lock(); defer { mutationLock.unlock() }
         try files.deleteNow(uri)
     }
+    /// Native-only object transport. Never round-trip creation authority through
+    /// the JSON mailbox or call these synchronous wrappers from the file queue.
+    func copyProviderSource(_ url: URL, cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentFiles.ProviderCacheCopyReceipt {
+        try queue.sync {
+            lock.lock(); let ready = accepting; lock.unlock()
+            guard ready else { throw NativeAttachmentFileJobsError.unavailable }
+            try cancellation.check()
+            mutationLock.lock(); defer { mutationLock.unlock() }
+            return try files.copyProviderSource(url, checkCancellation: cancellation.check)
+        }
+    }
+    func requireProviderSource(_ receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt) throws {
+        try queue.sync {
+            lock.lock(); let ready = accepting; lock.unlock()
+            guard ready else { throw NativeAttachmentFileJobsError.unavailable }
+            mutationLock.lock(); defer { mutationLock.unlock() }
+            try files.requireProviderSource(receipt)
+        }
+    }
+    /// After drain, retirement stays on the off-main Engine turn so its final
+    /// callback may recheck editor/journal evidence without file-queue JSC use.
+    func retireProviderSource(_ receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt,
+                              requireOwner: () throws -> Void) throws -> NativeAttachmentFiles.BaselineAttachmentRetirementOutcome {
+        lock.lock(); let ready = accepting; lock.unlock()
+        guard ready else { throw NativeAttachmentFileJobsError.unavailable }
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        return try files.retireProviderSource(receipt, checkCancellation: requireOwner)
+    }
     func drain() { queue.sync {} }
     func cancelAndDrain() {
         lock.lock(); let tokens = jobs.values.map(\.token); lock.unlock()

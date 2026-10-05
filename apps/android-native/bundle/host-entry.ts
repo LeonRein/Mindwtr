@@ -3332,14 +3332,16 @@ globalThis.MindwtrHost = {
             const mixedSave = operation === 'mixed-save' && ['domainSaved', 'settled'].includes(outcome);
             const mixedDiscard = operation === 'discard-mixed' && outcome === 'confirmed';
             const mixedAdd = operation === 'add-mixed' && ['confirmed', 'replayed'].includes(outcome);
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd
+            const providerAdd = operation === 'provider-add' && outcome === 'confirmed';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
+                    context: { ...(providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
+                        : mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
                         : mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }
                         : mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
                         : removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
