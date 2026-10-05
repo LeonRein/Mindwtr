@@ -3,7 +3,7 @@ import { validateNativeTaskEditorOpeningFields } from './native-host-contract-ta
 import { ASSOCIATIONS, LIFECYCLE, RECURRENCE, SCHEDULE, readNativeTaskDraftSaveRequest, validRawTask,
     type NativeTaskRecurrenceBase, type NativeTaskScheduleBase } from './native-host-contract-task-save';
 import { readNativeAttachments } from './native-host-contract-attachments';
-import { isNativeJsonWithinBytes } from './native-host-contract-task-view';
+import { isNativeJsonWithinBytes, readChecklist } from './native-host-contract-task-view';
 import { getTaskEditorDailyInterval, getTaskEditorSuggestions } from './task-editor-model';
 import { getTaskEditorRelativeStart, getTaskEditorRecurrenceInputValues, getTaskEditorTimeEstimate } from './task-editor-schedule';
 import { taskEditValuesEqual } from './json-value-equality';
@@ -99,6 +99,19 @@ export function validateNativeTaskEditorSaveCheckpoint(
     input: NativeTaskEditorSaveCheckpointInput,
     validateField: (field: TaskDraftField, value: unknown) => boolean,
 ): NativeHostResult<{ kind: 'ready' }> {
+    return validateEditorSaveCheckpoint(input, validateField, false);
+}
+
+/** Internal complete-owned selection; ordinary checkpoint grammar stays sealed. */
+export function validateNativeOwnedCompleteTaskEditorSaveCheckpoint(
+    input: NativeTaskEditorSaveCheckpointInput,
+    validateField: (field: TaskDraftField, value: unknown) => boolean,
+): NativeHostResult<{ kind: 'ready' }> {
+    return validateEditorSaveCheckpoint(input, validateField, true);
+}
+
+function validateEditorSaveCheckpoint(input: NativeTaskEditorSaveCheckpointInput,
+    validateField: (field: TaskDraftField, value: unknown) => boolean, complete: boolean): NativeHostResult<{ kind: 'ready' }> {
     try {
         const captured = capture(input, 2 * PAYLOAD_BYTES + REQUEST_BYTES + TASK_BYTES + 256);
         if (!exact(captured, ['payloadJSON', 'saveRequest', 'beforeTask']) || typeof captured.payloadJSON !== 'string'
@@ -111,19 +124,24 @@ export function validateNativeTaskEditorSaveCheckpoint(
         const touched = Object.keys(payload.touchedBase), edited = payload.edited, base = payload.touchedBase;
         const scheduleOwned = SCHEDULE.some((field) => touched.includes(field));
         const recurrenceOwned = RECURRENCE.some((field) => touched.includes(field));
+        const checklistOwned = complete && (own(payload, 'checklistBase') || own(payload, 'checklistValue'));
         const keys = ['version', 'taskID', 'tab', 'touchedBase', 'edited', 'raw', 'scheduleEdits', 'scheduleFailedID',
             'attachmentsOwned', 'attachmentsBase', 'attachments', 'linkSheet',
-            ...(scheduleOwned ? ['scheduleBase'] : []), ...(recurrenceOwned ? ['recurrenceBase'] : [])];
+            ...(scheduleOwned ? ['scheduleBase'] : []), ...(recurrenceOwned ? ['recurrenceBase'] : []),
+            ...(checklistOwned ? ['checklistBase', 'checklistValue'] : [])];
         if (!exact(payload, keys) || payload.version !== 2 || payload.attachmentsOwned !== true
             || (payload.tab !== 'task' && payload.tab !== 'view') || typeof payload.taskID !== 'string'
-            || !exact(edited, touched) || touched.some((field) => !FIELDS.includes(field) || (LIFECYCLE as readonly string[]).includes(field))
+            || !exact(edited, touched) || touched.some((field) => !(complete ? [...FIELDS, ...LIFECYCLE] : FIELDS).includes(field)
+                || !complete && (LIFECYCLE as readonly string[]).includes(field))
             || !exact(payload.raw, RAW_FIELDS) || !Array.isArray(payload.scheduleEdits) || payload.scheduleEdits.length !== 0
             || payload.scheduleFailedID !== null || !exact(payload.linkSheet, [])
             || !validRawTask(captured.beforeTask, payload.taskID)) return invalid();
         const beforeTask = captured.beforeTask;
         const openingInput = { id: payload.taskID, touchedBase: base,
             ...(scheduleOwned ? { scheduleBase: payload.scheduleBase as NativeTaskScheduleBase } : {}),
-            ...(recurrenceOwned ? { recurrenceBase: payload.recurrenceBase as NativeTaskRecurrenceBase } : {}) };
+            ...(recurrenceOwned ? { recurrenceBase: payload.recurrenceBase as NativeTaskRecurrenceBase } : {}),
+            ...(checklistOwned ? { checklistBase: readChecklist(payload.checklistBase, true) ?? undefined } : {}) };
+        if (checklistOwned && (!readChecklist(payload.checklistBase, true) || !readChecklist(payload.checklistValue, true))) return invalid();
         const opening = validateNativeTaskEditorOpeningFields(openingInput, beforeTask, validateField);
         if (!opening.ok) return opening;
         const editedGrammar = readNativeTaskDraftSaveRequest({ id: payload.taskID, base, patch: edited,
@@ -136,17 +154,32 @@ export function validateNativeTaskEditorSaveCheckpoint(
         if (!attachmentBase || !attachments || !record(captured.saveRequest)) return invalid();
         const request = captured.saveRequest;
         const attachmentChanged = !taskEditValuesEqual(attachmentBase, attachments);
-        if (own(request, 'attachments') !== attachmentChanged || attachmentChanged && (!exact(request.attachments, ['base', 'value'])
+        if (own(request, 'attachments') !== (complete || attachmentChanged) || (complete || attachmentChanged) && (!exact(request.attachments, ['base', 'value'])
             || !taskEditValuesEqual(request.attachments.base, attachmentBase) || !taskEditValuesEqual(request.attachments.value, attachments))) return invalid();
+        if (complete && (!exact(request, ['id', 'requestId', 'base', 'patch', 'scheduleBase', 'checklist', 'attachments',
+            ...(own(request, 'recurrenceBase') ? ['recurrenceBase'] : []), ...(own(request, 'intent') ? ['intent'] : [])])
+            || typeof request.requestId !== 'string' || request.requestId.length !== 36
+            || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(request.requestId)
+            || own(request, 'intent') && request.intent !== 'cancel' && request.intent !== 'skip'
+            || !exact(request.checklist, ['base', 'value']))) return invalid();
+        if (complete) {
+            const checklist = request.checklist as Record<string, unknown>;
+            const checklistBase = readChecklist(checklist.base, true), checklistValue = readChecklist(checklist.value, true);
+            if (!checklistBase || !checklistValue || !taskEditValuesEqual(checklistBase, checklistOwned ? payload.checklistBase : opening.value.freshChecklistBase)
+                || !taskEditValuesEqual(checklistValue, checklistOwned ? payload.checklistValue : opening.value.freshChecklistBase)) return invalid();
+        }
         // Surrogate is solely the sealed parser's field-grammar admission. The real
         // attachment half is matched above; no synthetic record escapes this call.
         const surrogate = { base: [], value: [{ id: '00000000-0000-4000-8000-000000000000', kind: 'link', title: 'Grammar',
             uri: 'https://example.invalid/', createdAt: '2020-01-01T00:00:00.000Z', updatedAt: '2020-01-01T00:00:00.000Z' }] };
-        const parsed = readNativeTaskDraftSaveRequest({ ...request, ...(attachmentChanged ? { attachments: surrogate } : {}) }, validateField, false, true, true);
+        const { requestId: _requestId, checklist: _checklist, intent: _intent, attachments: _attachments, ...completeFields } = request;
+        const parsed = complete ? readNativeTaskDraftSaveRequest(completeFields, validateField, true, true)
+            : readNativeTaskDraftSaveRequest({ ...request, ...(attachmentChanged ? { attachments: surrogate } : {}) }, validateField, false, true, true);
         if (!parsed || parsed.id !== payload.taskID || !taskEditValuesEqual(parsed.scheduleBase, opening.value.freshScheduleBase)
             || scheduleOwned && !taskEditValuesEqual(parsed.scheduleBase, payload.scheduleBase)) return invalid();
         const changed = new Set(touched.filter((field) => !taskEditValuesEqual(base[field], edited[field])));
-        for (const group of [ASSOCIATIONS, RECURRENCE]) if (group.some((field) => changed.has(field))) group.forEach((field) => changed.add(field));
+        for (const group of (complete ? [ASSOCIATIONS, RECURRENCE, LIFECYCLE] : [ASSOCIATIONS, RECURRENCE]))
+            if (group.some((field) => changed.has(field))) group.forEach((field) => changed.add(field));
         if (!exact(parsed.patch, [...changed]) || !exact(parsed.base, [...changed])
             || [...changed].some((field) => !taskEditValuesEqual(parsed.patch[field as keyof typeof parsed.patch], edited[field])
                 || !taskEditValuesEqual(parsed.base[field as keyof typeof parsed.base], base[field]))

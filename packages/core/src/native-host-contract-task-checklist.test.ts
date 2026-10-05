@@ -1160,7 +1160,7 @@ describe('prepared task completion and Undo', () => {
             await sqlite.restart();
             expect(unwrap(sqlite.host.taskCompletionOutcome({ request, prepared }))).toEqual(prepared.result);
         } finally { await sqlite.close(); }
-    });
+    }, 30_000); // The injected failure exercises real exponential persistence backoff before cold recovery.
 
     it('cold-retries a failed SQLite completion Undo COMMIT without a partial child tombstone', async () => {
         vi.useFakeTimers({ toFake: ['Date'] });

@@ -7,7 +7,11 @@ import { captureNativeOwnedFileAddSaveData } from './native-host-contract-owned-
 import { readNativeAttachments, type NativeTaskLinkHalf } from './native-host-contract-attachments';
 import { mergeTaskDraftAttachments } from './attachment-editor-model';
 import { planAttachmentDraftSettlement, type AttachmentDraftCleanupCandidate } from './attachment-draft-settlement';
-import { validateNativeTaskEditorSaveCheckpoint } from './native-task-editor-save-checkpoint';
+import { validateNativeTaskEditorSaveCheckpoint, validateNativeOwnedCompleteTaskEditorSaveCheckpoint } from './native-task-editor-save-checkpoint';
+import { createOwnedCompleteTaskChecklistSaveAuthority, type NativeTaskChecklistSaveDependencies,
+    type NativeOwnedCompleteChecklistSaveRequest, type NativeOwnedCompleteChecklistDecision,
+    type NativeOwnedCompleteChecklistCancellation, type NativeTaskCancellationUndoRequest,
+    type NativePreparedOwnedCompleteCancellationUndo } from './native-host-contract-task-checklist';
 import { isNativeJsonWithinBytes } from './native-host-contract-task-view';
 import { taskEditValuesEqual } from './json-value-equality';
 import { createTaskDraft, type TaskDraft } from './task-draft';
@@ -131,6 +135,121 @@ export function createOwnedEditorFileEditTaskDraftSaveMethods(deps: NativeTaskDr
             const decision = checked.envelope.prepared.decision;
             return decision.kind === 'changed' ? authority.commit(decision.prepared, checked.envelope)
                 : authority.confirmNoop(decision, checked.envelope.request.saveRequest);
+        },
+    };
+}
+
+export type OwnedEditorCompleteSaveRequest = {
+    version: 2; kind: typeof KIND; checkpoint: OwnedEditorFileEditSaveRequest['checkpoint'];
+    ownedDraft: NativeAttachmentDraftLineageInputV3; saveRequest: NativeOwnedCompleteChecklistSaveRequest;
+};
+export type PreparedOwnedEditorCompleteSave = {
+    version: 2; kind: typeof KIND; request: OwnedEditorCompleteSaveRequest; decision: NativeOwnedCompleteChecklistDecision;
+};
+export type OwnedEditorCompleteSaveEnvelope = { request: OwnedEditorCompleteSaveRequest; prepared: PreparedOwnedEditorCompleteSave };
+export type OwnedEditorCompleteSaveResult = Result & {
+    cancellation?: { cancelledAt: string; undoEnabled: boolean; message: string; undoLabel: string };
+};
+export type OwnedEditorCompleteSaveValidation = {
+    version: 2; kind: typeof KIND; result: OwnedEditorCompleteSaveResult; settlementPlan: AttachmentDraftCleanupCandidate[];
+};
+export type PreparedOwnedEditorCompleteCancellationUndo = NativePreparedOwnedCompleteCancellationUndo & { cancel: OwnedEditorCompleteSaveEnvelope };
+export type OwnedEditorCompleteCancellationUndoEnvelope = {
+    request: NativeTaskCancellationUndoRequest; prepared: PreparedOwnedEditorCompleteCancellationUndo;
+};
+
+/** Internal complete-owned selection. Legacy factories and bridge grammars remain sealed. */
+export function createOwnedEditorCompleteTaskDraftSaveMethods(deps: NativeTaskChecklistSaveDependencies) {
+    const authority = createOwnedCompleteTaskChecklistSaveAuthority(deps);
+    const readRequest = (input: unknown): OwnedEditorCompleteSaveRequest | null => {
+        const value = captureNativeOwnedFileAddSaveData(input, REQUEST_BYTES);
+        if (!exact(value, ['version', 'kind', 'checkpoint', 'ownedDraft', 'saveRequest']) || value.version !== 2 || value.kind !== KIND
+            || !exact(value.checkpoint, ['version', 'sessionID', 'taskID', 'generation', 'payloadJSON'])) return null;
+        const checkpoint = value.checkpoint;
+        if (checkpoint.version !== 1 || typeof checkpoint.sessionID !== 'string' || checkpoint.sessionID.length !== 36 || !UUID.test(checkpoint.sessionID)
+            || typeof checkpoint.generation !== 'number' || !Number.isSafeInteger(checkpoint.generation) || checkpoint.generation < 1
+            || typeof checkpoint.payloadJSON !== 'string') return null;
+        try {
+            const lineage = validateNativeAttachmentDraftLineageV3(value.ownedDraft);
+            const history = value.ownedDraft as NativeAttachmentDraftLineageInputV3;
+            if (checkpoint.generation < history.priorOperations.length + 1 || checkpoint.taskID !== lineage.taskID
+                || checkpoint.payloadJSON !== lineage.payloadJSON) return null;
+            const latest = JSON.parse(checkpoint.payloadJSON) as Record<string, unknown>, saveRequest = authority.readRequest(value.saveRequest);
+            if (!saveRequest || saveRequest.id !== lineage.taskID || !taskEditValuesEqual(saveRequest.attachments.base, latest.attachmentsBase)
+                || !taskEditValuesEqual(saveRequest.attachments.value, latest.attachments)) return null;
+            return { ...value, saveRequest } as OwnedEditorCompleteSaveRequest;
+        } catch { return null; }
+    };
+    const readEnvelope = (input: unknown): { envelope: OwnedEditorCompleteSaveEnvelope; validation: OwnedEditorCompleteSaveValidation } | null => {
+        const value = captureNativeOwnedFileAddSaveData(input, REQUEST_BYTES + PREPARED_BYTES + 128);
+        if (!exact(value, ['request', 'prepared']) || !exact(value.prepared, ['version', 'kind', 'request', 'decision'])
+            || value.prepared.version !== 2 || value.prepared.kind !== KIND || !isNativeJsonWithinBytes(value.prepared, PREPARED_BYTES)) return null;
+        const request = readRequest(value.request), repeated = readRequest(value.prepared.request), decision = authority.readDecision(value.prepared.decision);
+        if (!request || !repeated || !decision || !taskEditValuesEqual(request, repeated)
+            || !taskEditValuesEqual(decision.prepared.request, request.saveRequest)) return null;
+        const before = decision.prepared.witness.source;
+        const after = decision.kind === 'changed' ? decision.prepared.effect.tasks.find((row) => row.after.id === request.saveRequest.id)?.after : before;
+        if (!after || !validateNativeOwnedCompleteTaskEditorSaveCheckpoint({ payloadJSON: request.checkpoint.payloadJSON,
+            saveRequest: request.saveRequest, beforeTask: before }, deps.validateField).ok) return null;
+        const checklistResult = decision.prepared.result;
+        const result: OwnedEditorCompleteSaveResult = { id: request.saveRequest.id, draft: createTaskDraft(after),
+            ...('cancellation' in checklistResult ? { cancellation: checklistResult.cancellation } : {}) };
+        // Empty file history grants no cleanup ownership, including old baseline tombstones.
+        const settlementPlan = request.ownedDraft.priorOperations.length === 0 ? [] : planAttachmentDraftSettlement({
+            baselineAttachments: request.saveRequest.attachments.base, draftAttachments: request.saveRequest.attachments.value,
+            committedAttachments: after.attachments });
+        const validation: OwnedEditorCompleteSaveValidation = { version: 2, kind: KIND, result, settlementPlan };
+        if (!isNativeJsonWithinBytes(validation, PREPARED_BYTES)) return null;
+        return { envelope: { request, prepared: { version: 2, kind: KIND, request, decision } }, validation };
+    };
+    const cancellation = (input: unknown): { envelope: OwnedEditorCompleteSaveEnvelope; proof: NativeOwnedCompleteChecklistCancellation } | null => {
+        const checked = readEnvelope(input);
+        if (!checked || checked.envelope.request.saveRequest.intent !== 'cancel' || checked.envelope.prepared.decision.kind !== 'changed') return null;
+        return { envelope: checked.envelope, proof: { request: checked.envelope.request.saveRequest as NativeOwnedCompleteChecklistCancellation['request'],
+            prepared: checked.envelope.prepared.decision.prepared } };
+    };
+    const readUndo = (input: unknown): { envelope: OwnedEditorCompleteCancellationUndoEnvelope; cancel: NonNullable<ReturnType<typeof cancellation>> } | null => {
+        const value = captureNativeOwnedFileAddSaveData(input, REQUEST_BYTES + PREPARED_BYTES + 128);
+        if (!exact(value, ['request', 'prepared']) || !record(value.prepared) || !isNativeJsonWithinBytes(value.prepared, PREPARED_BYTES)) return null;
+        const cancel = cancellation(value.prepared.cancel);
+        if (!cancel || !authority.readUndo(value, cancel.proof, cancel.envelope)) return null;
+        return { envelope: value as unknown as OwnedEditorCompleteCancellationUndoEnvelope, cancel };
+    };
+    return {
+        async prepareOwnedEditorCompleteTaskDraftSave(input: OwnedEditorCompleteSaveRequest): Promise<NativeHostResult<{
+            kind: 'prepared'; prepared: PreparedOwnedEditorCompleteSave }>> {
+            const ready = deps.readiness(); if (!ready.ok) return ready;
+            const request = readRequest(input); if (!request) return invalid();
+            const selected = await authority.prepareDecision(request.saveRequest); if (!selected.ok) return selected;
+            const checked = readEnvelope({ request, prepared: { version: 2, kind: KIND, request, decision: selected.value } });
+            return checked ? { ok: true, value: { kind: 'prepared', prepared: checked.envelope.prepared } } : invalid();
+        },
+        validatePreparedOwnedEditorCompleteTaskDraftSave(input: OwnedEditorCompleteSaveEnvelope): NativeHostResult<OwnedEditorCompleteSaveValidation> {
+            const checked = readEnvelope(input); return checked ? { ok: true, value: checked.validation } : invalid();
+        },
+        async commitPreparedOwnedEditorCompleteTaskDraftSave(input: OwnedEditorCompleteSaveEnvelope): Promise<NativeHostResult<OwnedEditorCompleteSaveResult>> {
+            const ready = deps.readiness(); if (!ready.ok) return ready;
+            const checked = readEnvelope(input); if (!checked) return invalid();
+            const committed = await authority.commitDecision(checked.envelope.prepared.decision, checked.envelope);
+            return committed.ok ? { ok: true, value: checked.validation.result } : committed;
+        },
+        async prepareOwnedEditorCompleteTaskCancellationUndo(input: { request: NativeTaskCancellationUndoRequest; cancel: OwnedEditorCompleteSaveEnvelope }): Promise<NativeHostResult<{
+            kind: 'prepared'; prepared: PreparedOwnedEditorCompleteCancellationUndo }>> {
+            const value = captureNativeOwnedFileAddSaveData(input, REQUEST_BYTES + PREPARED_BYTES + 128);
+            if (!exact(value, ['request', 'cancel'])) return invalid();
+            const cancel = cancellation(value.cancel); if (!cancel || !exact(value.request, ['requestId', 'cancelRequestId'])) return invalid();
+            const selected = await authority.prepareUndo(value.request as NativeTaskCancellationUndoRequest, cancel.proof, cancel.envelope);
+            if (!selected.ok) return selected;
+            const checked = readUndo({ request: value.request, prepared: selected.value.prepared });
+            return checked ? { ok: true, value: { kind: 'prepared', prepared: checked.envelope.prepared } } : invalid();
+        },
+        validatePreparedOwnedEditorCompleteTaskCancellationUndo(input: OwnedEditorCompleteCancellationUndoEnvelope): NativeHostResult<{ id: string }> {
+            const checked = readUndo(input); return checked ? { ok: true, value: checked.envelope.prepared.result } : invalid();
+        },
+        async commitPreparedOwnedEditorCompleteTaskCancellationUndo(input: OwnedEditorCompleteCancellationUndoEnvelope): Promise<NativeHostResult<{ id: string }>> {
+            const ready = deps.readiness(); if (!ready.ok) return ready;
+            const checked = readUndo(input); if (!checked) return invalid();
+            return authority.commitUndo(checked.envelope, checked.cancel.proof, checked.cancel.envelope, checked.envelope);
         },
     };
 }
