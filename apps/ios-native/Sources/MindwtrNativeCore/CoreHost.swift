@@ -82,6 +82,35 @@ public final class CoreHost: @unchecked Sendable {
     public func beginAttachmentDraftV2(expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.beginAttachmentDraftV2(expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
+    // Internal foundation only; mixed settlement/UI admission remains unbound.
+    func beginAttachmentDraftV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.beginAttachmentDraftV3(expectedSession: expectedSession,
+                expectedGeneration: expectedGeneration, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
+    func removeAttachmentDraftV3(requestJSON: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.removeAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
+    func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.recoverAttachmentDraftV3(expectedSession: expectedSession, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func saveAttachmentDraftAdds(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.saveAttachmentDraftAdds(saveRequestJSON: saveRequestJSON,
             expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
@@ -1413,6 +1442,26 @@ private final class Engine: @unchecked Sendable {
         #endif
         return coordinator
     }
+    private func attachmentDraftCoordinatorV3(cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentDraftCoordinator {
+        dispatchPrecondition(condition: .onQueue(queue))
+        try cancellation.check()
+        guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0, try ownedJournalIsAbsent(),
+              let runtime = context, let jobs = attachmentJobs else { throw HostFailure("Attachment draft recovery is not ready") }
+        let generation = attachmentGeneration
+        let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs, requireOwner: { [unowned self] in
+            dispatchPrecondition(condition: .onQueue(self.queue))
+            try cancellation.check()
+            guard self.started, !self.closed, self.pending == nil, !self.recoveryActivationPending, self.lockFD >= 0,
+                  self.context === runtime, self.attachmentGeneration == generation, self.attachmentJobs === jobs,
+                  try self.ownedJournalIsAbsent() else {
+                throw HostFailure("Attachment draft recovery is not ready")
+            }
+        }) { [unowned self] method, arguments in try self.invoke(method, arguments: arguments) }
+        #if DEBUG
+        coordinator.hooks = attachmentDraftHooks
+        #endif
+        return coordinator
+    }
     private func attachmentDraftOperation(_ action: () throws -> String) throws -> String {
         do { return try action() }
         catch { throw HostFailure("Attachment draft operation could not be confirmed; retained evidence requires exact recovery") }
@@ -1422,6 +1471,17 @@ private final class Engine: @unchecked Sendable {
     }
     func beginAttachmentDraftV2(expectedSession: String, expectedGeneration: Int) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinator().beginV2(session: expectedSession, generation: expectedGeneration) }
+    }
+    func beginAttachmentDraftV3(expectedSession: String, expectedGeneration: Int,
+                                cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).beginV3(
+            session: expectedSession, generation: expectedGeneration, cancellation: cancellation) }
+    }
+    func removeAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).removeV3(requestJSON, cancellation: cancellation) }
+    }
+    func recoverAttachmentDraftV3(expectedSession: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation) }
     }
 
     private static func ownedEqual(_ lhs: String, _ rhs: String) -> Bool { lhs.utf8.elementsEqual(rhs.utf8) }
@@ -2236,11 +2296,18 @@ private final class Engine: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft is not ready") }
         if attachmentDraftEvidence {
-            guard (try? NativeAttachmentDraftStore(databaseURL: databaseURL).read())?.version == 2 else {
+            guard let loaded = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else {
                 throw HostFailure("Attachment draft ownership requires exact recovery")
             }
             _ = try attachmentDraftOperation {
-                try attachmentDraftCoordinator().advance(snapshot)
+                switch loaded.record {
+                case .legacy(let record):
+                    guard record.version == 2 else { throw HostFailure("Attachment draft ownership requires exact recovery") }
+                    try attachmentDraftCoordinator().advance(snapshot)
+                case .mixed:
+                    let cancellation = NativeAttachmentCancellation()
+                    try attachmentDraftCoordinatorV3(cancellation: cancellation).advanceV3(snapshot, cancellation: cancellation)
+                }
                 return ""
             }
             return

@@ -36,16 +36,19 @@ final class NativeAttachmentDraftCoordinator {
     private let jobs: NativeAttachmentFileJobs
     private let invoke: (String, [Any]) throws -> String
     private let managedURI: String
+    private let requireOwner: () throws -> Void
     #if DEBUG
     var hooks: AttachmentDraftHostHooks?
     #endif
     private static let failure = HostFailure("Attachment draft operation could not be confirmed; retained evidence requires exact recovery")
 
-    init(databaseURL: URL, jobs: NativeAttachmentFileJobs, invoke: @escaping (String, [Any]) throws -> String) throws {
+    init(databaseURL: URL, jobs: NativeAttachmentFileJobs, requireOwner: @escaping () throws -> Void = {},
+         invoke: @escaping (String, [Any]) throws -> String) throws {
         store = Store(databaseURL: databaseURL)
         editor = EditorDraftStore(databaseURL: databaseURL)
         self.jobs = jobs
         self.invoke = invoke
+        self.requireOwner = requireOwner
         let directories = try Self.object(jobs.directoriesJSON)
         guard let document = directories["document"] as? String, let root = URL(string: document) else { throw Self.failure }
         managedURI = root.appendingPathComponent("attachments", isDirectory: true).absoluteString
@@ -170,8 +173,11 @@ final class NativeAttachmentDraftCoordinator {
     }
     private func acknowledge(_ operation: String, _ outcome: String) { _ = try? invoke("attachmentDraftAcknowledged", [operation, outcome]) }
     static func readSummary(databaseURL: URL) throws -> String {
-        guard let record = try Store(databaseURL: databaseURL).read() else { return "null" }
-        return try Self.summary(record)
+        guard let snapshot = try Store(databaseURL: databaseURL).readVersioned() else { return "null" }
+        switch snapshot.record {
+        case .legacy(let record): return try Self.summary(record)
+        case .mixed(let record): return try Self.summary(record)
+        }
     }
     private static func summary(_ record: Store.Record) throws -> String {
         let status = record.checkpointAdvance != nil ? "checkpointPending"
@@ -179,6 +185,24 @@ final class NativeAttachmentDraftCoordinator {
         return try Self.json(["version": record.version, "status": status, "sessionID": record.session.sessionID,
                        "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(record.session.checkpoint), as: UTF8.self)),
                        "operations": record.operations.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue, "reason": $0.reason.map { $0.rawValue as Any } ?? NSNull()] }])
+    }
+    private static func summary(_ record: Store.MixedRecord) throws -> String {
+        let uncertain = record.operations.last.map { entry in
+            if case .add(let op) = entry { return op.reason != nil }
+            return false
+        } ?? false
+        let status = record.checkpointAdvance != nil ? "checkpointPending"
+            : record.session.state == .cleanupPending ? "cleanupPending" : uncertain ? "uncertain" : "active"
+        let operations: [[String: Any]] = record.operations.map { entry in
+            switch entry {
+            case .add(let op): return ["kind": "add", "requestId": op.requestId, "phase": op.phase.rawValue,
+                                      "reason": op.reason.map { $0.rawValue as Any } ?? NSNull()]
+            case .remove(let op): return ["kind": "remove", "requestId": op.requestId, "phase": op.phase.rawValue, "reason": NSNull()]
+            }
+        }
+        return try Self.json(["version": 3, "status": status, "sessionID": record.session.sessionID,
+            "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(record.session.checkpoint), as: UTF8.self)),
+            "operations": operations])
     }
     func begin(session: String, generation: Int) throws -> String {
         try begin(session: session, generation: generation, version: 1)
@@ -321,6 +345,352 @@ final class NativeAttachmentDraftCoordinator {
         #if DEBUG
         try hooks?.boundary?(.afterAdvanceMarker)
         #endif
+        return settled
+    }
+
+    private struct RemoveRequest {
+        let id: String, session: String, attachmentID: String, json: String
+        let generation: Int
+    }
+    private static func removeRequest(_ raw: String) throws -> RemoveRequest {
+        let value = try object(raw, limit: 64 * 1024)
+        guard Set(value.keys) == Set(["version", "requestId", "sessionID", "generation", "attachmentId"]),
+              integer(value["version"]) == 1, let id = uuid(value["requestId"]), id.utf8.count == 36,
+              let session = uuid(value["sessionID"]), session.utf8.count == 36,
+              let generation = integer(value["generation"], positive: true),
+              let attachment = value["attachmentId"] as? String, !attachment.isEmpty, attachment.utf16.count <= 500 else { throw failure }
+        let canonical = try json(value)
+        guard canonical.utf8.count <= 64 * 1024 else { throw failure }
+        return .init(id: id, session: session, attachmentID: attachment, json: canonical, generation: Int(generation))
+    }
+    private func mixedRead(_ cancellation: NativeAttachmentCancellation) throws -> (record: Store.MixedRecord, binding: Store.VersionedSnapshot) {
+        try requireOwner(); try cancellation.check()
+        guard let binding = try store.readVersioned(), case .mixed(let record) = binding.record else { throw Self.failure }
+        try requireOwner(); try cancellation.check()
+        return (record, binding)
+    }
+    private func requireMixed(_ binding: Store.VersionedSnapshot, _ cancellation: NativeAttachmentCancellation) throws {
+        try requireOwner(); try cancellation.check()
+        guard let actual = try store.readVersioned(), binding.matches(actual) else { throw Self.failure }
+        try requireOwner(); try cancellation.check()
+    }
+    private func mixedInvoke(_ method: String, _ input: [String: Any], binding: Store.VersionedSnapshot?,
+                             cancellation: NativeAttachmentCancellation) throws -> [String: Any] {
+        try Self.object(mixedInvokeJSON(method, input, binding: binding, cancellation: cancellation))
+    }
+    private func mixedInvokeJSON(_ method: String, _ input: [String: Any], binding: Store.VersionedSnapshot?,
+                                 cancellation: NativeAttachmentCancellation) throws -> String {
+        try requireOwner(); try cancellation.check()
+        let result = try invoke(method, [Self.json(input)])
+        try requireOwner(); try cancellation.check()
+        if let binding { try requireMixed(binding, cancellation) }
+        else { guard case nil = try store.readVersioned() else { throw Self.failure } }
+        return result
+    }
+    private func currentMixed(_ candidates: [EditorDraftSnapshot]) throws {
+        guard let value = try editor.read(), value.attempt == nil,
+              candidates.contains(where: { Self.equal(value.snapshot, $0) }) else { throw Self.failure }
+    }
+    private func writeMixed(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot?,
+                            cancellation: NativeAttachmentCancellation) throws -> Store.VersionedSnapshot {
+        try requireOwner(); try cancellation.check()
+        if let binding { try requireMixed(binding, cancellation) }
+        else { guard case nil = try store.readVersioned() else { throw Self.failure } }
+        // An uncertain write acknowledgment aborts before any binding refresh.
+        try store.writeMixed(record)
+        guard let next = try store.readVersioned(), case .mixed(let actual) = next.record else { throw Self.failure }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        guard try encoder.encode(actual) == encoder.encode(record) else { throw Self.failure }
+        try requireOwner(); try cancellation.check()
+        return next
+    }
+    private func removeReply(_ op: Store.RemoveOperation) throws -> String {
+        let request = try Self.removeRequest(op.requestJSON)
+        return try Self.json(["version": 1, "status": "draftRemoved", "requestId": op.requestId,
+            "sessionID": op.after.sessionID, "generation": op.after.generation, "attachmentId": request.attachmentID])
+    }
+    private func mixedPrepared(_ entry: Store.MixedOperation) throws -> [String: Any] {
+        switch entry {
+        case .add(let op):
+            let frozen = try prepared(op)
+            if let reply = op.replyJSON { guard Self.equal(reply, try addReply(op)) else { throw Self.failure } }
+            return ["kind": "add", "operation": frozen]
+        case .remove(let op):
+            let request = try Self.removeRequest(op.requestJSON)
+            guard Self.equal(request.json, op.requestJSON), request.id == op.requestId,
+                  request.session == op.before.sessionID, request.generation == op.before.generation else { throw Self.failure }
+            if let reply = op.replyJSON { guard Self.equal(reply, try removeReply(op)) else { throw Self.failure } }
+            return ["kind": "remove", "operation": try Self.object(op.preparedJSON, limit: 2 * 1024 * 1024)]
+        }
+    }
+    private func mixedInput(_ record: Store.MixedRecord, payload: String) throws -> [String: Any] {
+        ["version": 3, "taskID": record.session.taskID,
+         "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
+         "beforePayloadJSON": payload, "priorOperations": try record.operations.map { try mixedPrepared($0) }, "managedDirectoryURI": managedURI]
+    }
+    private func mixedProjection(_ record: Store.MixedRecord, payload: String, binding: Store.VersionedSnapshot,
+                                 cancellation: NativeAttachmentCancellation) throws {
+        let validated = try mixedInvoke("attachmentDraftValidateLineageV3", mixedInput(record, payload: payload),
+                                        binding: binding, cancellation: cancellation)
+        guard Set(validated.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(validated["version"]) == 3,
+              let task = validated["taskID"] as? String, Self.equal(task, record.session.taskID),
+              let projected = validated["payloadJSON"] as? String, Self.equal(projected, payload) else { throw Self.failure }
+    }
+    private func mixedHistory(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot,
+                              cancellation: NativeAttachmentCancellation) throws {
+        guard record.session.state == .active, record.discard == nil else { throw Self.failure }
+        let pending = record.operations.last.flatMap { $0.checkpointed ? nil : $0.after }
+        try mixedProjection(record, payload: pending?.payloadJSON ?? record.session.checkpoint.payloadJSON,
+                            binding: binding, cancellation: cancellation)
+        if let advance = record.checkpointAdvance {
+            try mixedProjection(record, payload: advance.after.payloadJSON, binding: binding, cancellation: cancellation)
+        }
+        try currentMixed([record.session.checkpoint] + (pending.map { [$0] } ?? [])
+            + (record.checkpointAdvance.map { [$0.after] } ?? []))
+    }
+    private func mixedRecord(_ record: Store.MixedRecord, checkpoint: EditorDraftSnapshot,
+                             operations: [Store.MixedOperation]? = nil,
+                             advance: Store.CheckpointAdvance? = nil) -> Store.MixedRecord {
+        Store.MixedRecord(session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
+            state: record.session.state, checkpoint: checkpoint), operations: operations ?? record.operations,
+            discard: record.discard, checkpointAdvance: advance)
+    }
+    private func preflightMixedShapes(_ records: [Store.MixedRecord]) throws {
+        for record in records {
+            _ = try Store.mixedFingerprint(record) // Structural validation only.
+            guard try JSONEncoder().encode(record).count <= Store.maximumBytes else { throw Self.failure }
+        }
+    }
+    private func futureMixedDiscards(_ record: Store.MixedRecord) throws -> [Store.MixedRecord] {
+        let used = Set(record.operations.map(\.requestId))
+        guard let id = (0...128).map({ String(format: "ffffffff-ffff-ffff-ffff-%012d", $0) }).first(where: { !used.contains($0) }) else {
+            throw Self.failure
+        }
+        let checkpoint = record.session.checkpoint
+        let request = try Self.json(["version": 1, "requestId": id, "sessionID": checkpoint.sessionID, "generation": checkpoint.generation])
+        let reply = try Self.json(["version": 1, "status": "cleanupPending", "requestId": id, "sessionID": checkpoint.sessionID])
+        return [Store.DiscardPhase.decided, .detached].map { phase in
+            Store.MixedRecord(session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
+                state: .cleanupPending, checkpoint: checkpoint), operations: record.operations,
+                discard: .init(requestId: id, requestJSON: request, expected: checkpoint, phase: phase,
+                               replyJSON: phase == .detached ? reply : nil))
+        }
+    }
+    private func completedRemove(_ op: Store.RemoveOperation) throws -> Store.RemoveOperation {
+        .init(requestId: op.requestId, requestJSON: op.requestJSON, phase: .checkpointed,
+            before: op.before, after: op.after, preparedJSON: op.preparedJSON, replyJSON: try removeReply(op))
+    }
+    private func acknowledgedRemoveRecord(_ record: Store.MixedRecord, _ op: Store.RemoveOperation) throws -> Store.MixedRecord {
+        mixedRecord(record, checkpoint: op.after, operations: Array(record.operations.dropLast()) + [.remove(try completedRemove(op))])
+    }
+    private func preflightRemove(_ record: Store.MixedRecord, admission: Bool) throws {
+        guard let last = record.operations.last, case .remove(let op) = last, op.phase == .intent else { throw Self.failure }
+        try editor.preflightCheckpoint(op.after)
+        let complete = try acknowledgedRemoveRecord(record, op)
+        var shapes = [record, complete]
+        if admission {
+            shapes += try futureMixedDiscards(record) + futureMixedDiscards(complete)
+            guard op.after.generation < 9_007_199_254_740_991 else { throw Self.failure }
+            let next = EditorDraftSnapshot(sessionID: op.after.sessionID, taskID: op.after.taskID,
+                generation: op.after.generation + 1, payloadJSON: op.after.payloadJSON)
+            shapes += [mixedRecord(complete, checkpoint: op.after, advance: .init(before: op.after, after: next)),
+                       mixedRecord(complete, checkpoint: next)]
+        }
+        try preflightMixedShapes(shapes)
+        try store.preflightMixed(record)
+    }
+    func beginV3(session: String, generation: Int, cancellation: NativeAttachmentCancellation) throws -> String {
+        jobs.drain(); try requireOwner(); try cancellation.check()
+        guard Self.uuid(session) != nil, session.utf8.count == 36, generation > 0, generation <= 9_007_199_254_740_991,
+              let value = try editor.read(), value.attempt == nil,
+              Self.equal(value.snapshot.sessionID, session), value.snapshot.generation == generation else { throw Self.failure }
+        let snapshot = value.snapshot, binding = try store.readVersioned()
+        let existing: Store.MixedRecord?
+        if let binding {
+            guard case .mixed(let record) = binding.record, record.session.state == .active, record.discard == nil,
+                  record.checkpointAdvance == nil, record.operations.allSatisfy({ $0.checkpointed }),
+                  Self.equal(record.session.checkpoint, snapshot) else { throw Self.failure }
+            try mixedHistory(record, binding: binding, cancellation: cancellation); existing = record
+        } else { existing = nil }
+        let initial = existing?.operations.first?.before.payloadJSON ?? snapshot.payloadJSON
+        let reply = try mixedInvoke("attachmentDraftBeginV3", ["taskID": snapshot.taskID, "payloadJSON": initial],
+                                    binding: binding, cancellation: cancellation)
+        guard Set(reply.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(reply["version"]) == 3,
+              let task = reply["taskID"] as? String, Self.equal(task, snapshot.taskID),
+              let payload = reply["payloadJSON"] as? String, Self.equal(payload, initial) else { throw Self.failure }
+        try current(snapshot)
+        if existing == nil {
+            let record = Store.MixedRecord(session: .init(sessionID: session, taskID: snapshot.taskID, state: .active, checkpoint: snapshot), operations: [])
+            try store.preflightMixed(record)
+            _ = try writeMixed(record, binding: nil, cancellation: cancellation)
+            try current(snapshot)
+        } else if let binding { try requireMixed(binding, cancellation) }
+        return try Self.json(["version": 3, "status": "begun", "sessionID": session, "generation": generation])
+    }
+    func removeV3(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        let request = try Self.removeRequest(raw)
+        jobs.drain()
+        let loaded = try mixedRead(cancellation), record = loaded.record
+        guard Self.equal(record.session.sessionID, request.session), record.session.state == .active,
+              record.discard == nil, record.checkpointAdvance == nil else { throw Self.failure }
+        if let entry = record.operations.first(where: { $0.requestId == request.id }) {
+            guard case .remove(let existing) = entry, Self.equal(existing.requestJSON, request.json) else { throw Self.failure }
+            try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+            if existing.phase == .checkpointed {
+                guard record.operations.allSatisfy({ $0.checkpointed }), let reply = existing.replyJSON else { throw Self.failure }
+                try current(record.session.checkpoint)
+                let resynced = try writeMixed(record, binding: loaded.binding, cancellation: cancellation)
+                try current(record.session.checkpoint); try requireMixed(resynced, cancellation)
+                acknowledge("remove", "replayed"); return reply
+            }
+            guard record.operations.last?.requestId == request.id else { throw Self.failure }
+            let finished = try finishRemove(record, binding: loaded.binding, cancellation: cancellation)
+            acknowledge("remove", "confirmed"); return try lastRemoveReply(finished)
+        }
+        guard record.operations.allSatisfy({ $0.checkpointed }), record.operations.count < 128,
+              request.generation == record.session.checkpoint.generation,
+              request.generation < 9_007_199_254_740_990 else { throw Self.failure }
+        try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+        try current(record.session.checkpoint)
+        var input = try mixedInput(record, payload: record.session.checkpoint.payloadJSON)
+        input["requestId"] = request.id; input["attachmentId"] = request.attachmentID
+        let frozenJSON = try mixedInvokeJSON("attachmentDraftRemovePrepareV3", input, binding: loaded.binding, cancellation: cancellation)
+        let frozen = try Self.object(frozenJSON, limit: 2 * 1024 * 1024)
+        guard let afterPayload = frozen["afterPayloadJSON"] as? String else { throw Self.failure }
+        let before = record.session.checkpoint
+        let after = EditorDraftSnapshot(sessionID: before.sessionID, taskID: before.taskID,
+            generation: before.generation + 1, payloadJSON: afterPayload)
+        let op = Store.RemoveOperation(requestId: request.id, requestJSON: request.json, phase: .intent,
+            before: before, after: after, preparedJSON: frozenJSON)
+        let intent = mixedRecord(record, checkpoint: before, operations: record.operations + [.remove(op)])
+        try preflightRemove(intent, admission: true)
+        try mixedHistory(intent, binding: loaded.binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.beforeIntent)
+        #endif
+        try current(before); try requireMixed(loaded.binding, cancellation)
+        let binding = try writeMixed(intent, binding: loaded.binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.afterIntent)
+        #endif
+        try currentMixed([before, after]); try requireMixed(binding, cancellation)
+        let finished = try finishRemove(intent, binding: binding, cancellation: cancellation)
+        acknowledge("remove", "confirmed"); return try lastRemoveReply(finished)
+    }
+    private func lastRemoveReply(_ record: Store.MixedRecord) throws -> String {
+        guard let last = record.operations.last, case .remove(let op) = last, let reply = op.replyJSON else { throw Self.failure }
+        return reply
+    }
+    private func finishRemove(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot,
+                              cancellation: NativeAttachmentCancellation) throws -> Store.MixedRecord {
+        guard let last = record.operations.last, case .remove(let op) = last, op.phase == .intent else { throw Self.failure }
+        try preflightRemove(record, admission: false)
+        try mixedHistory(record, binding: binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.beforeCheckpoint)
+        #endif
+        try currentMixed([op.before, op.after]); try requireMixed(binding, cancellation)
+        try editor.checkpointOwnedAdvanceMatching(before: op.before, after: op.after)
+        #if DEBUG
+        try hooks?.boundary?(.afterCheckpoint)
+        #endif
+        try current(op.after); try requireMixed(binding, cancellation)
+        let complete = try acknowledgedRemoveRecord(record, op)
+        #if DEBUG
+        try hooks?.boundary?(.beforeMarker)
+        #endif
+        try current(op.after); try requireMixed(binding, cancellation)
+        let completedBinding = try writeMixed(complete, binding: binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.afterMarker)
+        #endif
+        try current(op.after); try requireMixed(completedBinding, cancellation)
+        return complete
+    }
+    func recoverV3(session: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        jobs.drain()
+        let loaded = try mixedRead(cancellation)
+        guard Self.uuid(session) != nil, session.utf8.count == 36, Self.equal(loaded.record.session.sessionID, session) else { throw Self.failure }
+        try mixedHistory(loaded.record, binding: loaded.binding, cancellation: cancellation)
+        if loaded.record.checkpointAdvance != nil {
+            let record = try finishAdvanceV3(loaded.record, binding: loaded.binding, cancellation: cancellation)
+            acknowledge("checkpoint", "replayed"); return try Self.summary(record)
+        }
+        if let last = loaded.record.operations.last, !last.checkpointed {
+            guard case .remove = last else { throw Self.failure }
+            let record = try finishRemove(loaded.record, binding: loaded.binding, cancellation: cancellation)
+            acknowledge("remove", "confirmed"); return try Self.summary(record)
+        }
+        try current(loaded.record.session.checkpoint)
+        let binding = try writeMixed(loaded.record, binding: loaded.binding, cancellation: cancellation)
+        try current(loaded.record.session.checkpoint); try requireMixed(binding, cancellation)
+        return try Self.summary(loaded.record)
+    }
+    private func preflightAdvanceV3(_ record: Store.MixedRecord, admission: Bool) throws {
+        guard let advance = record.checkpointAdvance else { throw Self.failure }
+        try editor.preflightCheckpoint(advance.after)
+        let settled = mixedRecord(record, checkpoint: advance.after)
+        var shapes = [record, settled]
+        if admission { shapes += try futureMixedDiscards(settled) }
+        try preflightMixedShapes(shapes); try store.preflightMixed(record)
+    }
+    func advanceV3(_ snapshot: EditorDraftSnapshot, cancellation: NativeAttachmentCancellation) throws {
+        jobs.drain()
+        let loaded = try mixedRead(cancellation), record = loaded.record
+        guard record.session.state == .active, record.discard == nil, record.operations.allSatisfy({ $0.checkpointed }),
+              Self.equal(snapshot.sessionID, record.session.sessionID), Self.equal(snapshot.taskID, record.session.taskID) else { throw Self.failure }
+        try editor.preflightCheckpoint(snapshot)
+        try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+        if let pending = record.checkpointAdvance {
+            guard Self.equal(snapshot, pending.after) else { throw Self.failure }
+            _ = try finishAdvanceV3(record, binding: loaded.binding, cancellation: cancellation)
+            acknowledge("checkpoint", "replayed"); return
+        }
+        try current(record.session.checkpoint)
+        if Self.equal(snapshot, record.session.checkpoint) {
+            let binding = try writeMixed(record, binding: loaded.binding, cancellation: cancellation)
+            try current(snapshot); try requireMixed(binding, cancellation)
+            acknowledge("checkpoint", "replayed"); return
+        }
+        guard snapshot.generation > record.session.checkpoint.generation, snapshot.generation <= 9_007_199_254_740_991 else { throw Self.failure }
+        try mixedProjection(record, payload: snapshot.payloadJSON, binding: loaded.binding, cancellation: cancellation)
+        let pending = mixedRecord(record, checkpoint: record.session.checkpoint, advance: .init(before: record.session.checkpoint, after: snapshot))
+        try preflightAdvanceV3(pending, admission: true)
+        #if DEBUG
+        try hooks?.boundary?(.beforeAdvanceIntent)
+        #endif
+        try current(record.session.checkpoint); try requireMixed(loaded.binding, cancellation)
+        let binding = try writeMixed(pending, binding: loaded.binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.afterAdvanceIntent)
+        #endif
+        try currentMixed([record.session.checkpoint, snapshot]); try requireMixed(binding, cancellation)
+        _ = try finishAdvanceV3(pending, binding: binding, cancellation: cancellation)
+        acknowledge("checkpoint", "confirmed")
+    }
+    private func finishAdvanceV3(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot,
+                                 cancellation: NativeAttachmentCancellation) throws -> Store.MixedRecord {
+        guard let advance = record.checkpointAdvance else { throw Self.failure }
+        try preflightAdvanceV3(record, admission: false)
+        #if DEBUG
+        try hooks?.boundary?(.beforeAdvanceEditor)
+        #endif
+        try currentMixed([advance.before, advance.after]); try requireMixed(binding, cancellation)
+        try editor.checkpointOwnedAdvanceMatching(before: advance.before, after: advance.after)
+        #if DEBUG
+        try hooks?.boundary?(.afterAdvanceEditor)
+        #endif
+        try current(advance.after); try requireMixed(binding, cancellation)
+        let settled = mixedRecord(record, checkpoint: advance.after)
+        #if DEBUG
+        try hooks?.boundary?(.beforeAdvanceMarker)
+        #endif
+        try current(advance.after); try requireMixed(binding, cancellation)
+        let next = try writeMixed(settled, binding: binding, cancellation: cancellation)
+        #if DEBUG
+        try hooks?.boundary?(.afterAdvanceMarker)
+        #endif
+        try current(advance.after); try requireMixed(next, cancellation)
         return settled
     }
 

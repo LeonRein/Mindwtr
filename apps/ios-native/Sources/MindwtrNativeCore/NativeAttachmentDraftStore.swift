@@ -858,7 +858,30 @@ struct NativeAttachmentDraftStore {
         }
     }
 
-    private func bytes() throws -> Data? {
+    enum VersionedRecord: Sendable { case legacy(Record), mixed(MixedRecord) }
+    struct VersionedSnapshot: Sendable {
+        let record: VersionedRecord
+        let bytes: Data
+        let device: UInt64
+        let inode: UInt64
+        func matches(_ other: VersionedSnapshot) -> Bool {
+            device == other.device && inode == other.inode && bytes == other.bytes
+        }
+    }
+    private struct ReadBytes {
+        let data: Data
+        let device: UInt64
+        let inode: UInt64
+        let links: UInt64
+    }
+    private static func stable(_ a: stat, _ b: stat) -> Bool {
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_mode == b.st_mode && a.st_nlink == b.st_nlink
+            && a.st_size == b.st_size && a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec
+            && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec && a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec
+            && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec
+    }
+    private func bytes() throws -> Data? { try readBytes(bound: false)?.data }
+    private func readBytes(bound: Bool) throws -> ReadBytes? {
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0 {
             if errno == ENOENT { return nil }
@@ -879,7 +902,37 @@ struct NativeAttachmentDraftStore {
             guard data.count <= Self.maximumBytes - count else { throw NativeAttachmentDraftStoreError.corrupt }
             data.append(contentsOf: buffer[..<count])
         }
-        return data
+        if bound {
+            var after = stat(), named = stat()
+            guard Darwin.fstat(fd, &after) == 0, Darwin.lstat(url.path, &named) == 0 else {
+                throw NativeAttachmentDraftStoreError.io
+            }
+            guard Self.stable(info, after), Self.stable(after, named), data.count == Int(after.st_size) else {
+                throw NativeAttachmentDraftStoreError.corrupt
+            }
+        }
+        return ReadBytes(data: data, device: UInt64(info.st_dev), inode: UInt64(info.st_ino), links: UInt64(info.st_nlink))
+    }
+
+    private struct VersionHeader: Decodable { let version: Int }
+    /// One bounded descriptor read and one strict version-specific decoder.
+    /// Existing readers intentionally retain their original behavior.
+    func readVersioned() throws -> VersionedSnapshot? {
+        guard let read = try readBytes(bound: true) else { return nil }
+        let record: VersionedRecord
+        do {
+            switch try JSONDecoder().decode(VersionHeader.self, from: read.data).version {
+            case 1, 2:
+                let value = try JSONDecoder().decode(Record.self, from: read.data)
+                try Self.validate(value); record = .legacy(value)
+            case 3:
+                try Self.require(read.links == 1)
+                let value = try JSONDecoder().decode(MixedRecord.self, from: read.data)
+                try Self.validate(value); record = .mixed(value)
+            default: throw NativeAttachmentDraftStoreError.corrupt
+            }
+        } catch { throw NativeAttachmentDraftStoreError.corrupt }
+        return VersionedSnapshot(record: record, bytes: read.data, device: read.device, inode: read.inode)
     }
 
     func read() throws -> Record? {

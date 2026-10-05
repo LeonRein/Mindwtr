@@ -3231,14 +3231,16 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             const finishedDiscard = operation === 'discard-finish' && outcome === 'confirmed';
             const unstartedDiscard = operation === 'discard-unstarted' && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard
+            const removedDraft = operation === 'remove' && ['confirmed', 'replayed'].includes(outcome);
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }
+                    context: { ...(removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
+                        : operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }
                         : finishedDiscard ? { releaseCheck: 'v1.3.5/ios-owned-discard-finish' }
                             : unstartedDiscard ? { releaseCheck: 'v1.3.5/ios-unstarted-add-discard' }
                                 : operation === 'discard-capacity' ? { releaseCheck: 'v1.3.5/ios-owned-discard-capacity' }

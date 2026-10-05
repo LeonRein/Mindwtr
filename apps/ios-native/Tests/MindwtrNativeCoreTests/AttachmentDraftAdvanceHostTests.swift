@@ -482,7 +482,7 @@ final class AttachmentDraftAdvanceHostTests: XCTestCase {
             let previous = try isolate(); defer { root = previous }
             let (host, initial) = try await seed(); try await begin(host, initial); await host.close()
             if unknown {
-                var raw = try object(String(decoding: Data(contentsOf: store.url), as: UTF8.self)); raw["version"] = 3
+                var raw = try object(String(decoding: Data(contentsOf: store.url), as: UTF8.self)); raw["version"] = 99
                 try Data(json(raw).utf8).write(to: store.url)
             } else { try Data("private corrupt ownership".utf8).write(to: store.url) }
             let retained = try Data(contentsOf: store.url), checkpoint = try Data(contentsOf: editor.url)

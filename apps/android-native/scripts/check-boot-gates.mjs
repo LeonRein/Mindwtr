@@ -4350,6 +4350,25 @@ const poll = async (state, id) => {
         assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', 'confirmed'))).ok, true);
         assert.equal(android.logText, null, 'logical terminal capability exception remains iOS-only');
     });
+    await check('owned Remove acknowledgment is exact and survives optional capability loss', async () => {
+        for (const local of [makeState(0, [], 'ios'), makeState(0, [], 'ios', configureLocal)]) {
+            for (const outcome of ['confirmed', 'replayed']) {
+                assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('remove', outcome))).ok, true);
+                assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+                    { releaseCheck: 'v1.3.5/ios-attachment-draft-remove', operation: 'remove', outcome });
+            }
+            const before = local.logText;
+            for (const outcome of ['retained', 'removed', 'saved', '']) {
+                assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('remove', outcome))).ok, true);
+            }
+            local.logFailure = 'private diagnostics failure';
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('remove', 'confirmed'))).ok, true);
+            assert.equal(local.logText, before);
+        }
+        const android = makeState(0);
+        assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('remove', 'confirmed'))).ok, true);
+        assert.equal(android.logText, null);
+    });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);
