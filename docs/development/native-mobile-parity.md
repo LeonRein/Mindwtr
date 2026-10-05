@@ -1802,3 +1802,9 @@ Validation: two new real JavaScriptCore/file cases passed using actual encoded h
 A pure shared helper now validates retained version1/version2 Add history and derives Discard candidates through the existing RN settlement planner. It preserves opening baseline files and tombstones, keeps pending Add proposals distinct from acknowledged checkpoints, and returns only the exact frozen new-Add identities and target URIs. Candidates do not prove that a copy exists or authorize deletion.
 
 Validation: 206 shared tests passed (64 new, 142 existing), with typecheck and scoped lint passing. Both native bundles rebuilt successfully; the iOS bundle remained byte-identical because this helper is not bound to a native caller yet. Independent review passed. Native live-reference checks, file retirement, terminal ownership release and picker UI remain separate work.
+
+### iOS exact detached Discard record release (2026-10-05)
+
+Separate storage primitives now bind a complete detached Discard record to its exact canonical hash and release only that matching record. Request and reply identities must match the retained checkpoint. Active or merely decided records, changed opaque fields and nonregular paths refuse release; an already absent record still requires directory durability. Existing Save-only release remains separate.
+
+Validation: 19 new file-backed tests and 95 existing store tests passed with zero skips, independent review passed, and the signed development build passed without installation. These structural primitives do not prove file retirement or current live-reference checks. The native cleanup caller must establish those outcomes before release; picker UI and terminal Discard integration remain unfinished.

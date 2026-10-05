@@ -15,7 +15,7 @@ enum NativeAttachmentDraftStoreError: LocalizedError, Equatable {
 }
 
 /// Called only under the existing serialized library lock. Retained evidence
-/// cannot be reset or salvaged; exact saved-Add release needs terminal authority.
+/// cannot be reset or salvaged; exact saved/discarded release needs terminal authority.
 struct NativeAttachmentDraftStore {
     static let maximumBytes = 8 * 1024 * 1024
     let url: URL
@@ -602,6 +602,45 @@ struct NativeAttachmentDraftStore {
         try require(record.version == 2 && record.session.state == .active && !record.operations.isEmpty
                     && record.discard == nil && record.checkpointAdvance == nil
                     && record.operations.allSatisfy { $0.phase == .checkpointed && $0.reason == nil })
+        return try canonicalFingerprint(record)
+    }
+
+    private struct DiscardRequestIdentity: Decodable {
+        let version: Int
+        let requestId: String
+        let sessionID: String
+        let generation: Int
+    }
+    private struct DiscardReplyIdentity: Decodable {
+        let version: Int
+        let status: String
+        let requestId: String
+        let sessionID: String
+    }
+
+    /// Exact detached private decision binding, not file cleanup or Discard
+    /// success. Interrupted/unfinished Add evidence remains in the full hash.
+    static func ownedDiscardFingerprint(_ record: Record) throws -> String {
+        try validate(record)
+        guard record.session.state == .cleanupPending, record.checkpointAdvance == nil,
+              let discard = record.discard, discard.phase == .detached, let replyJSON = discard.replyJSON else {
+            throw NativeAttachmentDraftStoreError.corrupt
+        }
+        let requestData = Data(discard.requestJSON.utf8), replyData = Data(replyJSON.utf8)
+        guard let requestObject = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any],
+              Set(requestObject.keys) == Set(["version", "requestId", "sessionID", "generation"]),
+              let request = try? JSONDecoder().decode(DiscardRequestIdentity.self, from: requestData), request.version == 1,
+              equal(request.requestId, discard.requestId), equal(request.sessionID, discard.expected.sessionID),
+              request.generation == discard.expected.generation,
+              let replyObject = try? JSONSerialization.jsonObject(with: replyData) as? [String: Any],
+              Set(replyObject.keys) == Set(["version", "status", "requestId", "sessionID"]),
+              let reply = try? JSONDecoder().decode(DiscardReplyIdentity.self, from: replyData), reply.version == 1,
+              reply.status == "cleanupPending", equal(reply.requestId, discard.requestId),
+              equal(reply.sessionID, discard.expected.sessionID) else { throw NativeAttachmentDraftStoreError.corrupt }
+        return try canonicalFingerprint(record)
+    }
+
+    private static func canonicalFingerprint(_ record: Record) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data: Data
@@ -609,6 +648,19 @@ struct NativeAttachmentDraftStore {
         catch { throw NativeAttachmentDraftStoreError.corrupt }
         try require(data.count <= maximumBytes)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Caller owns the serialized library and the validated terminal cleanup
+    /// decision. This exact private-record match grants no file-job authority.
+    func releaseDiscardedAddsMatching(fingerprint: String) throws {
+        try Self.require(Self.digest(fingerprint))
+        if let record = try read() {
+            try Self.require(Self.equal(try Self.ownedDiscardFingerprint(record), fingerprint))
+        }
+        // Missing confirms parent durability only under the retained caller
+        // decision. Never recreate a missing parent or adopt a different record.
+        do { try DurableFile.remove(url) }
+        catch { throw NativeAttachmentDraftStoreError.io }
     }
 
     /// Caller owns the Engine/library lock and a validated durable success
