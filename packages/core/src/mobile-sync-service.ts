@@ -1828,6 +1828,9 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
         handleRunErrorBeforeRequeue: async (_error, context) => {
           if (this.requestAbortController.signal.aborted && activeMobileSyncAbortReason === 'deadline') {
             logSyncInfo('Sync aborted at the background run\'s deadline', { backend: this.backend, step: context.step });
+            // A sync asked for while this cycle wound down (the app opened meanwhile) would start once it ends, after the
+            // background job let go; the job's next run, or the foreground's next trigger, syncs instead.
+            mobileSyncOrchestrator.clearFollowUp();
             return { success: false, error: 'The background sync deadline passed' };
           }
           if (this.requestAbortController.signal.aborted && activeMobileSyncAbortReason === 'lifecycle') {
@@ -2506,7 +2509,8 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
   /** Aborts the running cycle: 'lifecycle' (the app changed state) queues a follow-up, 'deadline' (a background run gave up) does not. */
   function abortMobileSync(reason: 'lifecycle' | 'deadline' = 'lifecycle'): boolean {
     if (!activeMobileSyncAbortController) return false;
-    activeMobileSyncAbortReason = reason;
+    // A deadline stop stays one: a lifecycle abort after it (the app closing during its cleanup) must not queue a follow-up.
+    if (activeMobileSyncAbortReason !== 'deadline') activeMobileSyncAbortReason = reason;
     activeMobileSyncAbortController.abort();
     return true;
   }
