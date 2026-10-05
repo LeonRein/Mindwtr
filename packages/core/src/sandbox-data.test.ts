@@ -59,7 +59,7 @@ const structuralContent = (data: AppData) => ({
 });
 
 describe('createSandboxData', () => {
-    it('localizes all sample content for the six supported content languages', () => {
+    it('localizes all sample content for the supported content languages', () => {
         const english = createSandboxData({ now: FIXED_NOW, settings: { language: 'en' } });
         const expected = {
             de: ['Frühlings-Gemeinschaftsgarten', 'Maße des Werkstatttischs erfassen'],
@@ -67,6 +67,7 @@ describe('createSandboxData', () => {
             es: ['Huerto comunitario de primavera', 'Anotar las medidas de la mesa del taller'],
             ru: ['Весенний общественный огород', 'Записать размеры рабочего стола'],
             zh: ['春季社区花园', '记录工作台尺寸'],
+            'zh-Hant': ['春季社區花園', '記錄工作檯尺寸'],
         } as const;
 
         for (const [language, [projectTitle, firstTaskTitle]] of Object.entries(expected)) {
@@ -103,7 +104,9 @@ describe('createSandboxData', () => {
             expect(localized.tasks.find((task) => task.id === 'sandbox-task-garden-map')?.tags[0])
                 .not.toBe(english.tasks.find((task) => task.id === 'sandbox-task-garden-map')?.tags[0]);
         }
+    });
 
+    it('uses distinct Traditional Chinese content while preserving Simplified Chinese aliases', () => {
         const simplified = createSandboxData({ now: FIXED_NOW, settings: { language: 'zh' } });
         const simplifiedAlias = createSandboxData({
             now: FIXED_NOW,
@@ -111,7 +114,23 @@ describe('createSandboxData', () => {
         });
         const traditional = createSandboxData({ now: FIXED_NOW, settings: { language: 'zh-Hant' } });
         expect(visibleContent(simplifiedAlias)).toEqual(visibleContent(simplified));
-        expect(visibleContent(traditional)).toEqual(visibleContent(simplified));
+        expect(simplified.projects[0].title).toBe('春季社区花园');
+        expect(simplified.tasks[0].title).toBe('记录工作台尺寸');
+        expect(visibleContent(traditional)).not.toEqual(visibleContent(simplified));
+        expect(structuralContent(traditional)).toEqual(structuralContent(simplified));
+        expect(traditional.areas[0].name).toBe('社區與戶外');
+        expect(traditional.projects[0].title).toBe('春季社區花園');
+        expect(traditional.sections[0].title).toBe('規劃');
+        expect(traditional.people?.[1]).toMatchObject({ name: '李喬', note: '負責組織花園志工。' });
+        expect(traditional.tasks[0]).toMatchObject({ title: '記錄工作檯尺寸', contexts: ['@家中'], tags: ['#收集'] });
+        const reference = traditional.tasks.find((task) => task.id === 'sandbox-task-reference-raised-beds');
+        expect(reference?.description).toContain('# 高架種植床筆記');
+        expect(reference?.description).toContain('[虛構種植指南]');
+        expect(reference?.attachments?.[0].title).toBe('虛構高架種植床指南');
+        expect(traditional.tasks.find((task) => task.id === 'sandbox-task-garden-signs')?.checklist?.[0].title)
+            .toBe('草擬簡短的歡迎詞');
+        expect(traditional.tasks.find((task) => task.id === 'sandbox-task-garden-workday'))
+            .toMatchObject({ assignedTo: '李喬', location: '楓樹街社區花園', tags: ['#花園', '#社區'] });
         expect(simplified.settings.language).toBe('zh');
         expect(traditional.settings.language).toBe('zh-Hant');
     });
