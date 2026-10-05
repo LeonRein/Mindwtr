@@ -3423,6 +3423,8 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
 const fakeCore = `
 import { logInfo as realLogInfo, setLogger as setRealLogger } from ${JSON.stringify(resolve(app, '../../packages/core/src/logger.ts'))};
 export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLoggingEnabled } from ${JSON.stringify(resolve(app, '../../packages/core/src/diagnostics-log.ts'))};
+export { prepareNativeAttachmentDraftDiscardCandidates } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
+export { isAttachmentFileInUse } from ${JSON.stringify(resolve(app, '../../packages/core/src/attachment-draft-settlement.ts'))};
 export { canSaveTaskListTag } from ${JSON.stringify(resolve(app, '../../packages/core/src/task-list-bulk-actions.ts'))};
 export { formatListItemCount } from ${JSON.stringify(resolve(app, '../../packages/core/src/list-count.ts'))};
 export { getBulkMoveStatusOptions } from ${JSON.stringify(resolve(app, '../../packages/core/src/task-list-bulk-actions.ts'))};
@@ -3499,8 +3501,9 @@ export async function loadNativeRequestReceipts(_client, options) { globalThis.r
 export function setNativeReplayTokens(mode) { globalThis.replayTokens = mode; }
 export async function pruneNativeRequestReceipts() { return 3; }
 export function setStorageAdapter(adapter) { globalThis.adapter = adapter; }
+export function getStorageAdapter() { return globalThis.adapter; }
 export async function flushPendingSave() { globalThis.events.push('flush'); }
-export function getPersistenceStatus() { return globalThis.persistenceStatus ||
+export function getPersistenceStatus() { globalThis.onPersistenceStatus?.(); return globalThis.persistenceStatus ||
   { generation: 0, queued: false, inFlight: false, immediate: false, retrying: false, failed: false }; }
 export function isSupportedLanguage(value) { return ['en', 'zh', 'fa', 'de'].includes(value); }
 export function getGeneralSettingsDeviceWrites(edit) { return edit.type === 'language'
@@ -3596,6 +3599,7 @@ export function createNativeHostContract(bindings = {}) {
     },
     getDataSettings() {
         globalThis.backupReadinessChecks++;
+        globalThis.onReadiness?.();
         return globalThis.backupReadinessResult;
     },
     async prepareReferenceTasksAddTag(input) {
@@ -3711,12 +3715,14 @@ export function themeDescriptor(theme) {
     ['material3-light', { scheme: 'light', statusPreset: null }]]).get(theme);
 }
 export function resolveThemeStatusPreset(theme) { return themeDescriptor(theme)?.statusPreset ?? null; }
-export const useTaskStore = { getState: () => ({
+export const useTaskStore = { getState: () => {
+  globalThis.onStateRead?.();
+  return {
   settings: globalThis.settings,
-  _allTasks: globalThis.lastLoaded ? globalThis.lastLoaded.tasks : [],
-  _allProjects: [], _allSections: [], _allAreas: [], _allPeople: [],
-  persistenceFailure: globalThis.persistenceFailure,
-}) };
+  _allTasks: globalThis.lastLoaded ? globalThis.lastLoaded.tasks : globalThis.emptyOwnerTasks,
+  _allProjects: globalThis.ownerProjects, _allSections: [], _allAreas: [], _allPeople: [],
+  persistenceFailure: globalThis.persistenceFailure, isLoading: globalThis.storeLoading, editLockCount: globalThis.storeEditLocks,
+}; } };
 export function logInfo(message, meta) {
   if (globalThis.__mindwtrHostPlatform === 'ios') return realLogInfo(message, meta);
   throw new Error('diagnostic sink failed');
@@ -3781,7 +3787,7 @@ const makeState = (taskCount, fakeDataSequence = [], hostPlatform = undefined, c
         createCount: 0, completeCount: 0, persistenceFailure: null, captureInputs: [],
         snapshotResult: { ok: true, value: { fileName: 'data.2026-09-24T10-00-00.000.snapshot.json', contents: '{}' } }, editorInputs: [], updateInputs: [], focusInputs: [],
         // host-polyfills.js gives QuickJS these; the harness runs host-entry alone.
-        AbortController, setTimeout,
+        AbortController, setTimeout, TextEncoder, URL,
         languageInputs: [], projectInputs: [], settings: undefined, persistenceStatus: null, aiInputs: [],
         settingsReadFailure: false, afterLanguage: null, newInputs: [], menuInputs: [],
         fileCalls: [], ingestInputs: [], queueFiles: null, kv: {}, deleteResult: null, sandbox: false,
@@ -3804,6 +3810,7 @@ const makeState = (taskCount, fakeDataSequence = [], hostPlatform = undefined, c
         inboxCommitResult: { ok: false, error: { code: 'SAVE_FAILED', message: 'disk full' } },
         logText: null, logOps: [], logFailure: null,
         localAttachmentTest: false, localShaInstallCount: 0, attachmentInputs: [],
+        emptyOwnerTasks: [], ownerProjects: [], storeLoading: false, storeEditLocks: 0,
         attachmentReply: { ok: true, value: { kind: 'saved', ids: [], attachments: [] } },
         __mindwtrNative: {
             sqlAll(sql) {
@@ -3918,6 +3925,258 @@ const poll = async (state, id) => {
         assert.equal(unavailable.localShaInstallCount, 0, 'failed optional discovery leaves SHA binding unchanged');
         assert.equal((await poll(unavailable, unavailable.MindwtrHost.boot())).ok, true, 'optional local failure does not fail boot');
     }
+}
+// Task244: production direct handoff plus actual RN live-reference helper.
+// Native proof/lease/filesystem and real-JSC ordering acceptance are Task243.
+{
+    const configureLocal = (state) => {
+        state.localAttachmentTest = true;
+        for (const name of ['fileCall', 'installerCall', 'fileAbort', 'fileDeleteNow', 'ioNext', 'ioBody']) state.__mindwtrNative[name] = () => '';
+        state.__mindwtrNative.fileDirectories = () => JSON.stringify({ document: 'file:///library/documents/', cache: 'file:///library/cache/' });
+        state.__mindwtrFileCall = async () => null;
+        state.__mindwtrInstallerCall = async () => null;
+    };
+    const ID = '24400000-0000-4000-8000-000000000001';
+    const TARGET = 'file:///library/documents/attachments/owned-café😀.pdf';
+    const input = JSON.stringify({ version: 1, requestId: ID, targetURI: TARGET });
+    const invalid = 'INVALID_INPUT: Invalid attachment Discard handoff';
+    const unready = 'NOT_READY: Attachment Discard requires settled native storage';
+    let cases = 0;
+    const check = async (name, action) => { await action(); cases++; };
+    const makeLocal = () => makeState(0, [], 'ios', configureLocal);
+    const bootLocal = async (recovery = false) => {
+        const state = makeLocal();
+        assert.equal((await poll(state, recovery ? state.MindwtrHost.bootRecovery('', '') : state.MindwtrHost.boot())).ok, true);
+        return state;
+    };
+    const call = (state, json = input, keep = () => '{"outcome":"referenced"}', retire = () => '{"outcome":"removed"}') =>
+        state.MindwtrHost.attachmentDraftDiscardRetire(json, keep, retire);
+    const refused = (state, json = input, expected = unready) => {
+        let entered = 0;
+        assert.throws(() => call(state, json, () => { entered++; return '{"outcome":"referenced"}'; },
+            () => { entered++; return '{"outcome":"removed"}'; }), (error) => error.message === expected);
+        assert.equal(entered, 0, 'all admission/input failures occur before either native callback');
+    };
+    await check('pure candidate dispatch before boot', async () => {
+        const state = makeState(0, [], 'ios');
+        const payload = JSON.stringify({ version: 2, taskID: 'task244', attachmentsOwned: true, attachmentsBase: [], attachments: [] });
+        const candidateInput = { version: 1, historyVersion: 2, taskID: 'task244', managedDirectoryURI: 'file:///library/documents/attachments/',
+            initialPayloadJSON: payload, checkpointPayloadJSON: payload, operations: [] };
+        const ticket = state.MindwtrHost.attachmentDraftDiscardCandidates(JSON.stringify(candidateInput));
+        assert.match(ticket, /^[1-9]\d*$/, 'candidate transport retains Promise ticket dispatch');
+        assert.deepEqual(await poll(state, ticket), { ok: true, value: { version: 1, kind: 'owned-add-discard-candidates',
+            taskID: 'task244', historyVersion: 2, candidates: [] } });
+        assert.deepEqual(state.events, [], 'pure candidate admission does not load/flush/write');
+        const bad = await poll(state, state.MindwtrHost.attachmentDraftDiscardCandidates('{private-content'));
+        assert.deepEqual(bad, { ok: false, error: 'INVALID_INPUT' });
+    });
+    await check('candidate platform gate', async () => {
+        const state = makeState(0);
+        assert.match((await poll(state, state.MindwtrHost.attachmentDraftDiscardCandidates('{}'))).error, /^NOT_READY:/);
+    });
+    await check('before validated boot', () => refused(makeLocal()));
+    await check('normal bootRecovery ready state', async () => {
+        const state = await bootLocal(true);
+        assert.equal(call(state), '{"outcome":"removed"}', 'validated recovery load supports exact native replay handoff');
+    });
+    const state = await bootLocal();
+    const unchanged = JSON.stringify({ events: state.events, data: state.fakeData, fileCalls: state.fileCalls, logOps: state.logOps });
+    for (const outcome of ['removed', 'absent']) await check(`direct ${outcome}`, () => {
+        let keep = 0, retire = 0;
+        const result = call(state, input, () => { keep++; return '{"outcome":"referenced"}'; },
+            () => { retire++; return JSON.stringify({ outcome }); });
+        assert.equal(result, JSON.stringify({ outcome }), 'direct result is final JSON, never a ticket');
+        assert.equal(keep, 0); assert.equal(retire, 1);
+    });
+    await check('callback inside JS before queued microtask', async () => {
+        state.handoffOrder = [];
+        state.handoffInput = input;
+        state.keep244 = () => { state.handoffOrder.push('keep'); return '{"outcome":"referenced"}'; };
+        state.retire244 = () => { state.handoffOrder.push('retire'); return '{"outcome":"absent"}'; };
+        vm.runInNewContext(`Promise.resolve().then(() => handoffOrder.push('microtask'));
+            handoffOrder.push('entered');
+            globalThis.direct244 = MindwtrHost.attachmentDraftDiscardRetire(handoffInput, keep244, retire244);
+            handoffOrder.push('returned');`, state);
+        assert.deepEqual(state.handoffOrder, ['entered', 'retire', 'returned']);
+        await new Promise((resolveTick) => setImmediate(resolveTick));
+        assert.deepEqual(state.handoffOrder, ['entered', 'retire', 'returned', 'microtask']);
+        assert.equal(state.direct244, '{"outcome":"absent"}');
+    });
+    for (const [name, owners, expected] of [
+        ['live task', [{ attachments: [{ kind: 'file', uri: TARGET }] }], 'referenced'],
+        ['archived readonly task', [{ status: 'archived', readOnly: true, attachments: [{ kind: 'file', uri: TARGET }] }], 'referenced'],
+        ['deleted owner', [{ deletedAt: 'at', attachments: [{ kind: 'file', uri: TARGET }] }], 'removed'],
+        ['deleted attachment', [{ attachments: [{ kind: 'file', uri: TARGET, deletedAt: 'at' }] }], 'removed'],
+        ['link is not a file owner', [{ attachments: [{ kind: 'link', uri: TARGET }] }], 'removed'],
+        ['URI exact spelling', [{ attachments: [{ kind: 'file', uri: TARGET.replace('café', 'caf%C3%A9') }] }], 'removed'],
+    ]) await check(name, () => {
+        state.lastLoaded.tasks = owners;
+        assert.equal(call(state), JSON.stringify({ outcome: expected }));
+        state.lastLoaded.tasks = [];
+    });
+    await check('live project', () => {
+        state.ownerProjects = [{ status: 'archived', attachments: [{ kind: 'file', uri: TARGET }] }];
+        assert.equal(call(state), '{"outcome":"referenced"}');
+        state.ownerProjects = [];
+    });
+    await check('optimistic queued deletion cannot hide a durable live owner', () => {
+        const oldLoaded = state.lastLoaded, oldDurable = state.fakeData;
+        state.fakeData = { ...oldDurable, tasks: [{ attachments: [{ kind: 'file', uri: TARGET }] }] };
+        state.lastLoaded = { ...state.fakeData, tasks: [{ deletedAt: 'optimistic', attachments: [{ kind: 'file', uri: TARGET }] }] };
+        state.persistenceStatus = { generation: 1, queued: 1 };
+        assert.equal(state.persistenceFailure, null, 'failure-only requireSaved would pass');
+        refused(state);
+        assert.equal(state.fakeData.tasks[0].deletedAt, undefined, 'fake durable owner remains live');
+        state.persistenceStatus = null; state.lastLoaded = oldLoaded; state.fakeData = oldDurable;
+    });
+    await check('deleted project with a separate live task retains target', () => {
+        state.ownerProjects = [{ deletedAt: 'at', attachments: [{ kind: 'file', uri: TARGET }] }];
+        assert.equal(call(state), '{"outcome":"removed"}');
+        state.lastLoaded.tasks = [{ attachments: [{ kind: 'file', uri: TARGET }] }];
+        assert.equal(call(state), '{"outcome":"referenced"}');
+        state.lastLoaded.tasks = []; state.ownerProjects = [];
+    });
+    for (const flag of ['queued', 'inFlight', 'immediate', 'retrying', 'failed']) await check(`unsaved ${flag}`, () => {
+        state.persistenceStatus = { generation: 0, [flag]: 1 };
+        refused(state); state.persistenceStatus = null;
+    });
+    for (const [field, value] of [['persistenceFailure', { message: 'private failure' }], ['storeLoading', true],
+        ['storeEditLocks', 1], ['sandbox', true], ['workspaceTransition', true]]) await check(`guard ${field}`, () => {
+        const previous = state[field]; state[field] = value;
+        refused(state); state[field] = previous;
+    });
+    await check('foreign adapter', () => {
+        const previous = state.adapter; state.adapter = {};
+        refused(state); state.adapter = previous;
+    });
+    await check('normal readiness failure', () => {
+        state.backupReadinessResult = { ok: false, error: { code: 'NOT_READY', message: 'private reload' } };
+        refused(state); state.backupReadinessResult = { ok: true, value: {} };
+    });
+    await check('thrown readiness content is redacted', () => {
+        state.onReadiness = () => { throw new Error('private task/path'); };
+        refused(state); state.onReadiness = null;
+    });
+    for (const owner of ['task', 'project']) await check(`changed ${owner} reference`, () => {
+        let reads = 0;
+        state.onStateRead = () => {
+            if (++reads === 2) {
+                if (owner === 'task') state.lastLoaded.tasks = [...state.lastLoaded.tasks];
+                else state.ownerProjects = [...state.ownerProjects];
+            }
+        };
+        refused(state); state.onStateRead = null;
+    });
+    await check('changed generation', () => {
+        let reads = 0;
+        state.persistenceStatus = { generation: 0 };
+        state.onPersistenceStatus = () => { if (++reads === 2) state.persistenceStatus.generation++; };
+        refused(state); state.onPersistenceStatus = null; state.persistenceStatus = null;
+    });
+    for (const field of ['adapter', 'workspaceTransition']) await check(`late ${field} change during readiness`, () => {
+        const previous = state[field]; let reads = 0;
+        state.onReadiness = () => { if (++reads === 2) state[field] = field === 'adapter' ? {} : true; };
+        refused(state); state.onReadiness = null; state[field] = previous;
+    });
+    await check('unfinished direct document work and completed unpolled slot', async () => {
+        let release;
+        state.backupPrepareHold = new Promise((resolveHeld) => { release = resolveHeld; });
+        const ticket = state.MindwtrHost.backupDocumentPrepare('{}');
+        refused(state);
+        release(); await new Promise((resolveTick) => setImmediate(resolveTick));
+        assert.equal(call(state), '{"outcome":"removed"}', 'a completed slot is not unresolved async work');
+        assert.equal((await poll(state, ticket)).ok, true);
+        state.backupPrepareHold = null;
+    });
+    for (const json of ['{private text', 'null', '[]', 'true', '{}',
+        JSON.stringify({ version: '1', requestId: ID, targetURI: TARGET }),
+        JSON.stringify({ version: 1, requestId: ID.toUpperCase().replace('244', 'ABC'), targetURI: TARGET }),
+        JSON.stringify({ version: 1, requestId: ID, targetURI: '' }),
+        JSON.stringify({ version: 1, requestId: ID, targetURI: '界'.repeat(5_462) }),
+        JSON.stringify({ version: 1, requestId: ID, targetURI: TARGET, proof: 'untrusted' }),
+        ' '.repeat(64 * 1024) + input,
+    ]) await check('invalid exact input', () => refused(state, json, invalid));
+    for (const which of ['keep', 'retire']) await check(`invalid ${which} callback type`, () => {
+        let entered = 0;
+        const callback = () => { entered++; return '{"outcome":"removed"}'; };
+        assert.throws(() => call(state, input, which === 'keep' ? null : callback, which === 'retire' ? null : callback),
+            (error) => error.message === invalid);
+        assert.equal(entered, 0);
+    });
+    for (const result of ['{private result', 'null', '[]', '{}', '{"outcome":"referenced"}',
+        '{"outcome":"removed","proof":"untrusted"}', '界'.repeat(342), 1, Promise.resolve('{"outcome":"removed"}')]) {
+        await check('invalid retire outcome no fallback', () => {
+            let keep = 0, retire = 0;
+            assert.throws(() => call(state, input, () => { keep++; return '{"outcome":"referenced"}'; },
+                () => { retire++; return result; }), (error) => error.message === invalid);
+            assert.equal(keep, 0); assert.equal(retire, 1);
+        });
+    }
+    await check('keep rejects destructive outcome with no fallback', () => {
+        state.ownerProjects = [{ attachments: [{ kind: 'file', uri: TARGET }] }];
+        let keep = 0, retire = 0;
+        assert.throws(() => call(state, input, () => { keep++; return '{"outcome":"removed"}'; },
+            () => { retire++; return '{"outcome":"removed"}'; }), (error) => error.message === invalid);
+        assert.equal(keep, 1); assert.equal(retire, 0); state.ownerProjects = [];
+    });
+    await check('callback exception fixed refusal no fallback', () => {
+        let keep = 0, retire = 0;
+        assert.throws(() => call(state, input, () => { keep++; return '{"outcome":"referenced"}'; },
+            () => { retire++; throw new Error('private source/hash'); }), (error) => error.message === unready);
+        assert.equal(keep, 0); assert.equal(retire, 1);
+    });
+    await check('valid callback string preserved byte for byte', () => {
+        const result = ' \n{"outcome":"absent"} ';
+        assert.equal(call(state, input, () => '{"outcome":"referenced"}', () => result), result);
+    });
+    await check('direct handoff creates no flush/write/file bridge/diagnostic work', () => {
+        // Reset only harness document dispatch bookkeeping from the deliberate
+        // held-Promise test; direct calls never touched these domain arrays.
+        const before = JSON.stringify({ events: state.events, data: state.fakeData, fileCalls: state.fileCalls, logOps: state.logOps });
+        assert.equal(call(state), '{"outcome":"removed"}');
+        assert.equal(JSON.stringify({ events: state.events, data: state.fakeData, fileCalls: state.fileCalls, logOps: state.logOps }), before);
+        assert.equal(JSON.parse(unchanged).data.tasks.length, 0);
+    });
+    for (const variant of ['partial', 'refused', 'android']) await check(`${variant} capability gate`, async () => {
+        const unavailable = makeState(0, [], variant === 'android' ? undefined : 'ios', (state) => {
+            configureLocal(state);
+            if (variant === 'partial') delete state.__mindwtrNative.ioBody;
+            if (variant === 'refused') state.__mindwtrNative.fileDirectories = () => '!MindwtrNativeError:private capability error';
+        });
+        assert.equal((await poll(unavailable, unavailable.MindwtrHost.boot())).ok, true);
+        refused(unavailable);
+    });
+    await check('nativeSync gate stays explicit with local-only construction', () => {
+        const entry = readFileSync(resolve(app, 'bundle/host-entry.ts'), 'utf8');
+        assert.match(entry, /const localAttachments = nativeSync \? null : createNativeLocalAttachmentsForHost\(\)/);
+        assert.match(entry, /const settledAttachmentDiscardState[\s\S]*?nativeSync !== null/);
+    });
+    await check('existing owned draft acknowledgment pairs and tags remain sealed', async () => {
+        for (const [operation, outcome, tag] of [['add', 'confirmed', 'v1.3.4/ios-attachment-draft-owned'],
+            ['checkpoint', 'replayed', 'v1.3.4/ios-attachment-draft-owned'], ['save', 'confirmed', 'v1.3.5/ios-attachment-owned-save'],
+            ['discard', 'retained', 'v1.3.4/ios-attachment-draft-owned'], ['discard-capacity', 'confirmed', 'v1.3.5/ios-owned-discard-capacity']]) {
+            assert.equal((await poll(state, state.MindwtrHost.attachmentDraftAcknowledged(operation, outcome))).ok, true);
+            const marker = JSON.parse(state.logText.trim().split('\n').at(-1));
+            assert.deepEqual(marker.context, { releaseCheck: tag, operation, outcome });
+        }
+    });
+    await check('terminal diagnostic after lost optional capability', async () => {
+        const absent = makeState(0, [], 'ios');
+        for (const pair of [['add', 'confirmed'], ['save', 'confirmed'], ['discard-finish', 'replayed'], ['discard-finish', 'retained']]) {
+            assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged(...pair))).ok, true);
+        }
+        assert.equal(absent.logText, null, 'only the exact new terminal pair bypasses capability');
+        assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('discard-finish', 'confirmed'))).ok, true);
+        const marker = JSON.parse(absent.logText.trim());
+        assert.deepEqual(marker.context, { releaseCheck: 'v1.3.5/ios-owned-discard-finish', operation: 'discard-finish', outcome: 'confirmed' });
+        absent.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('discard-finish', 'confirmed'))).ok, true,
+            'diagnostic IO cannot invalidate durable completion');
+        const android = makeState(0);
+        assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('discard-finish', 'confirmed'))).ok, true);
+        assert.equal(android.logText, null, 'terminal capability exception remains iOS-only');
+    });
+    console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);
 const result = await poll(state, state.MindwtrHost.boot());

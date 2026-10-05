@@ -1808,3 +1808,9 @@ Validation: 206 shared tests passed (64 new, 142 existing), with typecheck and s
 Separate storage primitives now bind a complete detached Discard record to its exact canonical hash and release only that matching record. Request and reply identities must match the retained checkpoint. Active or merely decided records, changed opaque fields and nonregular paths refuse release; an already absent record still requires directory durability. Existing Save-only release remains separate.
 
 Validation: 19 new file-backed tests and 95 existing store tests passed with zero skips, independent review passed, and the signed development build passed without installation. These structural primitives do not prove file retirement or current live-reference checks. The native cleanup caller must establish those outcomes before release; picker UI and terminal Discard integration remain unfinished.
+
+### iOS Discard candidate and current-reference bindings (2026-10-05)
+
+The iOS host now binds the shared RN-derived Discard candidate planner and a synchronous current-reference check. The check requires loaded, settled personal storage with no active writes or edit locks, examines all task and project references, and invokes one native-held callback before JavaScriptCore returns to Swift. It does not itself grant file ownership or authorize arbitrary paths.
+
+Validation: 67 new binding cases and existing boot gates passed, both native bundles built, scoped binding lint passed, and independent review passed. The existing boot script has no new lint violations against its baseline. These binding tests use controlled persistence state; native file proof, callback lifetime and cold recovery acceptance remain separate work. No attachment UI or physical-device acceptance is claimed.

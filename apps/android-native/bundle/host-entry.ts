@@ -26,12 +26,15 @@ import {
     validateNativeAttachmentDraftLineageV2,
     prepareNativeAttachmentDraftAddV2,
     completeNativeAttachmentDraftAdd,
+    prepareNativeAttachmentDraftDiscardCandidates,
+    isAttachmentFileInUse,
     formatI18nTemplate,
     canSaveTaskListTag,
     createNativeHostContract,
     diagnosticsEntryFromLogPayload,
     getGeneralSettingsDeviceWrites,
     getPersistenceStatus,
+    getStorageAdapter,
     isSupportedLanguage,
     isDiagnosticsLoggingEnabled,
     isSandboxMode,
@@ -1001,6 +1004,65 @@ const attachmentDraftJson = (json: string): unknown => {
             && new TextEncoder().encode(json).byteLength <= 8 * 1024 * 1024) return JSON.parse(json);
     } catch { /* A parser excerpt could expose draft content or a picked path. */ }
     throw new Error('INVALID_INPUT');
+};
+const attachmentDiscardInvalid = (): Error => new Error('INVALID_INPUT: Invalid attachment Discard handoff');
+const attachmentDiscardNotReady = (): Error => new Error('NOT_READY: Attachment Discard requires settled native storage');
+const attachmentDiscardInput = (json: string): { version: 1; requestId: string; targetURI: string } => {
+    try {
+        if (typeof json !== 'string' || json.length > 64 * 1024
+            || new TextEncoder().encode(json).byteLength > 64 * 1024) throw attachmentDiscardInvalid();
+        const value = JSON.parse(json) as Record<string, unknown> | null;
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3
+            || value.version !== 1 || typeof value.requestId !== 'string'
+            || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.requestId)
+            || typeof value.targetURI !== 'string' || !value.targetURI
+            || value.targetURI.length > 16 * 1024 || new TextEncoder().encode(value.targetURI).byteLength > 16 * 1024) {
+            throw attachmentDiscardInvalid();
+        }
+        return { version: 1, requestId: value.requestId, targetURI: value.targetURI };
+    } catch { throw attachmentDiscardInvalid(); }
+};
+const settledAttachmentDiscardState = () => {
+    try {
+        if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments || nativeSync !== null
+            || isSandboxMode() || isWorkspaceTransitionActive() || !bootAdapter || getStorageAdapter() !== bootAdapter
+            || [...pending.values()].some((slot) => !slot.done) || !contract.getDataSettings().ok) {
+            throw attachmentDiscardNotReady();
+        }
+        const status = getPersistenceStatus(), state = useTaskStore.getState();
+        if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments || nativeSync !== null
+            || isSandboxMode() || isWorkspaceTransitionActive() || !bootAdapter || getStorageAdapter() !== bootAdapter
+            || [...pending.values()].some((slot) => !slot.done) || state.persistenceFailure || state.isLoading || state.editLockCount !== 0
+            || status.queued || status.inFlight || status.immediate || status.retrying || status.failed) throw attachmentDiscardNotReady();
+        return { state, status };
+    } catch { throw attachmentDiscardNotReady(); }
+};
+/** Native-held callbacks complete their action before JSC's return-time microtask drain. */
+const retireAttachmentDiscard = (json: string, keepCallback: () => string, retireCallback: () => string): string => {
+    if (typeof keepCallback !== 'function' || typeof retireCallback !== 'function') throw attachmentDiscardInvalid();
+    const input = attachmentDiscardInput(json), before = settledAttachmentDiscardState();
+    const tasks = before.state._allTasks, projects = before.state._allProjects, generation = before.status.generation;
+    let inUse: boolean;
+    try { inUse = isAttachmentFileInUse(input.targetURI, [...tasks, ...projects]); }
+    catch { throw attachmentDiscardNotReady(); }
+    const after = settledAttachmentDiscardState();
+    if (after.state._allTasks !== tasks || after.state._allProjects !== projects
+        || after.status.generation !== generation) throw attachmentDiscardNotReady();
+    let result: unknown;
+    try { result = inUse ? keepCallback() : retireCallback(); }
+    catch { throw attachmentDiscardNotReady(); }
+    // Never retry/fall back to the other callback after a refused/failed branch.
+    try {
+        if (typeof result !== 'string' || result.length > 1024 || new TextEncoder().encode(result).byteLength > 1024) {
+            throw attachmentDiscardInvalid();
+        }
+        const value = JSON.parse(result) as Record<string, unknown> | null;
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1
+            || !(inUse ? value.outcome === 'referenced' : value.outcome === 'removed' || value.outcome === 'absent')) {
+            throw attachmentDiscardInvalid();
+        }
+        return result;
+    } catch { throw attachmentDiscardInvalid(); }
 };
 // Pure validation remains available before boot; applying an owned Save also
 // requires the current iOS file capability and stable personal workspace.
@@ -3087,6 +3149,16 @@ globalThis.MindwtrHost = {
     attachmentDraftPrepareV2(json: string): string {
         return submit(async () => prepareNativeAttachmentDraftAddV2(attachmentDraftJson(json), attachmentDraftDependencies));
     },
+    attachmentDraftDiscardCandidates(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return prepareNativeAttachmentDraftDiscardCandidates(attachmentDraftJson(json));
+        });
+    },
+    /** Private, synchronous final handoff; native passes ephemeral proof-bound callbacks. */
+    attachmentDraftDiscardRetire(json: string, keepCallback: () => string, retireCallback: () => string): string {
+        return retireAttachmentDiscard(json, keepCallback, retireCallback);
+    },
     attachmentDraftResult(json: string): string {
         return submit(async () => completeNativeAttachmentDraftAdd(attachmentDraftJson(json), attachmentDraftDependencies));
     },
@@ -3112,15 +3184,17 @@ globalThis.MindwtrHost = {
     /** Called only after the native private record and exact checkpoint are durable. */
     attachmentDraftAcknowledged(operation: string, outcome: string): string {
         return submit(async () => {
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments
+            const finishedDiscard = operation === 'discard-finish' && outcome === 'confirmed';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed')) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
                     context: { releaseCheck: operation === 'save' ? 'v1.3.5/ios-attachment-owned-save'
-                        : operation === 'discard-capacity' ? 'v1.3.5/ios-owned-discard-capacity'
+                        : finishedDiscard ? 'v1.3.5/ios-owned-discard-finish'
+                            : operation === 'discard-capacity' ? 'v1.3.5/ios-owned-discard-capacity'
                             : 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
             } catch { /* Diagnostics cannot invalidate a durable acknowledgment. */ }
             return {};
