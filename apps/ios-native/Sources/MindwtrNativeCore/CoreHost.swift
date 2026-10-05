@@ -259,6 +259,7 @@ private final class Engine: @unchecked Sendable {
     private static let ownedDiscardMethod = "attachmentOwnedDiscardFinish"
     private static let ownedDiscardFailure = HostFailure("Attachment Discard could not be confirmed; retry the exact retained decision")
     private struct OwnedDiscardJournal {
+        let version: Int
         let session: String
         let requestId: String
         let fingerprint: String
@@ -1665,15 +1666,17 @@ private final class Engine: @unchecked Sendable {
               let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
               let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
               Set(wrapper.keys) == Set(["version", "sessionID", "requestId", "recordSHA256", "operationIDs"]),
-              Self.isInteger(wrapper["version"], equalTo: 1),
+              Self.isInteger(wrapper["version"], equalTo: 1) || Self.isInteger(wrapper["version"], equalTo: 2),
               let session = Self.ownedDiscardUUID(wrapper["sessionID"]), let id = Self.ownedDiscardUUID(wrapper["requestId"]),
               let fingerprint = wrapper["recordSHA256"] as? String, fingerprint.utf8.count == 64,
               fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               let ids = wrapper["operationIDs"] as? [String], ids.count <= 128, Set(ids).count == ids.count,
               ids.allSatisfy({ Self.ownedDiscardUUID($0) != nil && $0 != id }) else { throw Self.ownedDiscardFailure }
+        let version = Self.isInteger(wrapper["version"], equalTo: 1) ? 1 : 2
+        guard version == 1 || !ids.isEmpty else { throw Self.ownedDiscardFailure }
         if let terminal = command.terminal {
             guard case .success(let value) = terminal else { throw Self.ownedDiscardFailure }
-            try validateOwnedDiscardResult(value, session: session, requestId: id, operationIDs: ids)
+            try validateOwnedDiscardResult(value, version: version, session: session, requestId: id, operationIDs: ids)
         }
         let record = checkingNative ? try NativeAttachmentDraftStore(databaseURL: databaseURL).read() : nil
         if checkingNative {
@@ -1682,25 +1685,26 @@ private final class Engine: @unchecked Sendable {
                 guard Self.ownedEqual(try NativeAttachmentDraftStore.ownedDiscardFingerprint(record), fingerprint),
                       Self.ownedEqual(record.session.sessionID, session), record.discard.map({ Self.ownedEqual($0.requestId, id) }) == true,
                       record.operations.map(\.requestId) == ids,
-                      record.operations.allSatisfy({ [.published, .resultDurable, .checkpointed].contains($0.phase)
-                          && $0.stage != nil && $0.published != nil }) else { throw Self.ownedDiscardFailure }
+                      try NativeAttachmentDraftCoordinator.ownedDiscardVersion(record) == version else { throw Self.ownedDiscardFailure }
             } else {
                 guard case .success = command.terminal else { throw Self.ownedDiscardFailure }
             }
         }
-        return OwnedDiscardJournal(session: session, requestId: id, fingerprint: fingerprint, operationIDs: ids, record: record)
+        return OwnedDiscardJournal(version: version, session: session, requestId: id, fingerprint: fingerprint, operationIDs: ids, record: record)
     }
-    private func validateOwnedDiscardResult(_ value: String, session: String, requestId: String, operationIDs: [String]) throws {
+    private func validateOwnedDiscardResult(_ value: String, version: Int, session: String, requestId: String, operationIDs: [String]) throws {
         guard value.utf8.count <= 64 * 1024,
               let result = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
               Set(result.keys) == Set(["version", "status", "sessionID", "requestId", "operations"]),
-              Self.isInteger(result["version"], equalTo: 1), result["status"] as? String == "released",
+              Self.isInteger(result["version"], equalTo: version), result["status"] as? String == "released",
               let actualSession = result["sessionID"] as? String, Self.ownedEqual(actualSession, session),
               let actualID = result["requestId"] as? String, Self.ownedEqual(actualID, requestId),
               let operations = result["operations"] as? [[String: Any]], operations.count == operationIDs.count else { throw Self.ownedDiscardFailure }
-        for (operation, id) in zip(operations, operationIDs) {
+        for (index, pair) in zip(operations, operationIDs).enumerated() {
+            let (operation, id) = pair
+            let targets = version == 2 && index == operationIDs.count - 1 ? ["untouched"] : ["removed", "absent", "referenced"]
             guard Set(operation.keys) == Set(["requestId", "target", "stage"]), operation["requestId"] as? String == id,
-                  let target = operation["target"] as? String, ["removed", "absent", "referenced"].contains(target),
+                  let target = operation["target"] as? String, targets.contains(target),
                   let stage = operation["stage"] as? String, ["removed", "missing"].contains(stage) else { throw Self.ownedDiscardFailure }
         }
     }
@@ -1753,15 +1757,15 @@ private final class Engine: @unchecked Sendable {
         return captured
     }
     private func ownedDiscardResult(_ captured: OwnedDiscardJournal, operations: [[String: String]]) throws -> String {
-        let value = try Self.ownedJSON(["version": 1, "status": "released", "sessionID": captured.session,
+        let value = try Self.ownedJSON(["version": captured.version, "status": "released", "sessionID": captured.session,
             "requestId": captured.requestId, "operations": operations] as [String: Any])
-        try validateOwnedDiscardResult(value, session: captured.session, requestId: captured.requestId, operationIDs: captured.operationIDs)
+        try validateOwnedDiscardResult(value, version: captured.version, session: captured.session, requestId: captured.requestId, operationIDs: captured.operationIDs)
         return value
     }
     private func preflightOwnedDiscard(_ command: PendingCommand) throws {
         let captured = try ownedDiscardJournal(command, checkingNative: false)
-        let reserved = try ownedDiscardResult(captured, operations: captured.operationIDs.map {
-            ["requestId": $0, "target": "referenced", "stage": "removed"]
+        let reserved = try ownedDiscardResult(captured, operations: captured.operationIDs.enumerated().map { index, id in
+            ["requestId": id, "target": captured.version == 2 && index == captured.operationIDs.count - 1 ? "untouched" : "referenced", "stage": "removed"]
         })
         var terminal = command; terminal.terminal = .success(reserved)
         for candidate in [command, terminal] {
@@ -1779,7 +1783,8 @@ private final class Engine: @unchecked Sendable {
                   Self.ownedEqual(record.session.sessionID, expectedSession),
                   record.discard.map({ Self.ownedEqual($0.requestId, requestId) }) == true else { throw Self.ownedDiscardFailure }
             let fingerprint = try NativeAttachmentDraftStore.ownedDiscardFingerprint(record)
-            let wrapper = try Self.ownedJSON(["version": 1, "sessionID": expectedSession, "requestId": requestId,
+            let version = try NativeAttachmentDraftCoordinator.ownedDiscardVersion(record)
+            let wrapper = try Self.ownedJSON(["version": version, "sessionID": expectedSession, "requestId": requestId,
                 "recordSHA256": fingerprint, "operationIDs": record.operations.map(\.requestId)] as [String: Any])
             let command = PendingCommand(version: 2, method: Self.ownedDiscardMethod,
                 argumentsJSON: String(decoding: try JSONEncoder().encode([wrapper]), as: UTF8.self))
@@ -1863,15 +1868,23 @@ private final class Engine: @unchecked Sendable {
             var outcomes: [[String: String]] = []
             for (index, op) in operations.enumerated() {
                 _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
-                #if DEBUG
-                try attachmentDraftHooks?.boundary?(.beforeDiscardTarget(index))
-                #endif
-                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
-                let target = try ownedDiscardTargetHandoff(command, turn: turn, op: op, coordinator: coordinator, cancellation: cancellation)
-                #if DEBUG
-                try attachmentDraftHooks?.boundary?(.afterDiscardTarget(index))
-                #endif
-                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                let target: String
+                if captured.version == 2 && index == operations.count - 1 {
+                    // The durable phase proves publication was never invoked.
+                    // No public content/proof/reference query or mutation. The
+                    // stage job retains its existing confined path validation.
+                    target = "untouched"
+                } else {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardTarget(index))
+                    #endif
+                    _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                    target = try ownedDiscardTargetHandoff(command, turn: turn, op: op, coordinator: coordinator, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardTarget(index))
+                    #endif
+                    _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                }
                 #if DEBUG
                 try attachmentDraftHooks?.boundary?(.beforeDiscardStage(index))
                 #endif

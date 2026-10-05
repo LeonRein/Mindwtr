@@ -122,6 +122,45 @@ final class AttachmentDiscardFinishHostTests: XCTestCase {
     private func finish(_ host: CoreHost, _ record: NativeAttachmentDraftStore.Record) async throws -> String {
         try await host.finishAttachmentDraftDiscard(expectedSession: record.session.sessionID, requestId: XCTUnwrap(record.discard?.requestId))
     }
+    private func stagePrepared(version: Int = 2, prefix: Int = 0, content: String = "empty") async throws -> CoreHost {
+        let host = try await seed(version: version, adds: prefix)
+        if version == 2 {
+            let before = try latest()
+            try await host.checkpointEditorDraft(.init(sessionID: before.sessionID, taskID: before.taskID,
+                generation: before.generation + 7, payloadJSON: before.payloadJSON))
+        }
+        // Large enough that a real streaming cancellation leaves a partial stage.
+        try Data(repeating: 0x73, count: 256 * 1024).write(to: cache.appendingPathComponent("borrowed.txt"))
+        let before = try latest()
+        let request = try json(["version": 1, "requestId": UUID().uuidString.lowercased(), "sessionID": before.sessionID,
+            "generation": before.generation, "picked": ["uri": cache.appendingPathComponent("borrowed.txt").absoluteString,
+                "name": "Private.txt", "mimeType": "text/plain", "size": NSNull()]] as [String: Any])
+        await boundary(content == "full" ? .beforeFilled : .afterStageProof, on: host)
+        await failure { _ = try await host.addAttachmentDraft(requestJSON: request) }
+        await host.configureAttachmentDraftHost(AttachmentDraftHostHooks())
+        let op = try XCTUnwrap(record().operations.last), proof = try XCTUnwrap(op.stage)
+        XCTAssertEqual(op.phase, .stagePrepared); XCTAssertNil(op.filled); XCTAssertNil(op.published)
+        let stage = try XCTUnwrap(URL(string: proof.uri))
+        if content == "partial" {
+            let files = try NativeAttachmentFiles(libraryRoot: root)
+            XCTAssertThrowsError(try files.fillReservedAttachmentStage(
+                sourceProof: .init(sourceURI: op.source.sourceURI, sha256: op.source.sha256, size: op.source.size,
+                    identity: op.source.identity, cacheRootIdentity: op.source.cacheRootIdentity, parentIdentity: op.source.parentIdentity),
+                stageProof: .init(stageURI: proof.uri, stagedIdentity: proof.identity,
+                    directoryIdentity: proof.directoryIdentity, privateDirectoryIdentity: proof.privateDirectoryIdentity),
+                checkCancellation: {
+                    var info = stat()
+                    guard lstat(stage.path, &info) == 0 else { throw HostFailure("Fixture stage unavailable") }
+                    if info.st_size > 0 { throw NativeAttachmentFileJobsError.cancelled }
+                })) { XCTAssertEqual($0.localizedDescription, NativeAttachmentFileJobsError.cancelled.localizedDescription) }
+        }
+        let count = try Data(contentsOf: stage).count
+        if content == "empty" { XCTAssertEqual(count, 0) }
+        if content == "partial" { XCTAssertGreaterThan(count, 0); XCTAssertLessThan(count, Int(op.source.size)) }
+        if content == "full" { XCTAssertEqual(count, Int(op.source.size)) }
+        XCTAssertEqual(try inode(stage), proof.identity)
+        return host
+    }
     private func failure(_ work: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
         do { try await work(); XCTFail("Expected retained exact decision", file: file, line: line) }
         catch {
@@ -393,11 +432,18 @@ final class AttachmentDiscardFinishHostTests: XCTestCase {
     }
 
     func testIncompleteAndUnrecordedReservationPhasesRefuseBeforeJournalAndKeepAllEvidence() async throws {
-        let boundaries: [AttachmentDraftBoundary] = [.afterIntent, .afterReservation, .afterStageProof, .afterFilled]
+        let boundaries: [AttachmentDraftBoundary] = [.afterIntent, .afterReservation, .afterFilled]
         for point in boundaries {
             let previous = try isolate(); defer { root = previous }
-            let host = try await seed(stopAdd: point), retained = try await detach(host), bytes = try Data(contentsOf: store.url), files = try protectedBytes(), saved = try domain()
+            let jobs = NativeAttachmentHostHooks(), armed = LockedFlag()
+            jobs.configureJobs = { jobs in jobs.beforeWork = { _, _ in
+                if armed.take() { XCTFail("Incomplete unowned phase must start no new job"); throw HostFailure("Unexpected job") }
+            } }
+            let host = try await seed(jobs: jobs, stopAdd: point), retained = try await detach(host), bytes = try Data(contentsOf: store.url), files = try protectedBytes(), saved = try domain()
+            XCTAssertEqual(retained.operations.last?.phase, point == .afterFilled ? .stageFilled : .intent)
+            armed.set(true)
             await failure { _ = try await self.finish(host, retained) }
+            XCTAssertTrue(armed.take(), "No typed work consumed the refusal guard")
             XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path)); XCTAssertEqual(try Data(contentsOf: store.url), bytes)
             XCTAssertNil(try editor.read()); try sameFiles(files); XCTAssertEqual(try domain(), saved)
             await host.close()
@@ -725,5 +771,192 @@ final class AttachmentDiscardFinishHostTests: XCTestCase {
         XCTAssertNil(try journalObject()["terminal"]); XCTAssertEqual(try domain(), saved); try sameFiles(files)
         _ = try await replacement.start()
         try released(); XCTAssertFalse(FileManager.default.fileExists(atPath: target.path)); XCTAssertEqual(try domain(), saved); try sameFiles(files)
+    }
+
+    func testStagePreparedEmptyPartialFullV1V2RetireOnlyPrivateStageWithSourceGoneAndPublishedPrefix() async throws {
+        for version in [1, 2] { for content in ["empty", "partial", "full"] {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await stagePrepared(version: version, prefix: 1, content: content), retained = try await detach(host)
+            let last = try XCTUnwrap(retained.operations.last), proof = try XCTUnwrap(last.stage)
+            let stage = try XCTUnwrap(URL(string: proof.uri)), target = try XCTUnwrap(URL(string: last.targetURI))
+            let frozen = try encoded(retained.operations), baseline = managed.appendingPathComponent("baseline.txt")
+            let baselineBytes = try Data(contentsOf: baseline), saved = try domain()
+            let foreign = try Data(contentsOf: cache.appendingPathComponent("borrowed.txt"))
+            try foreign.write(to: target); let targetIdentity = try inode(target)
+            XCTAssertNotEqual(targetIdentity, proof.identity)
+            try FileManager.default.removeItem(at: cache.appendingPathComponent("borrowed.txt"))
+            await host.close()
+            // A stage-only entry must not use even the trusted public-target callback.
+            try probeBundle("const h=MindwtrHost,f=h.attachmentDraftDiscardRetire;h.attachmentDraftDiscardRetire=function(j,k,r){if(JSON.parse(j).requestId==='\(last.requestId)')throw new Error('Unexpected stage target query');return f.call(h,j,k,r)}")
+            let cold = core(noDomainWrites()); _ = try await cold.start()
+            let hooks = AttachmentDraftHostHooks()
+            hooks.boundary = { point in
+                if point == .beforeDiscardTarget(1) || point == .afterDiscardTarget(1) { XCTFail("Stage-only target must remain untouched") }
+                if point == .beforeDiscardStage(1) { XCTAssertEqual(try self.encoded(self.record().operations), frozen) }
+            }
+            await cold.configureAttachmentDraftHost(hooks)
+            let result = try await finish(cold, retained), operations = try resultOperations(result, record: retained)
+            XCTAssertEqual(try object(result)["version"] as? Int, 2)
+            XCTAssertEqual(operations.first?["target"] as? String, "removed")
+            XCTAssertEqual(operations.last?["target"] as? String, "untouched"); XCTAssertEqual(operations.last?["stage"] as? String, "removed")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: stage.deletingLastPathComponent().path))
+            XCTAssertEqual(try Data(contentsOf: target), foreign); XCTAssertEqual(try inode(target), targetIdentity)
+            XCTAssertEqual(try Data(contentsOf: baseline), baselineBytes); XCTAssertEqual(try domain(), saved)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: cache.appendingPathComponent("borrowed.txt").path))
+            try released(); await cold.close()
+        } }
+    }
+
+    func testStagePreparedColdFinishBoundariesAndRecordedMissingKeepTargetUntouched() async throws {
+        let points: [AttachmentDraftBoundary] = [.afterDiscardFinishJournal, .beforeDiscardStage(0), .afterDiscardStage(0),
+            .beforeDiscardTerminal, .afterDiscardTerminal, .beforeDiscardRelease, .afterDiscardRelease,
+            .beforeDiscardJournalClear, .afterDiscardJournalClear]
+        for point in points {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await stagePrepared(), retained = try await detach(host), op = try XCTUnwrap(retained.operations.last)
+            let stage = try XCTUnwrap(URL(string: XCTUnwrap(op.stage?.uri))), target = try XCTUnwrap(URL(string: op.targetURI))
+            let foreign = Data("Foreign public target sentinel".utf8); try foreign.write(to: target)
+            let targetIdentity = try inode(target), files = try protectedBytes(), saved = try domain(), frozen = try encoded(retained.operations)
+            await boundary(point, on: host); await failure { _ = try await self.finish(host, retained) }
+            if let actual = try store.read() { XCTAssertEqual(try encoded(actual.operations), frozen) }
+            if FileManager.default.fileExists(atPath: journal.path) { XCTAssertEqual(try wrapper(journalObject())["version"] as? Int, 2) }
+            XCTAssertEqual(try Data(contentsOf: target), foreign); XCTAssertEqual(try inode(target), targetIdentity)
+            await host.close(); let cold = core(noDomainWrites()); _ = try await cold.start()
+            try released(); XCTAssertFalse(FileManager.default.fileExists(atPath: stage.deletingLastPathComponent().path))
+            XCTAssertEqual(try Data(contentsOf: target), foreign); XCTAssertEqual(try inode(target), targetIdentity)
+            try sameFiles(files); XCTAssertEqual(try domain(), saved); await cold.close()
+        }
+        let previous = try isolate(); defer { root = previous }
+        let host = try await stagePrepared(), retained = try await detach(host), op = try XCTUnwrap(retained.operations.last)
+        let stage = try XCTUnwrap(URL(string: XCTUnwrap(op.stage?.uri)))
+        try FileManager.default.removeItem(at: stage.deletingLastPathComponent())
+        let saved = try domain(), files = try protectedBytes()
+        let operations = try resultOperations(await finish(host, retained), record: retained)
+        XCTAssertEqual(operations.last?["target"] as? String, "untouched"); XCTAssertEqual(operations.last?["stage"] as? String, "missing")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(URL(string: op.targetURI)).path))
+        try released(); try sameFiles(files); XCTAssertEqual(try domain(), saved)
+    }
+
+    func testStagePreparedProofAndNamespaceConflictsRetainExactEvidenceAndForeignBytes() async throws {
+        for mode in ["stage", "namespace", "root", "missing-root", "hardlink", "symlink", "extra"] {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await stagePrepared(content: "full"), retained = try await detach(host), op = try XCTUnwrap(retained.operations.last)
+            let stage = try XCTUnwrap(URL(string: XCTUnwrap(op.stage?.uri))), namespace = stage.deletingLastPathComponent()
+            let target = try XCTUnwrap(URL(string: op.targetURI)), foreign = Data("Untouched public bytes".utf8)
+            try foreign.write(to: target)
+            let evidence = try Data(contentsOf: store.url), saved = try domain(), source = cache.appendingPathComponent("borrowed.txt")
+            let sourceBytes = try Data(contentsOf: source), baselineBytes = try Data(contentsOf: managed.appendingPathComponent("baseline.txt"))
+            var keptStage = stage, keptTarget = target, keptBaseline = managed.appendingPathComponent("baseline.txt")
+            let unknown = namespace.appendingPathComponent("unknown"), unknownBytes = Data("Unknown child".utf8)
+            var unknownIdentity: String?
+            await boundary(.beforeDiscardStage(0), on: host) {
+                switch mode {
+                case "stage", "symlink":
+                    keptStage = self.root.appendingPathComponent("retained-stage")
+                    try FileManager.default.moveItem(at: stage, to: keptStage)
+                    if mode == "symlink" { try FileManager.default.createSymbolicLink(at: stage, withDestinationURL: source) }
+                    else { try sourceBytes.write(to: stage) }
+                case "namespace":
+                    let moved = self.root.appendingPathComponent("retained-namespace", isDirectory: true)
+                    try FileManager.default.moveItem(at: namespace, to: moved); keptStage = moved.appendingPathComponent("stage")
+                    try FileManager.default.createDirectory(at: namespace, withIntermediateDirectories: false)
+                    try sourceBytes.write(to: stage)
+                case "root", "missing-root":
+                    let moved = self.root.appendingPathComponent("retained-managed", isDirectory: true)
+                    try FileManager.default.moveItem(at: self.managed, to: moved)
+                    keptStage = moved.appendingPathComponent(namespace.lastPathComponent).appendingPathComponent("stage")
+                    keptTarget = moved.appendingPathComponent(target.lastPathComponent); keptBaseline = moved.appendingPathComponent("baseline.txt")
+                    if mode == "root" {
+                        try FileManager.default.createDirectory(at: self.managed, withIntermediateDirectories: false)
+                        try foreign.write(to: target)
+                    }
+                case "hardlink": XCTAssertEqual(Darwin.link(stage.path, self.root.appendingPathComponent("stage-alias").path), 0)
+                default: try unknownBytes.write(to: unknown); unknownIdentity = try self.inode(unknown)
+                }
+            }
+            await failure { _ = try await self.finish(host, retained) }
+            XCTAssertEqual(try Data(contentsOf: store.url), evidence); XCTAssertNil(try journalObject()["terminal"])
+            let pendingEvidence = try journalEvidence()
+            if mode == "extra" {
+                // Retirement is not rollback: the exact owned stage was unlinked
+                // before rmdir refused the unknown child. No full result is owed.
+                var info = stat(); XCTAssertEqual(lstat(keptStage.path, &info), -1); XCTAssertEqual(errno, ENOENT)
+                XCTAssertEqual(try inode(namespace), op.stage?.privateDirectoryIdentity)
+                XCTAssertEqual(try Data(contentsOf: unknown), unknownBytes); XCTAssertEqual(try inode(unknown), unknownIdentity)
+            } else { XCTAssertEqual(try Data(contentsOf: keptStage), sourceBytes) }
+            XCTAssertEqual(try Data(contentsOf: keptTarget), foreign)
+            XCTAssertEqual(try Data(contentsOf: keptBaseline), baselineBytes); XCTAssertEqual(try Data(contentsOf: source), sourceBytes)
+            if mode == "missing-root" { XCTAssertFalse(FileManager.default.fileExists(atPath: managed.path)) }
+            await host.close(); let cold = core(noDomainWrites()); await failure { _ = try await cold.start() }
+            XCTAssertEqual(try Data(contentsOf: store.url), evidence); XCTAssertNil(try journalObject()["terminal"])
+            XCTAssertEqual(try journalEvidence(), pendingEvidence)
+            if mode == "extra" {
+                var info = stat(); XCTAssertEqual(lstat(keptStage.path, &info), -1); XCTAssertEqual(errno, ENOENT)
+                XCTAssertEqual(try inode(namespace), op.stage?.privateDirectoryIdentity)
+                XCTAssertEqual(try Data(contentsOf: unknown), unknownBytes); XCTAssertEqual(try inode(unknown), unknownIdentity)
+            } else { XCTAssertEqual(try Data(contentsOf: keptStage), sourceBytes) }
+            XCTAssertEqual(try Data(contentsOf: keptTarget), foreign)
+            XCTAssertEqual(try Data(contentsOf: keptBaseline), baselineBytes); XCTAssertEqual(try Data(contentsOf: source), sourceBytes)
+            XCTAssertEqual(try domain(), saved)
+            if mode == "missing-root" { XCTAssertFalse(FileManager.default.fileExists(atPath: managed.path)) }
+            await cold.close()
+        }
+    }
+
+    func testStagePreparedVersionAndUntouchedCorrespondenceRefuseBeforeJobs() async throws {
+        for mode in ["v1-stage", "v2-published", "v2-empty", "v1-untouched", "v2-result-v1", "v2-prefix-untouched", "v2-last-removed"] {
+            let previous = try isolate(); defer { root = previous }
+            let published = ["v2-published", "v2-empty", "v1-untouched"].contains(mode)
+            let host: CoreHost
+            if published { host = try await seed(adds: mode == "v2-empty" ? 0 : 1) }
+            else { host = try await stagePrepared(prefix: 1) }
+            let retained = try await detach(host), files = try protectedBytes(), saved = try domain()
+            await boundary(.afterDiscardFinishJournal, on: host); await failure { _ = try await self.finish(host, retained) }
+            await host.close(); var command = try journalObject(), value = try wrapper(command)
+            if mode == "v1-stage" { value["version"] = 1 }
+            if mode == "v2-published" || mode == "v2-empty" { value["version"] = 2 }
+            if ["v1-untouched", "v2-result-v1", "v2-prefix-untouched", "v2-last-removed"].contains(mode) {
+                let resultVersion = mode == "v1-untouched" || mode == "v2-result-v1" ? 1 : 2
+                let result: [String: Any] = ["version": resultVersion, "status": "released", "sessionID": retained.session.sessionID,
+                    "requestId": try XCTUnwrap(retained.discard?.requestId), "operations": retained.operations.enumerated().map { index, op in
+                        ["requestId": op.requestId, "target": mode == "v2-last-removed" ? "removed"
+                            : mode == "v2-prefix-untouched" || index == retained.operations.count - 1 ? "untouched" : "removed", "stage": "removed"]
+                    }]
+                command["terminal"] = ["success": ["_0": try json(result)]]
+            }
+            try setWrapper(value, in: &command); try writeJournal(command)
+            let journalBytes = try Data(contentsOf: journal), sidecarBytes = try Data(contentsOf: store.url)
+            let lastStage = try retained.operations.last?.stage.map { try XCTUnwrap(URL(string: $0.uri)) }
+            let stageBytes = try lastStage.flatMap { FileManager.default.fileExists(atPath: $0.path) ? try Data(contentsOf: $0) : nil }
+            let cold = core(noDomainWrites()), jobs = NativeAttachmentHostHooks()
+            jobs.configureJobs = { jobs in jobs.beforeWork = { _, _ in XCTFail("Version/proof mismatch must start no job"); throw HostFailure("Unexpected job") } }
+            await cold.configureAttachmentHost(jobs); await failure { _ = try await cold.start() }
+            XCTAssertEqual(try Data(contentsOf: journal), journalBytes); XCTAssertEqual(try Data(contentsOf: store.url), sidecarBytes)
+            if let lastStage, let stageBytes { XCTAssertEqual(try Data(contentsOf: lastStage), stageBytes) }
+            try sameFiles(files); XCTAssertEqual(try domain(), saved); await cold.close()
+        }
+    }
+
+    func testStagePreparedDurableTerminalPresentOrAbsentSidecarReleasesWithoutAnyNewFileOrReferenceWork() async throws {
+        for absent in [false, true] {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await stagePrepared(prefix: 1), retained = try await detach(host), files = try protectedBytes(), saved = try domain()
+            await boundary(absent ? .afterDiscardRelease : .afterDiscardTerminal, on: host)
+            await failure { _ = try await self.finish(host, retained) }
+            let command = try journalObject(), terminal = try XCTUnwrap(command["terminal"] as? [String: Any])
+            let success = try XCTUnwrap(terminal["success"] as? [String: Any]), result = try XCTUnwrap(success["_0"] as? String)
+            let operations = try resultOperations(result, record: retained)
+            XCTAssertEqual(try object(result)["version"] as? Int, 2); XCTAssertEqual(operations.last?["target"] as? String, "untouched")
+            XCTAssertEqual(operations.last?["stage"] as? String, "removed"); XCTAssertEqual(try store.read() == nil, absent)
+            await host.close()
+            let foreign = Data("New foreign replacement after terminal".utf8)
+            for target in try targets(retained) { try foreign.write(to: target) }
+            try probeBundle("const h=MindwtrHost;h.attachmentDraftDiscardCandidates=function(){throw new Error('Unexpected terminal plan')};h.attachmentDraftDiscardRetire=function(){throw new Error('Unexpected terminal reference')}")
+            let cold = core(noDomainWrites()), jobs = NativeAttachmentHostHooks()
+            jobs.configureJobs = { jobs in jobs.beforeWork = { _, _ in XCTFail("Durable v2 terminal must start no file job"); throw HostFailure("Unexpected job") } }
+            await cold.configureAttachmentHost(jobs); _ = try await cold.start()
+            try released(); for target in try targets(retained) { XCTAssertEqual(try Data(contentsOf: target), foreign) }
+            try sameFiles(files); XCTAssertEqual(try domain(), saved); await cold.close()
+        }
     }
 }
