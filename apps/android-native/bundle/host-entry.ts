@@ -3285,6 +3285,14 @@ globalThis.MindwtrHost = {
             return validateNativeAttachmentDraftLineageV3(attachmentDraftJson(json));
         });
     },
+    /** Private read-only opening check; native retains the exact editor and sidecar owner. */
+    attachmentDraftResumeCheckV3(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            requireSaved();
+            return unwrap(await contract.checkOwnedTaskEditorResume(attachmentDraftJson(json)));
+        });
+    },
     attachmentDraftPrepareV3(json: string): string {
         return submit(async () => prepareNativeAttachmentDraftAddV3(attachmentDraftJson(json), attachmentDraftDependencies));
     },
@@ -3378,14 +3386,16 @@ globalThis.MindwtrHost = {
             const providerAdd = operation === 'provider-add' && outcome === 'confirmed';
             const completeSave = operation === 'complete-save' && ['domainSaved', 'settled'].includes(outcome);
             const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo
+            const ownedResume = operation === 'owned-resume' && outcome === 'validated';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
+                    context: { ...(ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
+                        : completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
                         : providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
                         : mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
                         : mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }

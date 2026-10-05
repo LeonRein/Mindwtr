@@ -1959,3 +1959,10 @@ This remains an internal host capability. The file picker/editor UI, owned-draft
 A separate shared recovery check now validates the exact retained V3 attachment history and editor checkpoint before reading fresh task data. It reuses existing field, checklist, container and read-only checks and RN attachment metadata merging. Unfinished raw input stays unchanged, and ordinary link-only recovery still refuses file mutations. This check grants no native file ownership and does not write or thaw a draft.
 
 Validation: 165 tests passed across the new 13-case suite and existing recovery, checkpoint and complete Save suites; typecheck, scoped lint and independent review passed. The factory is not yet bound to the native host or editor UI.
+
+
+### Native owned editor reopening check (2026-10-05)
+
+The internal iOS resume check now binds the shared reopening contract to the exact retained editor bytes and file identity, V3 attachment history, active library and runtime. It preserves unfinished input and refuses pending operations, frozen Saves, decided Discards and replaced recovery records. Missing or changed attachment bytes do not prevent reopening to remove the file; a later Save still verifies publication. No draft, journal or task is written by this check.
+
+Validation: ten actual JavaScriptCore/SQLite/native recovery tests passed, followed by a targeted rerun of the corrected public resume API check. Coverage includes concurrent metadata, stale fields and archived parents, pending recovery, cancellation, same-byte file replacement across shared calls and diagnostics, and escaped inputs without file jobs. Eight bridge groups passed against the real shared contract and SQLite adapter; typecheck, scoped lint, both bundles, diagnostics checks and the signed development build passed. Runtime fixture corrections preserved canonical link IDs, established tombstone cleanup, and actual retained checkpoint evidence. This remains an internal check; editor hydration, picker UI, retained-cleanup navigation and physical-device workflow acceptance are still pending.

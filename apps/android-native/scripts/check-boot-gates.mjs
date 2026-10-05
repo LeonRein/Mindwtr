@@ -3430,7 +3430,8 @@ export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentD
 import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
 import { createNativeHostContract as createRealCompleteContract } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract.ts'))};
 import { NativeReceiptSqliteAdapter as RealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
-import { setStorageAdapter as setRealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/store.ts'))};
+import { setStorageAdapter as setRealCompleteAdapter, useTaskStore as realCompleteStore,
+    getPersistenceStatus as realCompletePersistence } from ${JSON.stringify(resolve(app, '../../packages/core/src/store.ts'))};
 const realCompleteContract = createRealCompleteContract();
 let realCompleteActivation;
 async function completeFixtureContract() {
@@ -3438,6 +3439,12 @@ async function completeFixtureContract() {
     if (!globalThis.completeSqliteClient) throw new Error('complete SQLite fixture unavailable');
     if (globalThis.completeSeed) await new RealCompleteAdapter(globalThis.completeSqliteClient).saveData(globalThis.completeSeed);
     const adapter = new RealCompleteAdapter(globalThis.completeSqliteClient, { rejectConcurrentWrites: true });
+    if (globalThis.resumeFixture) {
+      const read = adapter.getData.bind(adapter);
+      adapter.getData = async (options) => { globalThis.resumeReads++; await globalThis.onResumeRead?.(); return read(options); };
+      globalThis.actualResumeStore = realCompleteStore;
+      globalThis.actualResumePersistence = realCompletePersistence;
+    }
     setRealCompleteAdapter(adapter);
     const ready = await realCompleteContract.activate({ writeSafetyReady: true, recoveryLoad: true });
     if (!ready.ok) throw new Error('complete SQLite fixture activation failed: ' + JSON.stringify(ready));
@@ -3579,6 +3586,10 @@ export function createNativeHostContract(bindings = {}) {
       globalThis.editorInputs.push(JSON.stringify(input));
       return { ok: true, value: { version: 1, id: input.id } };
     },
+    async checkOwnedTaskEditorResume(input) { globalThis.resumeInputs.push(['owned', input]);
+        return (await completeFixtureContract()).checkOwnedTaskEditorResume(input); },
+    async checkTaskEditorResume(input) { globalThis.resumeInputs.push(['ordinary', input]);
+        return (await completeFixtureContract()).checkTaskEditorResume(input); },
     getTaskView(input) {
       globalThis.editorInputs.push(JSON.stringify(['view', input]));
       if (globalThis.localTaskViewFailure) return globalThis.localTaskViewFailure;
@@ -3861,7 +3872,7 @@ const makeState = (taskCount, fakeDataSequence = [], hostPlatform = undefined, c
         inboxCommitResult: { ok: false, error: { code: 'SAVE_FAILED', message: 'disk full' } },
         logText: null, logOps: [], logFailure: null,
         localAttachmentTest: false, localShaInstallCount: 0, attachmentInputs: [],
-        fileEditSaveInputs: [], fileEditSaveReply: { ok: true, value: null },
+        fileEditSaveInputs: [], fileEditSaveReply: { ok: true, value: null }, resumeInputs: [], resumeReads: 0,
         emptyOwnerTasks: [], ownerProjects: [], ownerTaskMap: new Map(), storeLoading: false, storeEditLocks: 0,
         attachmentReply: { ok: true, value: { kind: 'saved', ids: [], attachments: [] } },
         __mindwtrNative: {
@@ -4613,6 +4624,155 @@ const poll = async (state, id) => {
     } finally { for (const db of databases) db.close(); }
     console.log(`Task268: ${cases} complete Save/Undo/retire checks (real bound266 factory + SQLite, fresh refs and same-turn callbacks; Node VM)`);
 }
+// Task270: private iOS resume dispatch reaches the actual bound269 factory and raw SQLite reader.
+{
+    const { DatabaseSync } = await import('node:sqlite');
+    const AT = '2026-10-05T10:00:00.000Z', ROOT = 'file:///library/documents/attachments/';
+    const SESSION = '27000000-0000-4000-8000-000000000001';
+    const databases = []; let cases = 0;
+    const check = async (work) => { await work(); cases++; };
+    const call = (state, method, input) => poll(state, state.MindwtrHost[method](JSON.stringify(input)));
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const fixture = async (mixed = false) => {
+        const baseline = [{ id: 'file', kind: 'file', title: 'File', uri: ROOT + 'file.pdf', size: 3, localStatus: 'available', createdAt: AT, updatedAt: AT },
+            { id: 'link', kind: 'link', title: 'Link', uri: 'https://example.test', createdAt: AT, updatedAt: AT }];
+        const source = { id: 'task270', title: 'Opening', status: 'next', taskMode: 'list', tags: [], contexts: [],
+            checklist: [{ id: 'row', title: 'Opening row', isCompleted: false }], description: 'Notes', attachments: baseline,
+            createdAt: AT, updatedAt: AT, rev: 8, revBy: 'before' };
+        const data = { tasks: [source], projects: [], sections: [], areas: [], people: [], settings: { deviceId: 'existing270' } };
+        const db = new DatabaseSync(':memory:'); databases.push(db); let writes = 0;
+        const state = makeState('auto', [], 'ios', (value) => {
+            value.resumeFixture = true; value.fakeData = clone(data); value.completeSeed = data;
+            value.completeSqliteClient = {
+                run: async (sql, params = []) => { db.prepare(sql).run(...params); if (/^(INSERT|UPDATE|DELETE)/.test(sql)) writes++; },
+                all: async (sql, params = []) => db.prepare(sql).all(...params),
+                get: async (sql, params = []) => db.prepare(sql).all(...params)[0], exec: async (sql) => { db.exec(sql); } };
+        });
+        assert.equal((await poll(state, state.MindwtrHost.boot())).ok, true);
+        const initialPayloadJSON = JSON.stringify({ version: 2, taskID: source.id, tab: 'task', touchedBase: { title: 'Opening' }, edited: {},
+            raw: { title: 'Unresolved title 🧪\n', estimate: '12.', timeSpent: '-', checklistInputs: { row: 'Unresolved row' }, checklistAppend: 'Pending row' },
+            scheduleEdits: [{ id: 'pending', field: 'dueDate', value: '2026-10-10' }], scheduleFailedID: 'pending', checklistBase: source.checklist,
+            attachmentsOwned: true, attachmentsBase: baseline, attachments: baseline, linkSheet: { text: 'https://[' } }, null, 2);
+        const ownedDraft = { version: 3, taskID: source.id, initialPayloadJSON, beforePayloadJSON: initialPayloadJSON,
+            priorOperations: [], managedDirectoryURI: ROOT };
+        if (mixed) {
+            // Actual shared producers validate the retained history; no file capability is installed in the resume VM.
+            const producer = makeState(0, [], 'ios', (value) => {
+                value.localAttachmentTest = true;
+                for (const name of ['fileCall', 'installerCall', 'fileAbort', 'fileDeleteNow', 'ioNext', 'ioBody']) value.__mindwtrNative[name] = () => '';
+                value.__mindwtrNative.fileDirectories = () => JSON.stringify({ document: 'file:///library/documents/', cache: 'file:///library/cache/' });
+                value.__mindwtrFileCall = async () => null; value.__mindwtrInstallerCall = async () => null;
+            });
+            assert.equal((await poll(producer, producer.MindwtrHost.boot())).ok, true);
+            const added = await call(producer, 'attachmentDraftPrepareV3', { ...ownedDraft,
+                requestId: '27000000-0000-4000-8000-000000000010', picked: { uri: 'file:///cache/picked.pdf', name: 'Report.pdf', mimeType: null, size: 3 }, measuredSize: 3 });
+            assert.equal(added.ok, true); assert.equal(added.value.kind, 'prepared');
+            ownedDraft.priorOperations.push({ kind: 'add', operation: added.value }); ownedDraft.beforePayloadJSON = added.value.afterPayloadJSON;
+            const gap = JSON.parse(ownedDraft.beforePayloadJSON); gap.attachments.find((row) => row.id === 'link').title = 'Draft link title';
+            ownedDraft.beforePayloadJSON = JSON.stringify(gap);
+            const removed = await call(producer, 'attachmentDraftRemovePrepareV3', { ...ownedDraft,
+                requestId: '27000000-0000-4000-8000-000000000011', attachmentId: 'file' });
+            assert.equal(removed.ok, true); ownedDraft.priorOperations.push({ kind: 'remove', operation: removed.value });
+            ownedDraft.beforePayloadJSON = removed.value.afterPayloadJSON;
+        }
+        const request = { version: 1, kind: 'owned-editor-resume', checkpoint: { version: 1, sessionID: SESSION, taskID: source.id,
+            generation: ownedDraft.priorOperations.length + 1, payloadJSON: ownedDraft.beforePayloadJSON }, ownedDraft };
+        // The existing lazy real-contract fixture activates before the read-only assertion baseline.
+        assert.equal((await call(state, 'attachmentDraftResumeCheckV3', request)).ok, true);
+        writes = 0; state.resumeReads = 0; state.resumeInputs.length = 0;
+        return { state, db, request, source, writes: () => writes,
+            rows: () => JSON.stringify([db.prepare('SELECT * FROM tasks ORDER BY id').all(), db.prepare('SELECT * FROM settings ORDER BY id').all()]) };
+    };
+    try {
+        for (const mixed of [false, true]) await check(async () => {
+            const f = await fixture(mixed), before = f.rows(), input = JSON.stringify(f.request), status = f.state.actualResumePersistence();
+            const sideEffects = JSON.stringify([f.state.fileCalls, f.state.logOps, f.state.events]);
+            const result = await call(f.state, 'attachmentDraftResumeCheckV3', f.request);
+            assert.equal(result.ok, true); assert.equal(result.value.kind, 'ready');
+            assert.equal(result.value.freshDraft.title, 'Opening'); assert.deepEqual(result.value.freshChecklistBase, f.source.checklist);
+            assert.equal(typeof result.value.freshScheduleBase, 'object'); assert.equal(typeof result.value.freshRecurrenceBase, 'object');
+            assert.deepEqual(result.value.freshAttachmentsBase, f.source.attachments);
+            assert.equal(JSON.stringify(f.request), input); assert.equal(f.rows(), before); assert.equal(f.writes(), 0);
+            assert.deepEqual(f.state.actualResumePersistence(), status); assert.equal(f.state.resumeReads, 1);
+            assert.equal(JSON.stringify([f.state.fileCalls, f.state.logOps, f.state.events]), sideEffects, 'read emits no file work or success diagnostic');
+            assert.equal(f.state.localShaInstallCount, 0, 'historical opening does not renew publication capability');
+        });
+        const f = await fixture(true);
+        await check(async () => {
+            const fresh = clone(f.source.attachments); fresh[0].cloudKey = 'concurrent'; fresh[0].deletedAt = AT;
+            f.db.prepare('UPDATE tasks SET attachments = ?, description = ? WHERE id = ?').run(JSON.stringify(fresh), 'External note', f.source.id);
+            const before = f.rows(), original = f.request.checkpoint.payloadJSON;
+            const result = await call(f.state, 'attachmentDraftResumeCheckV3', f.request); assert.equal(result.ok, true);
+            assert.deepEqual(result.value.freshAttachmentsBase, fresh); assert.equal(result.value.freshDraft.description, 'External note');
+            assert.equal(f.request.checkpoint.payloadJSON, original); assert.equal(f.rows(), before); assert.equal(f.writes(), 0);
+        });
+        await check(async () => {
+            f.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Later title', f.source.id);
+            const stale = await call(f.state, 'attachmentDraftResumeCheckV3', f.request); assert.equal(stale.ok, false); assert.match(stale.error, /STALE_REVISION/);
+            f.db.prepare('INSERT INTO projects (id, title, status, color, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)')
+                .run('archived270', 'Archived', 'archived', '#000000', AT, AT);
+            f.db.prepare('UPDATE tasks SET title = ?, projectId = ? WHERE id = ?').run('Opening', 'archived270', f.source.id);
+            const archived = await call(f.state, 'attachmentDraftResumeCheckV3', f.request); assert.equal(archived.ok, false); assert.match(archived.error, /INVALID_INPUT/);
+            f.db.prepare('UPDATE tasks SET projectId = NULL WHERE id = ?').run(f.source.id);
+            f.db.prepare('DELETE FROM projects WHERE id = ?').run('archived270'); assert.equal(f.writes(), 0);
+        });
+        await check(async () => {
+            const reads = f.state.resumeReads;
+            for (const mutate of [(value) => { value.version = 2; }, (value) => { value.ownedDraft.version = 2; },
+                (value) => { value.checkpoint.generation = 1; }, (value) => { value.checkpoint.payloadJSON += ' '; },
+                (value) => { value.checkpoint.taskID = 'foreign'; }, (value) => { value.touchedBase = { title: 'Caller base' }; }]) {
+                const wrong = clone(f.request); mutate(wrong); const result = await call(f.state, 'attachmentDraftResumeCheckV3', wrong);
+                assert.equal(result.ok, false); assert.match(result.error, /INVALID_INPUT/);
+            }
+            assert.equal(f.state.resumeReads, reads);
+            const calls = f.state.resumeInputs.length;
+            for (const text of ['{ private-picked-path', JSON.stringify({ ...f.request, oversized: '界'.repeat(3 * 1024 * 1024) })]) {
+                const result = await poll(f.state, f.state.MindwtrHost.attachmentDraftResumeCheckV3(text));
+                assert.equal(result.ok, false); assert.equal(result.error, 'INVALID_INPUT');
+            }
+            assert.equal(f.state.resumeInputs.length, calls, 'invalid UTF8 transport refuses before selected factory invocation');
+            assert.equal(f.writes(), 0);
+        });
+        await check(async () => {
+            for (const platform of ['android', undefined]) {
+                const absent = makeState(0, [], platform);
+                const result = await call(absent, 'attachmentDraftResumeCheckV3', f.request);
+                assert.equal(result.ok, false); assert.match(result.error, /NOT_READY/); assert.equal(absent.resumeInputs.length, 0);
+            }
+            assert.equal((await poll(f.state, f.state.MindwtrHost.attachmentRequest('attachmentDraftResumeCheckV3', JSON.stringify(f.request)))).ok, false);
+            f.state.persistenceFailure = 'existing failed save'; const before = f.state.resumeInputs.length;
+            const result = await call(f.state, 'attachmentDraftResumeCheckV3', f.request); assert.equal(result.ok, false); assert.match(result.error, /SAVE_FAILED/);
+            assert.equal(f.state.resumeInputs.length, before); f.state.persistenceFailure = null;
+        });
+        await check(async () => {
+            const payload = JSON.parse(f.request.checkpoint.payloadJSON);
+            const ordinary = { id: f.source.id, touchedBase: payload.touchedBase, checklistBase: payload.checklistBase,
+                attachmentsBase: payload.attachmentsBase, attachments: payload.attachments };
+            const refused = await call(f.state, 'taskEditorResumeCheck', ordinary); assert.equal(refused.ok, false); assert.match(refused.error, /INVALID_INPUT/);
+            ordinary.attachments = ordinary.attachmentsBase;
+            assert.equal((await call(f.state, 'taskEditorResumeCheck', ordinary)).ok, true, 'ordinary unchanged file half stays accepted');
+            assert.equal((await call(f.state, 'attachmentDraftResumeCheckV3', f.request)).ok, true);
+            assert.equal(f.writes(), 0);
+        });
+        await check(async () => {
+            let entered, release;
+            const started = new Promise((done) => { entered = done; }), held = new Promise((done) => { release = done; });
+            f.state.onResumeRead = async () => { entered(); await held; };
+            const ticket = f.state.MindwtrHost.attachmentDraftResumeCheckV3(JSON.stringify(f.request)); await started;
+            f.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Changed during read', f.source.id); release();
+            const result = await poll(f.state, ticket); assert.equal(result.ok, false); assert.match(result.error, /STALE_REVISION/);
+            assert.equal(f.db.prepare('SELECT title FROM tasks WHERE id = ?').get(f.source.id).title, 'Changed during read');
+            f.state.onResumeRead = null; f.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Opening', f.source.id);
+            const secondStarted = new Promise((done) => { entered = done; }), secondHeld = new Promise((done) => { release = done; });
+            f.state.onResumeRead = async () => { entered(); await secondHeld; };
+            const second = f.state.MindwtrHost.attachmentDraftResumeCheckV3(JSON.stringify(f.request)); await secondStarted;
+            const store = f.state.actualResumeStore; store.setState({ _allTasks: [...store.getState()._allTasks] }); release();
+            const changed = await poll(f.state, second); assert.equal(changed.ok, false); assert.match(changed.error, /SAVE_FAILED/);
+            f.state.onResumeRead = null; assert.equal(f.writes(), 0);
+        });
+    } finally { for (const db of databases) db.close(); }
+    console.log(`Task270: ${cases} private owned resume checks (real bound269 factory + SQLite, exact retained inputs, ordinary sealed and iOS-only; Node VM)`);
+}
 // Task244: production direct handoff plus actual RN live-reference helper.
 // Native proof/lease/filesystem and real-JSC ordering acceptance are Task243.
 {
@@ -5000,6 +5160,24 @@ const poll = async (state, id) => {
             const absent = makeState(0, [], platform);
             assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('complete-save', 'domainSaved'))).ok, true);
             assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('complete-cancel-undo', 'confirmed'))).ok, true);
+            assert.equal(absent.logText, null);
+        }
+    });
+    await check('owned resume acknowledgment is iOS-only and fixed without claiming Save or UI hydration', async () => {
+        const local = makeState(0, [], 'ios');
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('owned-resume', 'validated'))).ok, true);
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-owned-editor-resume', operation: 'owned-resume', outcome: 'validated' });
+        const before = local.logText;
+        for (const outcome of ['confirmed', 'replayed', 'domainSaved', 'settled', 'resumed', '', 'unknown'])
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('owned-resume', outcome))).ok, true);
+        assert.equal(local.logText, before);
+        local.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('owned-resume', 'validated'))).ok, true);
+        assert.equal(local.logText, before);
+        for (const platform of ['android', undefined]) {
+            const absent = makeState(0, [], platform);
+            assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('owned-resume', 'validated'))).ok, true);
             assert.equal(absent.logText, null);
         }
     });

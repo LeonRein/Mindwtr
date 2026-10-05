@@ -30,6 +30,8 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 ## v1.3.5 (add before tagging, trim in the release after)
 
+- **`v1.3.5/ios-owned-editor-resume`** — `apps/android-native/bundle/host-entry.ts`, after the native owner validates the retained editor checkpoint and V3 attachment lineage against current task state. `Native iOS attachment draft acknowledged` with `operation=owned-resume`, `outcome=validated` proves this read-only validation ran. It does not claim editor hydration, current file existence, task Save, or cleanup. No task text, identifiers, paths, URLs, payloads, or raw errors are logged.
+
 - **`v1.3.5/ios-attachment-link-lineage`** — `apps/android-native/bundle/host-entry.ts`, after V3 Begin passes the shared link-compatible lineage validator. `Native iOS link-compatible attachment lineage validated`, `outcome=validated` proves this validation path ran; it does not claim native ownership, task Save, or picker completion. No IDs, links, paths, contents, or raw errors are logged.
 
 - **`v1.3.5/ios-attachment-complete-save`** — `apps/android-native/bundle/host-entry.ts`, invoked by the selected complete native Save/Undo owner only after durable acknowledgment. `Native iOS attachment draft acknowledged` with `operation=complete-save`, `outcome=domainSaved` or `settled` distinguishes saved task data from released cleanup ownership; `operation=complete-cancel-undo`, `outcome=confirmed` proves the selected cancellation Undo completed. No task text, identifiers, paths, proofs, or raw errors are logged.

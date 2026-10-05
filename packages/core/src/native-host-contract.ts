@@ -259,7 +259,7 @@ import { createOwnedEditorCompleteTaskDraftSaveMethods, createOwnedEditorFileEdi
 import { createOwnedEditorFileAddTaskDraftSaveMethods } from './native-host-contract-owned-editor-save';
 import { createOwnedFileAddTaskDraftSaveMethods } from './native-host-contract-owned-file-save';
 import { createTaskDraftSaveMethods, getNativeTaskScheduleBase, getNativeTaskRecurrenceBase, type NativeTaskScheduleBase, type NativeTaskRecurrenceBase } from './native-host-contract-task-save';
-import { createTaskEditorResumeMethods } from './native-host-contract-task-editor-resume';
+import { createOwnedTaskEditorResumeMethods, createTaskEditorResumeMethods } from './native-host-contract-task-editor-resume';
 import { canCancelNativeTask, canSkipNativeTaskOccurrence, createTaskChecklistSaveMethods } from './native-host-contract-task-checklist';
 import { createTaskFocusMethods } from './native-host-contract-task-focus';
 import { createFocusOrderMethods } from './native-host-contract-focus-order';
@@ -1610,6 +1610,8 @@ export function createNativeHostContract(options: {
         ...createOwnedEditorCompleteTaskDraftSaveMethods({ readiness, save, receipts, language: () => language,
             validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value), isReadOnly: isInArchivedProject }),
         ...createTaskEditorResumeMethods({ readiness, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value),
+            isReadOnly: isInArchivedProject }),
+        ...createOwnedTaskEditorResumeMethods({ readiness, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value),
             isReadOnly: isInArchivedProject }),
         ...taskChecklistMethods,
         ...createReferenceProjectNextActionMethods({ readiness, save, t: () => translate, originMethods: taskChecklistMethods }),

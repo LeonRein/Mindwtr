@@ -156,6 +156,16 @@ public final class CoreHost: @unchecked Sendable {
                 expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
+    func checkAttachmentDraftResumeV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.checkAttachmentDraftResumeV3(expectedSession: expectedSession,
+                expectedGeneration: expectedGeneration, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func readAttachmentDraft() async throws -> String {
         try await perform { try $0.readAttachmentDraft() }
     }
@@ -1635,6 +1645,29 @@ private final class Engine: @unchecked Sendable {
                                 cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).beginV3(
             session: expectedSession, generation: expectedGeneration, cancellation: cancellation) }
+    }
+    func checkAttachmentDraftResumeV3(expectedSession: String, expectedGeneration: Int,
+                                       cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation {
+            try cancellation.check()
+            guard UUID(uuidString: expectedSession)?.uuidString.lowercased() == expectedSession,
+                  expectedGeneration > 0, expectedGeneration <= 9_007_199_254_740_991,
+                  let binding = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000),
+                  let current = try editorDrafts.read(), current.attempt == nil,
+                  Self.ownedEqual(current.snapshot.sessionID, expectedSession),
+                  current.snapshot.generation == expectedGeneration else {
+                throw HostFailure("Attachment draft recovery is not ready")
+            }
+            let snapshot = current.snapshot
+            let coordinator = try attachmentDraftCoordinatorV3(cancellation: cancellation, additionalOwner: { [unowned self] in
+                guard try self.mixedSaveFileBinding(self.editorDrafts.url, maximumBytes: 3_000_000) == binding,
+                      let actual = try self.editorDrafts.read(), actual.attempt == nil,
+                      Self.ownedEqual(actual.snapshot, snapshot) else {
+                    throw HostFailure("Attachment draft recovery is not ready")
+                }
+            })
+            return try coordinator.checkResumeV3(snapshot, cancellation: cancellation)
+        }
     }
     func removeAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).removeV3(requestJSON, cancellation: cancellation) }

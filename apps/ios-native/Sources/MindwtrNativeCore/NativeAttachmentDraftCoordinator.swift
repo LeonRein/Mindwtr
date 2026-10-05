@@ -1126,6 +1126,37 @@ final class NativeAttachmentDraftCoordinator {
             return .init(index: index, attachmentID: id, targetURI: uri, reason: reason, authority: authorities[index])
         }
     }
+    /// Historical opening validation only. Missing or changed published bytes
+    /// remain removable from the draft; a later Save proves publication again.
+    func checkResumeV3(_ snapshot: EditorDraftSnapshot, cancellation: NativeAttachmentCancellation) throws -> String {
+        jobs.drain()
+        let loaded = try mixedRead(cancellation), record = loaded.record
+        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: .complete)
+        guard Self.equal(record.session.checkpoint, snapshot) else { throw Self.failure }
+        try current(snapshot)
+        let checkpoint = try Self.object(String(decoding: JSONEncoder().encode(snapshot), as: UTF8.self))
+        let request: [String: Any] = ["version": 1, "kind": "owned-editor-resume", "checkpoint": checkpoint,
+                                     "ownedDraft": try Self.object(lineage)]
+        // Account for Foundation's actual nested escaping before the first
+        // shared invocation, including historical lineage validation.
+        guard try Self.json(request).utf8.count <= 8 * 1024 * 1024 else { throw Self.failure }
+        try requireMixed(loaded.binding, cancellation)
+        try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+        try requireMixed(loaded.binding, cancellation)
+        let ready = try mixedInvoke("attachmentDraftResumeCheckV3", request, binding: loaded.binding, cancellation: cancellation)
+        guard Set(ready.keys) == Set(["kind", "freshDraft", "freshScheduleBase", "freshRecurrenceBase", "freshChecklistBase", "freshAttachmentsBase"]),
+              ready["kind"] as? String == "ready", ready["freshDraft"] is [String: Any],
+              ready["freshScheduleBase"] is [String: Any], ready["freshRecurrenceBase"] is [String: Any],
+              ready["freshChecklistBase"] is [[String: Any]], ready["freshAttachmentsBase"] is [[String: Any]] else { throw Self.failure }
+        let result = try Self.json(["version": 1, "checkpoint": checkpoint, "ready": ready])
+        guard result.utf8.count <= 8 * 1024 * 1024 else { throw Self.failure }
+        try current(snapshot); try requireMixed(loaded.binding, cancellation)
+        acknowledge("owned-resume", "validated")
+        // Diagnostics can enter shared code. Recheck the original editor and
+        // sidecar generation rather than adopting an identical-byte inode.
+        try current(snapshot); try requireMixed(loaded.binding, cancellation)
+        return result
+    }
     func prepareMixedSave(_ raw: String, session: String, generation: Int, selection: MixedSaveSelection = .legacy,
                           cancellation: NativeAttachmentCancellation) throws -> MixedSavePreparation {
         jobs.drain()
