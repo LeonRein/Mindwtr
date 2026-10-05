@@ -3323,14 +3323,16 @@ globalThis.MindwtrHost = {
             const removedDraft = operation === 'remove' && ['confirmed', 'replayed'].includes(outcome);
             const mixedSave = operation === 'mixed-save' && ['domainSaved', 'settled'].includes(outcome);
             const mixedDiscard = operation === 'discard-mixed' && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard
+            const mixedAdd = operation === 'add-mixed' && ['confirmed', 'replayed'].includes(outcome);
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }
+                    context: { ...(mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
+                        : mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }
                         : mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
                         : removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
                         : operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }

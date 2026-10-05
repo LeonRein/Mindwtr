@@ -613,6 +613,12 @@ final class NativeAttachmentDraftCoordinator {
         jobs.drain()
         let loaded = try mixedRead(cancellation)
         guard Self.uuid(session) != nil, session.utf8.count == 36, Self.equal(loaded.record.session.sessionID, session) else { throw Self.failure }
+        if loaded.record.checkpointAdvance == nil, let last = loaded.record.operations.last, case .add = last {
+            let editorBinding = try mixedAddEditor(loaded.record)
+            let finished = try resumeMixedAdd(loaded.record, binding: loaded.binding, editorBinding: editorBinding,
+                cancellation: cancellation)
+            return try Self.summary(finished)
+        }
         try mixedHistory(loaded.record, binding: loaded.binding, cancellation: cancellation)
         if loaded.record.checkpointAdvance != nil {
             let record = try finishAdvanceV3(loaded.record, binding: loaded.binding, cancellation: cancellation)
@@ -694,6 +700,275 @@ final class NativeAttachmentDraftCoordinator {
         #endif
         try current(advance.after); try requireMixed(next, cancellation)
         return settled
+    }
+
+    // Explicit mixed last-Add owner. The old Add-only controller stays sealed.
+    private func mixedAddEditor(_ record: Store.MixedRecord) throws -> EditorDraftStore.OwnedCheckpoint {
+        guard record.session.state == .active, record.discard == nil, record.checkpointAdvance == nil,
+              let binding = try editor.readOwnedCheckpoint(), binding.attempt == nil else { throw Self.failure }
+        if let last = record.operations.last, case .add(let op) = last, op.phase != .checkpointed {
+            guard Self.equal(binding.snapshot, op.before)
+                || (op.phase == .resultDurable && Self.equal(binding.snapshot, op.after)) else { throw Self.failure }
+        } else {
+            guard record.operations.allSatisfy({ $0.checkpointed }), Self.equal(binding.snapshot, record.session.checkpoint) else {
+                throw Self.failure
+            }
+        }
+        return binding
+    }
+    private func requireMixedAdd(_ binding: Store.VersionedSnapshot, _ editorBinding: EditorDraftStore.OwnedCheckpoint,
+                                 _ cancellation: NativeAttachmentCancellation) throws {
+        try requireMixed(binding, cancellation)
+        guard let actual = try editor.readOwnedCheckpoint(), editorBinding.matches(actual), actual.attempt == nil else { throw Self.failure }
+        try requireOwner(); try cancellation.check()
+    }
+    private func mixedAddBoundary(_ point: AttachmentDraftBoundary, binding: Store.VersionedSnapshot,
+                                  editorBinding: EditorDraftStore.OwnedCheckpoint,
+                                  cancellation: NativeAttachmentCancellation) throws {
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        #if DEBUG
+        try hooks?.boundary?(point)
+        #endif
+        try requireMixedAdd(binding, editorBinding, cancellation)
+    }
+    private func mixedAddFile(_ request: NativeAttachmentDraftFileRequest, binding: Store.VersionedSnapshot,
+                             editorBinding: EditorDraftStore.OwnedCheckpoint, cancellation: NativeAttachmentCancellation,
+                             ignoringCancellation: Bool = false) throws -> [String: Any] {
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        let value = try file(request, cancellation: cancellation, ignoringCancellation: ignoringCancellation)
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        return value
+    }
+    private func writeMixedAdd(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot,
+                               editorBinding: EditorDraftStore.OwnedCheckpoint,
+                               cancellation: NativeAttachmentCancellation) throws -> Store.VersionedSnapshot {
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        let receipt = try store.writeMixedAcknowledged(record)
+        try requireMixedAdd(receipt, editorBinding, cancellation)
+        return receipt
+    }
+    private func replacingMixedAdd(_ record: Store.MixedRecord, _ op: Store.Operation) -> Store.MixedRecord {
+        mixedRecord(record, checkpoint: op.phase == .checkpointed ? op.after : record.session.checkpoint,
+            operations: Array(record.operations.dropLast()) + [.add(op)])
+    }
+    private func preflightMixedAdd(_ record: Store.MixedRecord, admission: Bool) throws {
+        guard let last = record.operations.last, case .add(let op) = last else { throw Self.failure }
+        if op.phase == .checkpointed { try store.preflightMixed(record); return }
+        try editor.preflightCheckpoint(op.after)
+        // Unknown identities are maximum-width size placeholders only. Actual
+        // jobs supply every persisted proof; no placeholder grants authority.
+        let token = "18446744073709551615:18446744073709551615"
+        let stageProof = op.stage ?? Store.Stage(uri: managedURI + ".mindwtr-install-"
+            + op.requestId.replacingOccurrences(of: "-", with: "") + ".candidate/stage",
+            identity: token, directoryIdentity: token, privateDirectoryIdentity: token)
+        let filled = op.filled ?? Store.Filled(sha256: op.source.sha256, size: op.source.size, identity: stageProof.identity)
+        let published = op.published ?? Store.Published(sha256: op.source.sha256, size: op.source.size,
+            identity: stageProof.identity, directoryIdentity: stageProof.directoryIdentity)
+        func shape(_ phase: Store.Phase, reason: Store.Reason? = nil) throws -> Store.MixedRecord {
+            let candidate = Store.Operation(requestId: op.requestId, requestJSON: op.requestJSON, phase: phase, reason: reason,
+                before: op.before, after: op.after, preparedJSON: op.preparedJSON, targetURI: op.targetURI, source: op.source,
+                stage: phase.rank >= Store.Phase.stagePrepared.rank ? stageProof : nil,
+                filled: phase.rank >= Store.Phase.stageFilled.rank ? filled : nil,
+                published: phase.rank >= Store.Phase.published.rank ? published : nil,
+                replyJSON: phase.rank >= Store.Phase.resultDurable.rank ? try addReply(op) : nil)
+            return replacingMixedAdd(record, candidate)
+        }
+        var shapes = [record]
+        for phase in [Store.Phase.intent, .stagePrepared, .stageFilled, .published, .resultDurable, .checkpointed]
+            where phase.rank >= op.phase.rank {
+            shapes.append(try shape(phase))
+            // Longest admitted reason dominates every other reason's encoding.
+            if phase != .checkpointed { shapes.append(try shape(phase, reason: .interruptedReservation)) }
+        }
+        if admission {
+            let complete = try shape(.checkpointed)
+            shapes += try futureMixedDiscards(shape(.resultDurable, reason: .interruptedReservation))
+                + futureMixedDiscards(complete)
+            guard op.after.generation < 9_007_199_254_740_991 else { throw Self.failure }
+            let next = EditorDraftSnapshot(sessionID: op.after.sessionID, taskID: op.after.taskID,
+                generation: op.after.generation + 1, payloadJSON: op.after.payloadJSON)
+            try editor.preflightCheckpoint(next)
+            shapes += [mixedRecord(complete, checkpoint: op.after, advance: .init(before: op.after, after: next)),
+                       mixedRecord(complete, checkpoint: next)]
+        }
+        try preflightMixedShapes(shapes)
+        try store.preflightMixed(record)
+    }
+    func addV3(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        let request = try Self.request(raw, add: true)
+        guard request.id.utf8.count == 36, request.session.utf8.count == 36 else { throw Self.failure }
+        jobs.drain()
+        let loaded = try mixedRead(cancellation), record = loaded.record
+        guard Self.equal(record.session.sessionID, request.session) else { throw Self.failure }
+        let editorBinding = try mixedAddEditor(record)
+        try requireMixedAdd(loaded.binding, editorBinding, cancellation)
+        try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+        try requireMixedAdd(loaded.binding, editorBinding, cancellation)
+        if let entry = record.operations.first(where: { $0.requestId == request.id }) {
+            guard case .add(let existing) = entry, Self.equal(existing.requestJSON, request.json) else { throw Self.failure }
+            if existing.phase == .checkpointed {
+                guard record.operations.allSatisfy({ $0.checkpointed }), let reply = existing.replyJSON else { throw Self.failure }
+                let resynced = try writeMixedAdd(record, binding: loaded.binding, editorBinding: editorBinding, cancellation: cancellation)
+                acknowledge("add-mixed", "replayed")
+                try requireMixedAdd(resynced, editorBinding, cancellation)
+                return reply
+            }
+            guard record.operations.last?.requestId == request.id else { throw Self.failure }
+            let finished = try resumeMixedAdd(record, binding: loaded.binding, editorBinding: editorBinding, cancellation: cancellation)
+            guard let last = finished.operations.last, case .add(let op) = last, let reply = op.replyJSON else { throw Self.failure }
+            return reply
+        }
+        guard record.operations.allSatisfy({ $0.checkpointed }), record.operations.count < 128,
+              request.generation == record.session.checkpoint.generation,
+              request.generation < 9_007_199_254_740_990 else { throw Self.failure }
+        let sourceValue = try mixedAddFile(.snapshotSource(sourceURI: request.picked!["uri"] as! String),
+            binding: loaded.binding, editorBinding: editorBinding, cancellation: cancellation)
+        let sourceProof = try JSONDecoder().decode(Store.Source.self, from: Data(Self.json(sourceValue).utf8))
+        var input = try mixedInput(record, payload: record.session.checkpoint.payloadJSON)
+        input["requestId"] = request.id; input["picked"] = request.picked!; input["measuredSize"] = sourceProof.size
+        let frozenJSON = try mixedInvokeJSON("attachmentDraftPrepareV3", input, binding: loaded.binding, cancellation: cancellation)
+        try requireMixedAdd(loaded.binding, editorBinding, cancellation)
+        let frozen = try Self.object(frozenJSON, limit: 2 * 1024 * 1024)
+        guard let afterPayload = frozen["afterPayloadJSON"] as? String, let target = frozen["targetURI"] as? String else { throw Self.failure }
+        let before = record.session.checkpoint
+        let after = EditorDraftSnapshot(sessionID: before.sessionID, taskID: before.taskID,
+            generation: before.generation + 1, payloadJSON: afterPayload)
+        let op = Store.Operation(requestId: request.id, requestJSON: request.json, phase: .intent,
+            before: before, after: after, preparedJSON: frozenJSON, targetURI: target, source: sourceProof)
+        _ = try prepared(op)
+        let intent = mixedRecord(record, checkpoint: before, operations: record.operations + [.add(op)])
+        try preflightMixedAdd(intent, admission: true)
+        try mixedHistory(intent, binding: loaded.binding, cancellation: cancellation)
+        try mixedAddBoundary(.beforeIntent, binding: loaded.binding, editorBinding: editorBinding, cancellation: cancellation)
+        let binding = try writeMixedAdd(intent, binding: loaded.binding, editorBinding: editorBinding, cancellation: cancellation)
+        try mixedAddBoundary(.afterIntent, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+        let finished = try resumeMixedAdd(intent, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+        guard let last = finished.operations.last, case .add(let completed) = last, let reply = completed.replyJSON else { throw Self.failure }
+        return reply
+    }
+    private func resumeMixedAdd(_ original: Store.MixedRecord, binding originalBinding: Store.VersionedSnapshot,
+                                editorBinding originalEditor: EditorDraftStore.OwnedCheckpoint,
+                                cancellation: NativeAttachmentCancellation) throws -> Store.MixedRecord {
+        var record = original, binding = originalBinding, editorBinding = originalEditor
+        guard let last = record.operations.last, case .add(var op) = last else { throw Self.failure }
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        try mixedHistory(record, binding: binding, cancellation: cancellation)
+        try requireMixedAdd(binding, editorBinding, cancellation)
+        try preflightMixedAdd(record, admission: false)
+        // Re-acknowledge actual retained phase before another primitive, including
+        // visible writes whose earlier directory-sync acknowledgment was lost.
+        binding = try writeMixedAdd(record, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+        if op.phase == .checkpointed {
+            acknowledge("add-mixed", "replayed")
+            try requireMixedAdd(binding, editorBinding, cancellation)
+            return record
+        }
+        do {
+            if op.phase == .intent {
+                guard op.reason != .interruptedReservation else { throw Self.failure }
+                _ = try mixedAddFile(.ensureManagedDirectory, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                do {
+                    let value = try mixedAddFile(.prepareStage(targetURI: op.targetURI,
+                        operationID: op.requestId.replacingOccurrences(of: "-", with: "")),
+                        binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    try mixedAddBoundary(.afterReservation, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    guard Set(value.keys) == Set(["stageURI", "stagedIdentity", "directoryIdentity", "privateDirectoryIdentity"]),
+                          let uri = value["stageURI"] as? String, let identity = value["stagedIdentity"] as? String,
+                          let directory = value["directoryIdentity"] as? String, let privateDirectory = value["privateDirectoryIdentity"] as? String else { throw Self.failure }
+                    let proof = Store.Stage(uri: uri, identity: identity, directoryIdentity: directory, privateDirectoryIdentity: privateDirectory)
+                    try mixedAddBoundary(.beforeStageProof, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    let next = replacingMixedAdd(record, advancing(op, phase: .stagePrepared, stage: proof))
+                    binding = try writeMixedAdd(next, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    record = next; if case .add(let actual) = next.operations.last! { op = actual }
+                } catch {
+                    // Only the still-exact acknowledged intent can receive this
+                    // reason; an uncertain phase write is never reparsed/adopted.
+                    if op.phase == .intent, (try? requireMixedAdd(binding, editorBinding, cancellation)) != nil {
+                        let retained = replacingMixedAdd(record, advancing(op, phase: .intent, reason: .interruptedReservation))
+                        _ = try? writeMixedAdd(retained, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    }
+                    throw Self.failure
+                }
+                try mixedAddBoundary(.afterStageProof, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+            }
+            if op.phase == .stagePrepared {
+                let value = try mixedAddFile(.fillStage(source: source(op.source), stage: stage(op.stage!)),
+                    binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                let content = try JSONDecoder().decode(Store.Filled.self, from: Data(Self.json(value).utf8))
+                try mixedAddBoundary(.beforeFilled, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                let next = replacingMixedAdd(record, advancing(op, phase: .stageFilled, filled: content))
+                binding = try writeMixedAdd(next, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                record = next; if case .add(let actual) = next.operations.last! { op = actual }
+                try mixedAddBoundary(.afterFilled, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+            }
+            if op.phase == .stageFilled {
+                var proof = try? mixedAddFile(.verifyPublication(targetURI: op.targetURI, stage: stage(op.stage!),
+                    sha256: op.source.sha256, size: op.source.size), binding: binding, editorBinding: editorBinding,
+                    cancellation: cancellation, ignoringCancellation: true)
+                if proof == nil {
+                    let sourceValue = try mixedAddFile(.snapshotSource(sourceURI: op.source.sourceURI),
+                        binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    let latest = try JSONDecoder().decode(Store.Source.self, from: Data(Self.json(sourceValue).utf8))
+                    guard latest == op.source, Self.equal(latest.sourceURI, op.source.sourceURI) else { throw Self.failure }
+                    try mixedAddBoundary(.beforePublication, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    _ = try? mixedAddFile(.publishStage(stage: stage(op.stage!), targetURI: op.targetURI, sha256: op.source.sha256),
+                        binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    try mixedAddBoundary(.afterPublication, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    proof = try mixedAddFile(.verifyPublication(targetURI: op.targetURI, stage: stage(op.stage!),
+                        sha256: op.source.sha256, size: op.source.size), binding: binding, editorBinding: editorBinding,
+                        cancellation: cancellation, ignoringCancellation: true)
+                }
+                guard let proof else { throw Self.failure }
+                let publication = try JSONDecoder().decode(Store.Published.self, from: Data(Self.json(proof).utf8))
+                let next = replacingMixedAdd(record, advancing(op, phase: .published, published: publication))
+                binding = try writeMixedAdd(next, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                record = next; if case .add(let actual) = next.operations.last! { op = actual }
+                try mixedAddBoundary(.afterPublicationProof, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+            }
+            if op.phase == .published || op.phase == .resultDurable {
+                let proof = try mixedAddFile(.verifyPublication(targetURI: op.targetURI, stage: stage(op.stage!),
+                    sha256: op.source.sha256, size: op.source.size), binding: binding, editorBinding: editorBinding,
+                    cancellation: cancellation, ignoringCancellation: true)
+                guard try JSONDecoder().decode(Store.Published.self, from: Data(Self.json(proof).utf8)) == op.published else { throw Self.failure }
+                if op.phase == .published {
+                    try mixedAddBoundary(.beforeResult, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    let frozen = try prepared(op)
+                    let value = try mixedInvoke("attachmentDraftResult", ["prepared": frozen], binding: binding, cancellation: cancellation)
+                    try requireMixedAdd(binding, editorBinding, cancellation)
+                    guard Set(value.keys) == Set(["version", "kind", "taskID", "requestId", "afterPayloadJSON", "attachment"]),
+                          Self.integer(value["version"]) == 1, value["kind"] as? String == "added",
+                          value["taskID"] as? String == op.before.taskID, value["requestId"] as? String == op.requestId,
+                          let payload = value["afterPayloadJSON"] as? String, Self.equal(payload, op.after.payloadJSON),
+                          Self.equal(try Self.json(value["attachment"]!), try Self.json(frozen["attachment"]!)) else { throw Self.failure }
+                    let next = replacingMixedAdd(record, advancing(op, phase: .resultDurable, reply: try addReply(op)))
+                    binding = try writeMixedAdd(next, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                    record = next; if case .add(let actual) = next.operations.last! { op = actual }
+                }
+                try mixedAddBoundary(.afterResult, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                try mixedAddBoundary(.beforeCheckpoint, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                let receipt = try editor.checkpointOwnedMatching(before: op.before, after: op.after, binding: editorBinding)
+                try requireMixed(binding, cancellation)
+                editorBinding = receipt
+                try mixedAddBoundary(.afterCheckpoint, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                try mixedAddBoundary(.beforeMarker, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                let next = replacingMixedAdd(record, advancing(op, phase: .checkpointed))
+                binding = try writeMixedAdd(next, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+                record = next
+                try mixedAddBoundary(.afterMarker, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+            }
+            acknowledge("add-mixed", "confirmed")
+            try requireMixedAdd(binding, editorBinding, cancellation)
+            return record
+        } catch {
+            // Preserve the last acknowledged phase only. Failed writes, foreign
+            // evidence and revocation cannot refresh or overwrite authority.
+            if (try? requireMixedAdd(binding, editorBinding, cancellation)) != nil,
+               let last = record.operations.last, case .add(let actual) = last, actual.phase != .checkpointed {
+                let retained = replacingMixedAdd(record, advancing(actual, phase: actual.phase, reason: actual.reason ?? .io))
+                _ = try? writeMixedAdd(retained, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
+            }
+            throw Self.failure
+        }
     }
 
     struct OwnedSavePreparation {

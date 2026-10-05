@@ -4731,6 +4731,25 @@ const poll = async (state, id) => {
         assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('discard-mixed', 'confirmed'))).ok, true);
         assert.equal(android.logText, null);
     });
+    await check('mixed Add acknowledgment has fixed outcomes and survives historical capability loss', async () => {
+        const local = makeState(0, [], 'ios');
+        for (const outcome of ['confirmed', 'replayed']) {
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('add-mixed', outcome))).ok, true);
+            assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+                { releaseCheck: 'v1.3.5/ios-attachment-mixed-add', operation: 'add-mixed', outcome });
+        }
+        const before = local.logText;
+        for (const outcome of ['retained', 'removed', 'settled', '']) {
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('add-mixed', outcome))).ok, true);
+        }
+        assert.equal(local.logText, before);
+        local.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('add-mixed', 'confirmed'))).ok, true);
+        assert.equal(local.logText, before);
+        const android = makeState(0);
+        assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('add-mixed', 'confirmed'))).ok, true);
+        assert.equal(android.logText, null);
+    });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);

@@ -102,6 +102,15 @@ public final class CoreHost: @unchecked Sendable {
             try await perform { try $0.removeAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
+    func addAttachmentDraftV3(requestJSON: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.addAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
@@ -1590,6 +1599,9 @@ private final class Engine: @unchecked Sendable {
     }
     func removeAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).removeV3(requestJSON, cancellation: cancellation) }
+    }
+    func addAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).addV3(requestJSON, cancellation: cancellation) }
     }
     func recoverAttachmentDraftV3(expectedSession: String, cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation) }

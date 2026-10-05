@@ -109,6 +109,11 @@ struct EditorDraftStore {
 
     func read() throws -> (snapshot: EditorDraftSnapshot, attempt: EditorDraftAttempt?)? {
         guard let data = try bytes() else { return nil }
+        let stored = try decode(data)
+        return (stored.snapshot, stored.attempt)
+    }
+
+    private func decode(_ data: Data) throws -> StoredEditorDraft {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(object.keys) == Set(object["attempt"] == nil ? ["snapshot"] : ["snapshot", "attempt"]),
               let rawSnapshot = object["snapshot"] as? [String: Any],
@@ -120,7 +125,76 @@ struct EditorDraftStore {
             throw EditorDraftStoreError.corrupt
         }
         try validate(stored)
-        return (stored.snapshot, stored.attempt)
+        return stored
+    }
+
+    /// V3's caller retains this descriptor, not merely an equivalent model.
+    struct OwnedCheckpoint {
+        let snapshot: EditorDraftSnapshot
+        let attempt: EditorDraftAttempt?
+        let bytes: Data
+        let device: UInt64
+        let inode: UInt64
+        func matches(_ other: OwnedCheckpoint) -> Bool {
+            device == other.device && inode == other.inode && bytes == other.bytes
+        }
+    }
+
+    private static func stable(_ a: stat, _ b: stat) -> Bool {
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_mode == b.st_mode && a.st_nlink == b.st_nlink
+            && a.st_size == b.st_size && a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec
+            && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec && a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec
+            && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec
+    }
+
+    func readOwnedCheckpoint() throws -> OwnedCheckpoint? {
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT { return nil }
+            throw EditorDraftStoreError.corrupt
+        }
+        defer { Darwin.close(fd) }
+        var before = stat()
+        guard Darwin.fstat(fd, &before) == 0, before.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              before.st_nlink == 1, before.st_size >= 0, before.st_size <= off_t(Self.maxFile) else {
+            throw EditorDraftStoreError.corrupt
+        }
+        var data = Data(), buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0, data.count <= Self.maxFile - count else { throw EditorDraftStoreError.corrupt }
+            if count == 0 { break }
+            data.append(contentsOf: buffer[..<count])
+        }
+        var after = stat(), named = stat()
+        guard Darwin.fstat(fd, &after) == 0, Darwin.lstat(url.path, &named) == 0,
+              Self.stable(before, after), Self.stable(after, named), data.count == Int(after.st_size) else {
+            throw EditorDraftStoreError.corrupt
+        }
+        let stored = try decode(data)
+        return OwnedCheckpoint(snapshot: stored.snapshot, attempt: stored.attempt, bytes: data,
+            device: UInt64(before.st_dev), inode: UInt64(before.st_ino))
+    }
+
+    /// Exact ownedAdvance semantics plus one actual encoded-write receipt. Even
+    /// matching-after retries rewrite, repairing a previous lost sync ack.
+    func checkpointOwnedMatching(before: EditorDraftSnapshot, after: EditorDraftSnapshot,
+                                 binding: OwnedCheckpoint) throws -> OwnedCheckpoint {
+        try validate(StoredEditorDraft(snapshot: before, attempt: nil))
+        let data = try encodedBytes(after)
+        guard before.generation <= 9_007_199_254_740_991, after.generation <= 9_007_199_254_740_991,
+              after.generation > before.generation, exact(before.sessionID, after.sessionID),
+              exact(before.taskID, after.taskID), let current = try readOwnedCheckpoint(),
+              binding.matches(current), current.attempt == nil,
+              matches(current.snapshot, before) || matches(current.snapshot, after) else {
+            throw HostFailure("Owned editor checkpoint changed or is pending")
+        }
+        try DurableFile.write(data, to: url, privateDraft: true)
+        guard let receipt = try readOwnedCheckpoint(), receipt.bytes == data else {
+            throw EditorDraftStoreError.corrupt
+        }
+        return receipt
     }
 
     private func encodedBytes(_ snapshot: EditorDraftSnapshot, attempt: EditorDraftAttempt? = nil) throws -> Data {
