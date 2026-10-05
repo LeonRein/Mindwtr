@@ -3192,10 +3192,10 @@ globalThis.MindwtrHost = {
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { releaseCheck: operation === 'save' ? 'v1.3.5/ios-attachment-owned-save'
-                        : finishedDiscard ? 'v1.3.5/ios-owned-discard-finish'
-                            : operation === 'discard-capacity' ? 'v1.3.5/ios-owned-discard-capacity'
-                            : 'v1.3.4/ios-attachment-draft-owned', operation, outcome } }, { force: true });
+                    context: { ...(operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }
+                        : finishedDiscard ? { releaseCheck: 'v1.3.5/ios-owned-discard-finish' }
+                            : operation === 'discard-capacity' ? { releaseCheck: 'v1.3.5/ios-owned-discard-capacity' }
+                                : { releaseCheck: 'v1.3.4/ios-attachment-draft-owned' }), operation, outcome } }, { force: true });
             } catch { /* Diagnostics cannot invalidate a durable acknowledgment. */ }
             return {};
         });
