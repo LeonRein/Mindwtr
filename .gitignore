@@ -70,7 +70,6 @@ apps/desktop/dist-electron/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/.tauri/
 apps/desktop/src-tauri/embedded.provisionprofile
-apps/desktop/src-tauri/binaries/
 
 # Lock files (using bun)
 package-lock.json
@@ -78,7 +77,6 @@ package-lock.json
 !apps/desktop/package-lock.json
 !packages/core/package-lock.json
 !tools/eas-cli/package-lock.json
-!apps/mcp-server/package-lock.json
 yarn.lock
 
 # AUR build artifacts

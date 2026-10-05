@@ -54,6 +54,8 @@ mod linux_notification;
 mod portal_secrets;
 mod local_api;
 mod mcp_server;
+mod mcp_tools;
+mod local_query;
 mod logging;
 mod macos_widget;
 mod obsidian_paths;

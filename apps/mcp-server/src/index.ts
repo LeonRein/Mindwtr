@@ -57,10 +57,7 @@ import { buildTaskCreateFieldsShape, buildTaskUpdateFieldsShape } from './task-f
 export { parseArgs, parseBooleanFlag } from './flags.js';
 export { isAuthorizedBearerToken, resolveHttpConfig, type HttpServerConfig } from './http-server.js';
 
-declare const __MINDWTR_MCP_VERSION__: string | undefined;
-
 const resolvePackageVersion = (): string => {
-  if (typeof __MINDWTR_MCP_VERSION__ === 'string') return __MINDWTR_MCP_VERSION__;
   try {
     const packageJsonPath = resolve(dirname(fileURLToPath(import.meta.url)), '../package.json');
     const parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { version?: unknown };
@@ -277,19 +274,6 @@ export const resolveServerConfig = (
     keepAlive,
     ...(http ? { http } : {}),
   };
-};
-
-/** App-owned helper: only the dedicated environment contract can configure it. */
-export const resolveManagedServerConfig = (env: FlagEnv): ServerConfig => {
-  const allowWrite = parseBooleanFlag(env.MINDWTR_MCP_ALLOW_WRITE, 'managed-allow-write') ?? false;
-  return resolveServerConfig({
-    'api-url': env.MINDWTR_MCP_API_URL ?? '',
-    http: true,
-    'http-host': '127.0.0.1',
-    'http-port': env.MINDWTR_MCP_HTTP_PORT ?? '8722',
-    'http-token': env.MINDWTR_MCP_HTTP_TOKEN ?? '',
-    readonly: !allowWrite,
-  }, { MINDWTR_MCP_API_TOKEN: env.MINDWTR_MCP_API_TOKEN });
 };
 
 // Derived from core's own TASK_STATUS_VALUES (task-status.ts) rather than hand-written, so
@@ -978,13 +962,12 @@ const attachLifecycleHandlers = (service: MindwtrService, onShutdown?: () => voi
   process.on('SIGTERM', () => {
     void closeService().finally(() => process.exit(0));
   });
-  return closeService;
 };
 
-export async function startMcpServer(argv: string[] = process.argv.slice(2), options: { managed?: boolean } = {}) {
+export async function startMcpServer(argv: string[] = process.argv.slice(2)) {
   const flags = parseArgs(argv);
 
-  const config = options.managed ? resolveManagedServerConfig(process.env) : resolveServerConfig(flags);
+  const config = resolveServerConfig(flags);
 
   // The core logger defaults to console.info (protocol stdout). Install the stderr
   // bridge only when the server starts, before any local data can be loaded.
@@ -1009,24 +992,12 @@ export async function startMcpServer(argv: string[] = process.argv.slice(2), opt
       host: httpConfig.host,
       logError,
     });
-    const shutdown = attachLifecycleHandlers(service, () => {
-      httpServer.closeAllConnections();
+    attachLifecycleHandlers(service, () => {
       httpServer.close();
     });
-    if (options.managed) {
-      // The app keeps this pipe open. EOF also covers a crashed/killed parent,
-      // unlike an exit hook in the parent process alone.
-      const parentGone = () => { void shutdown().finally(() => process.exit(0)); };
-      process.stdin.once('end', parentGone);
-      process.stdin.once('error', parentGone);
-      process.stdin.resume();
-    }
     await startHttpServer(httpServer, httpConfig);
     if (httpConfig.weakTokenWarning) {
       logInfo(`Warning: ${httpConfig.weakTokenWarning}`);
-    }
-    if (options.managed) {
-      process.stderr.write(`${JSON.stringify({ event: 'mindwtr-mcp-ready', port: httpConfig.port })}\n`);
     }
     logInfo('HTTP MCP transport listening', {
       host: httpConfig.host,

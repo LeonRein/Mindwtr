@@ -508,14 +508,6 @@ jobs:
             --bundles app \
             --config src-tauri/tauri.appstore.conf.json
 
-      - name: Sign sandbox-inheriting MCP helper and re-seal host
-        env:
-          MAS_SIGNING_IDENTITY: ${{ secrets.MAS_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          APP_PATH="$(find apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
-          node scripts/build-mcp-sidecar-sign.mjs "$APP_PATH" "$MAS_SIGNING_IDENTITY" appstore
-
       - name: Build and embed macOS widget (App Store)
         if: env.HAS_MAS_WIDGET_PROFILE == '1'
         timeout-minutes: 15

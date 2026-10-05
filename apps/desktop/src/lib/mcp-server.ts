@@ -3,7 +3,7 @@ import { isTauriRuntime } from './runtime';
 import { invokeNative } from './tauri-invoke';
 
 export const MCP_SERVER_PORT = 8722;
-export type McpServerError = 'helper_missing' | 'port_in_use' | 'start_failed' | 'exited' | 'config_failed' | 'unsupported_os';
+export type McpServerError = 'port_in_use' | 'start_failed' | 'exited' | 'config_failed';
 export type McpServerStatus = {
     enabled: boolean;
     running: boolean;
@@ -29,7 +29,7 @@ function assertAvailable(): void {
 
 export function normalizeMcpServerError(error: unknown): McpServerError | null {
     if (error === null || error === undefined) return null;
-    return ['helper_missing', 'port_in_use', 'start_failed', 'exited', 'config_failed', 'unsupported_os'].includes(String(error))
+    return ['port_in_use', 'start_failed', 'exited', 'config_failed'].includes(String(error))
         ? error as McpServerError
         : 'config_failed';
 }
@@ -50,7 +50,7 @@ export async function setMcpServerConfig(config: McpServerConfig): Promise<McpSe
 
 /** Contains a credential: generate only for an explicit copy action, never for logs or display. */
 export function getMcpConnectionDetails(status: McpServerStatus): string | null {
-    if (!status.enabled || !status.running || status.error === 'unsupported_os' || !status.token || status.url !== `http://127.0.0.1:${MCP_SERVER_PORT}/mcp`) return null;
+    if (!status.enabled || !status.running || !status.token || status.url !== `http://127.0.0.1:${MCP_SERVER_PORT}/mcp`) return null;
     return JSON.stringify({
         mcpServers: {
             mindwtr: { url: status.url, headers: { Authorization: `Bearer ${status.token}` } },

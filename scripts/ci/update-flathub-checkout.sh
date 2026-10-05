@@ -30,8 +30,6 @@ required_paths=(
   "apps/desktop/package-lock.json"
   "packages/core/package.json"
   "packages/core/package-lock.json"
-  "apps/mcp-server/package.json"
-  "apps/mcp-server/package-lock.json"
   "apps/desktop/src-tauri/Cargo.lock"
   "apps/desktop/src-tauri/linux/Mindwtr.metainfo.xml"
   "apps/desktop/src-tauri/linux/tech.dongdongbh.mindwtr.desktop"
@@ -333,71 +331,16 @@ lines[env_line_index + 1:block_end_index] = [
 manifest_path.write_text("\n".join(lines) + "\n")
 PY
 
-python3 - "${manifest_path}" "${repo_root}/scripts/build-mcp-sidecar.bun-sources.json" "${repo_root}/.bun-version" <<'PY'
-import json
+# Remove blocks generated for the former bundled MCP subprocess.
+python3 - "${manifest_path}" <<'PYTHON'
 from pathlib import Path
 import re
 import sys
-
 manifest = Path(sys.argv[1])
-tools = json.loads(Path(sys.argv[2]).read_text())
-if tools['version'] != Path(sys.argv[3]).read_text().strip():
-    raise SystemExit('MCP Flatpak Bun archive pins must match .bun-version')
 text = manifest.read_text()
-# Replace only our own generated blocks; preserve all other modules/sources.
 text = re.sub(r'^ *# BEGIN MINDWTR MCP [^\n]*\n.*?^ *# END MINDWTR MCP [^\n]*\n', '', text, flags=re.MULTILINE | re.DOTALL)
-module = re.search(r'^(?P<indent> *)- name: mindwtr\n(?P<body>.*?)(?=^  - name:|\Z)', text, flags=re.MULTILINE | re.DOTALL)
-if not module:
-    raise SystemExit('Cannot locate the Mindwtr Flatpak module for MCP build tooling')
-body = module.group('body')
-sources = re.search(r'^(?P<indent> *)sources:\s*\n', body, flags=re.MULTILINE)
-commands = re.search(r'^(?P<indent> *)build-commands:\s*\n', body, flags=re.MULTILINE)
-if not sources or not commands:
-    raise SystemExit('Cannot locate Flatpak MCP build-commands/sources')
-indent = sources.group('indent') + '  '
-lines = [indent + '# BEGIN MINDWTR MCP BUN SOURCES']
-for archive in tools['archives']:
-    lines += [
-        indent + '- type: archive',
-        indent + '  url: ' + archive['url'],
-        indent + '  sha256: ' + archive['sha256'],
-        indent + '  dest: .flatpak-bun',
-        indent + '  strip-components: 1',
-        indent + '  only-arches: [' + archive['architecture'] + ']',
-    ]
-lines += [indent + '# END MINDWTR MCP BUN SOURCES']
-body = body[:sources.end()] + '\n'.join(lines) + '\n' + body[sources.end():]
-# Compile using the predownloaded host Bun executable, which embeds itself;
-# no installer or cross-target runtime download runs inside the offline build.
-commands = re.search(r'^(?P<indent> *)build-commands:\s*\n', body, flags=re.MULTILINE)
-indent = commands.group('indent') + '  '
-build = [
-    # Core's React peer lives in the separate desktop install, not above core.
-    'ln -sfn ../../../apps/desktop/node_modules/react packages/core/node_modules/react',
-    'mkdir -p .flatpak-mcp-install',
-    'cp apps/mcp-server/package.json apps/mcp-server/package-lock.json .flatpak-mcp-install/',
-    'npm ci --prefix=.flatpak-mcp-install --offline --omit=optional --ignore-scripts --legacy-peer-deps --workspaces=false',
-    'mkdir -p apps/mcp-server/node_modules',
-    'cp -a .flatpak-mcp-install/node_modules/. apps/mcp-server/node_modules/',
-    'mkdir -p apps/mcp-server/node_modules/@mindwtr',
-    'ln -sfn ../../../../packages/core apps/mcp-server/node_modules/@mindwtr/core',
-    'chmod +x .flatpak-bun/bun',
-    './.flatpak-bun/bun scripts/build-mcp-sidecar.mjs',
-]
-# The helper bundles core, so insert after the existing core npm install and
-# before cargo. Refuse unknown production layouts instead of losing the helper.
-anchor = re.search(r'^ *- cargo --offline build[^\n]*\n', body, flags=re.MULTILINE)
-if not anchor:
-    raise SystemExit('Cannot locate the offline cargo build for MCP helper compilation')
-block = [indent + '# BEGIN MINDWTR MCP BUILD'] + [indent + '- ' + line for line in build] + [indent + '# END MINDWTR MCP BUILD']
-body = body[:anchor.start()] + '\n'.join(block) + '\n' + body[anchor.start():]
-install = re.search(r'^ *- install -Dm755 [^\n]*/mindwtr /app/bin/mindwtr\n', body, flags=re.MULTILINE)
-if not install:
-    raise SystemExit('Cannot locate the Flatpak application install for MCP helper')
-block = [indent + '# BEGIN MINDWTR MCP INSTALL', indent + '- install -Dm755 apps/desktop/src-tauri/binaries/mindwtr-mcp-$(rustc -vV | sed -n "s/^host: //p") /app/bin/mindwtr-mcp', indent + '# END MINDWTR MCP INSTALL']
-body = body[:install.end()] + '\n'.join(block) + '\n' + body[install.end():]
-manifest.write_text(text[:module.start('body')] + body + text[module.end('body'):])
-PY
+manifest.write_text(text)
+PYTHON
 
 if [ "${manifest_only}" = "1" ]; then
   echo "Updated Flathub manifest fixture in ${flathub_dir} for ${upstream_commit}"
@@ -510,7 +453,6 @@ python3 "${tools_dir}/cargo/flatpak-cargo-generator.py" \
   -r \
   -R "apps/desktop/package-lock.json" \
   -R "packages/core/package-lock.json" \
-  -R "apps/mcp-server/package-lock.json" \
   -o "${node_sources_path}"
 
 echo "Updated Flathub checkout in ${flathub_dir} for ${ref} (${upstream_commit})"

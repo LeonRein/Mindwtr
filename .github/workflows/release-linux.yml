@@ -100,18 +100,12 @@ jobs:
         timeout-minutes: 35
         run: |
           cd apps/desktop
-          bunx tauri build --verbose --bundles deb,rpm
-          # linuxdeploy rewrites ELF files and corrupts Bun's embedded payload.
-          # The AppImage repair step inserts the unchanged helper afterwards.
-          bunx tauri bundle --verbose --bundles appimage --config '{"bundle":{"externalBin":[]}}'
+          bunx tauri build --verbose --bundles deb,rpm,appimage
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VITE_ANALYTICS_HEARTBEAT_URL: ${{ secrets.ANALYTICS_HEARTBEAT_URL }}
           VITE_ANALYTICS_RELEASE_VERSION: ${{ inputs.tag || github.event.inputs.tag || github.ref_name }}
-
-      - name: Smoke test standalone MCP helper without a JS runtime on PATH
-        run: node scripts/build-mcp-sidecar-smoke.mjs apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-unknown-linux-gnu
 
       - name: Repair AppImage metadata
         run: |
@@ -167,9 +161,6 @@ jobs:
               cd "$APP_WORKDIR"
               ./original.AppImage --appimage-extract >/dev/null
               mv squashfs-root appdir
-
-              install -m 0755 "$GITHUB_WORKSPACE/apps/desktop/src-tauri/binaries/mindwtr-mcp-x86_64-unknown-linux-gnu" appdir/usr/bin/mindwtr-mcp
-              node "$GITHUB_WORKSPACE/scripts/build-mcp-sidecar-smoke.mjs" "$PWD/appdir/usr/bin/mindwtr-mcp"
 
               # Some Tauri builds emit .DirIcon as an absolute symlink into the CI workspace.
               # That symlink is broken for downstream users and AppImageHub lint.

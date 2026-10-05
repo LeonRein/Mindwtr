@@ -45,7 +45,7 @@ export function SettingsMcpSection({ isTauri }: { isTauri: boolean }) {
 
     // Schedule after each response so slow calls never overlap; disabled integration does no polling.
     useEffect(() => {
-        if (!available || !status?.enabled || status.error === 'unsupported_os' || busy) return;
+        if (!available || !status?.enabled || busy) return;
         let cancelled = false;
         let timer: ReturnType<typeof setTimeout>;
         const requestRevision = revision.current;
@@ -68,7 +68,6 @@ export function SettingsMcpSection({ isTauri }: { isTauri: boolean }) {
 
     const runAction = async (config?: McpServerConfig, copy = false) => {
         if (!available || inFlight.current) return;
-        if (status?.error === 'unsupported_os' && (config?.enabled || copy)) return;
         inFlight.current = true;
         revision.current += 1;
         setBusy(true);
@@ -105,7 +104,6 @@ export function SettingsMcpSection({ isTauri }: { isTauri: boolean }) {
     };
 
     const error = failed ? 'config_failed' : status?.error;
-    const unsupportedOs = status?.error === 'unsupported_os';
     return (
         <SettingsDisclosureCard
             sectionKey="mcpTitle"
@@ -116,17 +114,16 @@ export function SettingsMcpSection({ isTauri }: { isTauri: boolean }) {
                 {!available ? <p className="text-sm text-muted-foreground">{t('settings.mcpUnavailable')}</p> : <>
                     <SettingRow settingsKey={null} title={t('settings.mcpEnable')} description={t('settings.mcpReadPermission')}>
                         <Switch aria-label={t('settings.mcpEnable')} checked={status?.enabled ?? false}
-                            disabled={busy || !status || (unsupportedOs && !status.enabled)} onCheckedChange={(enabled) => void runAction({ enabled, allowWrite: status?.allowWrite ?? false })} />
+                            disabled={busy || !status} onCheckedChange={(enabled) => void runAction({ enabled, allowWrite: status?.allowWrite ?? false })} />
                     </SettingRow>
                     <p className="text-xs text-muted-foreground">{t('settings.mcpPrivacy')}</p>
                     <p className="text-sm" role="status">
                         {busy || (!status && !error) ? t('common.loading') : t(status?.running ? 'settings.mcpRunning' : 'settings.mcpStopped')}
                     </p>
                     {error && <p className="text-sm text-destructive" role="alert">{t(`settings.mcpError.${error}`)}</p>}
-                    {unsupportedOs && error !== 'unsupported_os' && <p className="text-sm text-muted-foreground">{t('settings.mcpError.unsupported_os')}</p>}
-                    {!unsupportedOs && (error || (status?.enabled && !status.running)) && <button type="button" className={actionClass} disabled={busy}
+                    {(error || (status?.enabled && !status.running)) && <button type="button" className={actionClass} disabled={busy}
                         onClick={() => void runAction(status ? { enabled: status.enabled, allowWrite: status.allowWrite } : undefined)}>{t('common.retry')}</button>}
-                    {status?.enabled && !unsupportedOs && <>
+                    {status?.enabled && <>
                         <SettingRow settingsKey={null} title={t('settings.mcpAllowWrite')} description={t('settings.mcpAllowWriteDesc')}>
                             <Switch aria-label={t('settings.mcpAllowWrite')} checked={status.allowWrite} disabled={busy}
                                 onCheckedChange={(allowWrite) => void runAction({ enabled: true, allowWrite })} />

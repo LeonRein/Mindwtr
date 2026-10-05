@@ -1,0 +1,747 @@
+{
+  "now": "2026-10-05T16:00:00.000Z",
+  "projects": [
+    {
+      "id": "10000000-0000-4000-8000-000000000900",
+      "title": "Work Launch",
+      "status": "active",
+      "color": "#336699",
+      "order": 0,
+      "tagIds": [],
+      "createdAt": "2026-10-01T12:00:00.000Z",
+      "updatedAt": "2026-10-01T12:00:00.000Z"
+    }
+  ],
+  "taskSets": {
+    "text": [
+      {
+        "id": "10000000-0000-4000-8000-000000000001",
+        "title": "Buy oat milk",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000002",
+        "title": "Buy milk",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "description": "Remember oat milk and foo:bar"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000003",
+        "title": "Read C:\\temp and folder\\new",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000004",
+        "title": "Say \"hello world\"",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000005",
+        "title": "Travel",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "location": "Airport lounge",
+        "checklist": [
+          {
+            "id": "10000000-0000-4000-8000-000000000901",
+            "title": "Book shuttle tickets",
+            "isCompleted": false
+          }
+        ]
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000006",
+        "title": "Unknown",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "description": "foo:<=bar"
+      }
+    ],
+    "metadata": [
+      {
+        "id": "10000000-0000-4000-8000-000000000010",
+        "title": "Inbox item",
+        "status": "inbox",
+        "tags": [
+          "#urgent"
+        ],
+        "contexts": [
+          "@work"
+        ],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "projectId": "10000000-0000-4000-8000-000000000900"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000011",
+        "title": "Work child",
+        "status": "next",
+        "tags": [
+          "#urgent/client"
+        ],
+        "contexts": [
+          "@work/office"
+        ],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "assignedTo": "Alex Smith",
+        "projectId": "10000000-0000-4000-8000-000000000900"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000012",
+        "title": "Uppercase tokens",
+        "status": "next",
+        "tags": [
+          "#Urgent"
+        ],
+        "contexts": [
+          "@Work"
+        ],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000013",
+        "title": "Waiting for Alex",
+        "status": "waiting",
+        "tags": [],
+        "contexts": [
+          "@ALEX SMITH"
+        ],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "assignedTo": " Alex  Smith "
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000014",
+        "title": "Similar person",
+        "status": "next",
+        "tags": [],
+        "contexts": [
+          "@Alex Smith/Office"
+        ],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "assignedTo": "Alex"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000015",
+        "title": "Completed",
+        "status": "done",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "completedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000016",
+        "title": "Punctuation person",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "assignedTo": "Alex: \"OR\" \\ Ops"
+      }
+    ],
+    "dates": [
+      {
+        "id": "10000000-0000-4000-8000-000000000020",
+        "title": "Yesterday date only",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-04"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000021",
+        "title": "Today date only",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-05",
+        "startTime": "2026-10-05",
+        "reviewAt": "2026-10-05"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000022",
+        "title": "Today midnight",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-05T00:00:00-04:00"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000023",
+        "title": "Today noon",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-05T16:00:00.000Z",
+        "startTime": "2026-10-05T16:00:00.000Z",
+        "reviewAt": "2026-10-05T16:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000024",
+        "title": "Tomorrow date only",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-06"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000025",
+        "title": "Seventh day date only",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-12"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000026",
+        "title": "Seventh day noon",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-12T12:00:00-04:00"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000027",
+        "title": "After seventh day noon",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-12T12:00:00.001-04:00"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000028",
+        "title": "Offset resolves to yesterday",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-05T01:00:00+02:00"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000029",
+        "title": "Offset resolves to today",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "dueDate": "2026-10-06T01:00:00+02:00"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000030",
+        "title": "Missing dates",
+        "status": "next",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      }
+    ],
+    "lifecycle": [
+      {
+        "id": "10000000-0000-4000-8000-000000000040",
+        "title": "Visible inbox",
+        "status": "inbox",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000041",
+        "title": "Deleted inbox",
+        "status": "inbox",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "deletedAt": "2026-10-01T12:00:00.000Z"
+      },
+      {
+        "id": "10000000-0000-4000-8000-000000000042",
+        "title": "Purged inbox",
+        "status": "inbox",
+        "tags": [],
+        "contexts": [],
+        "createdAt": "2026-10-01T12:00:00.000Z",
+        "updatedAt": "2026-10-01T12:00:00.000Z",
+        "purgedAt": "2026-10-01T12:00:00.000Z"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "quoted-free-text",
+      "query": "\"oat milk\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002"
+      ]
+    },
+    {
+      "name": "free-text-case-insensitive",
+      "query": "OAT MILK",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002"
+      ]
+    },
+    {
+      "name": "negated-free-text",
+      "query": "-\"oat milk\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000003",
+        "10000000-0000-4000-8000-000000000004",
+        "10000000-0000-4000-8000-000000000005",
+        "10000000-0000-4000-8000-000000000006"
+      ]
+    },
+    {
+      "name": "literal-backslash",
+      "query": "\"C:\\temp\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000003"
+      ]
+    },
+    {
+      "name": "escaped-backslash",
+      "query": "\"C:\\\\temp\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000003"
+      ]
+    },
+    {
+      "name": "escaped-quotes",
+      "query": "\"\\\"hello world\\\"\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000004"
+      ]
+    },
+    {
+      "name": "unknown-operator-text",
+      "query": "foo:bar",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000002"
+      ]
+    },
+    {
+      "name": "unknown-operator-comparator-stripped",
+      "query": "foo:<=bar",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000002"
+      ]
+    },
+    {
+      "name": "unknown-operator-negated",
+      "query": "-foo:bar",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000003",
+        "10000000-0000-4000-8000-000000000004",
+        "10000000-0000-4000-8000-000000000005",
+        "10000000-0000-4000-8000-000000000006"
+      ]
+    },
+    {
+      "name": "free-text-checklist",
+      "query": "shuttle",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000005"
+      ]
+    },
+    {
+      "name": "checklist-field",
+      "query": "checklist:tickets",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000005"
+      ]
+    },
+    {
+      "name": "location-alias",
+      "query": "where:\"airport lounge\"",
+      "taskSet": "text",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000005"
+      ]
+    },
+    {
+      "name": "status-context-tag",
+      "query": "status:inbox context:work tags:urgent",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010"
+      ]
+    },
+    {
+      "name": "status-case-insensitive",
+      "query": "STATUS:NEXT",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000011",
+        "10000000-0000-4000-8000-000000000012",
+        "10000000-0000-4000-8000-000000000014",
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "unknown-status-normalizes-inbox",
+      "query": "status:unknown",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010"
+      ]
+    },
+    {
+      "name": "negation-or-precedence",
+      "query": "status:inbox OR status:next -#urgent",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000012",
+        "10000000-0000-4000-8000-000000000014",
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "or-symbol",
+      "query": "status:waiting || status:done",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000013",
+        "10000000-0000-4000-8000-000000000015"
+      ]
+    },
+    {
+      "name": "shorthand-context-hierarchy",
+      "query": "@work/",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000011"
+      ]
+    },
+    {
+      "name": "shorthand-tag-hierarchy",
+      "query": "#urgent",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000011"
+      ]
+    },
+    {
+      "name": "context-case-sensitive",
+      "query": "@Work",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000012"
+      ]
+    },
+    {
+      "name": "tag-case-sensitive",
+      "query": "#Urgent",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000012"
+      ]
+    },
+    {
+      "name": "negated-shorthand-hierarchy",
+      "query": "-@work",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000012",
+        "10000000-0000-4000-8000-000000000013",
+        "10000000-0000-4000-8000-000000000014",
+        "10000000-0000-4000-8000-000000000015",
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "person-exact-shorthand",
+      "query": "%\"alex smith\"",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000011",
+        "10000000-0000-4000-8000-000000000013"
+      ]
+    },
+    {
+      "name": "person-exact-negated",
+      "query": "-person:\"alex smith\"",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000012",
+        "10000000-0000-4000-8000-000000000014",
+        "10000000-0000-4000-8000-000000000015",
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "assignee-substring",
+      "query": "assignee:alex",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000011",
+        "10000000-0000-4000-8000-000000000013",
+        "10000000-0000-4000-8000-000000000014",
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "person-punctuation-operators",
+      "query": "person:\"Alex: \\\"OR\\\" \\\\ Ops\"",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000016"
+      ]
+    },
+    {
+      "name": "project-title-case-insensitive",
+      "query": "project:\"WORK LAUNCH\"",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000011"
+      ]
+    },
+    {
+      "name": "project-id",
+      "query": "project:10000000-0000-4000-8000-000000000900",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000010",
+        "10000000-0000-4000-8000-000000000011"
+      ]
+    },
+    {
+      "name": "id-substring",
+      "query": "id:000000000011",
+      "taskSet": "metadata",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000011"
+      ]
+    },
+    {
+      "name": "due-today-equality-local-day",
+      "query": "due:today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000021",
+        "10000000-0000-4000-8000-000000000022",
+        "10000000-0000-4000-8000-000000000023",
+        "10000000-0000-4000-8000-000000000029"
+      ]
+    },
+    {
+      "name": "due-tomorrow-equality-local-day",
+      "query": "due:tomorrow",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000024"
+      ]
+    },
+    {
+      "name": "due-explicit-date-equality",
+      "query": "due:2026-10-05",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000021",
+        "10000000-0000-4000-8000-000000000022",
+        "10000000-0000-4000-8000-000000000023",
+        "10000000-0000-4000-8000-000000000029"
+      ]
+    },
+    {
+      "name": "due-less-equal-today-midnight",
+      "query": "due:<=today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000020",
+        "10000000-0000-4000-8000-000000000022",
+        "10000000-0000-4000-8000-000000000028"
+      ]
+    },
+    {
+      "name": "due-less-today-midnight",
+      "query": "due:<today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000020",
+        "10000000-0000-4000-8000-000000000028"
+      ]
+    },
+    {
+      "name": "due-greater-today-midnight",
+      "query": "due:>today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000021",
+        "10000000-0000-4000-8000-000000000023",
+        "10000000-0000-4000-8000-000000000024",
+        "10000000-0000-4000-8000-000000000025",
+        "10000000-0000-4000-8000-000000000026",
+        "10000000-0000-4000-8000-000000000027",
+        "10000000-0000-4000-8000-000000000029"
+      ]
+    },
+    {
+      "name": "due-less-equal-seven-days-noon",
+      "query": "due:<=7d",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000020",
+        "10000000-0000-4000-8000-000000000021",
+        "10000000-0000-4000-8000-000000000022",
+        "10000000-0000-4000-8000-000000000023",
+        "10000000-0000-4000-8000-000000000024",
+        "10000000-0000-4000-8000-000000000026",
+        "10000000-0000-4000-8000-000000000028",
+        "10000000-0000-4000-8000-000000000029"
+      ]
+    },
+    {
+      "name": "due-offset-explicit-comparison",
+      "query": "due:<=2026-10-05T16:00:00Z",
+      "taskSet": "dates",
+      "expectedIds": []
+    },
+    {
+      "name": "missing-due-negated",
+      "query": "-due:today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000020",
+        "10000000-0000-4000-8000-000000000024",
+        "10000000-0000-4000-8000-000000000025",
+        "10000000-0000-4000-8000-000000000026",
+        "10000000-0000-4000-8000-000000000027",
+        "10000000-0000-4000-8000-000000000028",
+        "10000000-0000-4000-8000-000000000030"
+      ]
+    },
+    {
+      "name": "start-today-midnight",
+      "query": "start:<=today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000021"
+      ]
+    },
+    {
+      "name": "review-today-midnight",
+      "query": "review:<=today",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000021"
+      ]
+    },
+    {
+      "name": "created-explicit-date",
+      "query": "created:2026-10-01",
+      "taskSet": "dates",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000020",
+        "10000000-0000-4000-8000-000000000021",
+        "10000000-0000-4000-8000-000000000022",
+        "10000000-0000-4000-8000-000000000023",
+        "10000000-0000-4000-8000-000000000024",
+        "10000000-0000-4000-8000-000000000025",
+        "10000000-0000-4000-8000-000000000026",
+        "10000000-0000-4000-8000-000000000027",
+        "10000000-0000-4000-8000-000000000028",
+        "10000000-0000-4000-8000-000000000029",
+        "10000000-0000-4000-8000-000000000030"
+      ]
+    },
+    {
+      "name": "deleted-exclusion-empty-query",
+      "query": "",
+      "taskSet": "lifecycle",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000040"
+      ]
+    },
+    {
+      "name": "deleted-exclusion-status",
+      "query": "status:inbox",
+      "taskSet": "lifecycle",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000040"
+      ]
+    },
+    {
+      "name": "deleted-exclusion-negation",
+      "query": "-status:done",
+      "taskSet": "lifecycle",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000040"
+      ]
+    },
+    {
+      "name": "operator-only-query",
+      "query": "OR ||",
+      "taskSet": "lifecycle",
+      "expectedIds": [
+        "10000000-0000-4000-8000-000000000040"
+      ]
+    }
+  ]
+}

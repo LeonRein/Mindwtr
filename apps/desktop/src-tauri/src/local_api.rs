@@ -72,10 +72,25 @@ impl Default for LocalApiConfig {
     }
 }
 
-struct LocalApiHandle {
-    port: u16,
+pub(crate) struct LocalApiHandle {
+    pub(crate) port: u16,
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+}
+
+impl LocalApiHandle {
+    #[cfg(test)]
+    pub(crate) fn test_access(&self, allow_write: bool) -> LocalApiAccess {
+        LocalApiAccess {
+            allow_write,
+            shutdown: self.shutdown.clone(),
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        !self.shutdown.load(Ordering::SeqCst)
+            && self.join.as_ref().is_some_and(|join| !join.is_finished())
+    }
 }
 
 impl Drop for LocalApiHandle {
@@ -97,20 +112,20 @@ impl Drop for LocalApiHandle {
 }
 
 #[derive(Clone)]
-struct LocalApiAccess {
-    allow_write: bool,
-    shutdown: Arc<AtomicBool>,
+pub(crate) struct LocalApiAccess {
+    pub(crate) allow_write: bool,
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 impl LocalApiAccess {
-    fn ensure_active(&self) -> Result<(), String> {
+    pub(crate) fn ensure_active(&self) -> Result<(), String> {
         if self.shutdown.load(Ordering::SeqCst) {
             return Err("Local API server is stopped".to_string());
         }
         Ok(())
     }
 
-    fn ensure_write(&self) -> Result<(), String> {
+    pub(crate) fn ensure_write(&self) -> Result<(), String> {
         self.ensure_active()?;
         if !self.allow_write {
             return Err("Local API is read-only".to_string());
@@ -128,58 +143,6 @@ impl LocalApiAccess {
         self.ensure_write()?;
         Ok(guard)
     }
-}
-
-/// An ephemeral, separately authenticated bridge for the managed helper. It
-/// never reads or changes the external Local API's configuration or token.
-pub(crate) struct PrivateMcpApiBridge {
-    handle: LocalApiHandle,
-    token: String,
-}
-
-impl PrivateMcpApiBridge {
-    pub(crate) fn url(&self) -> String {
-        format!("http://{LOCAL_API_HOST}:{}", self.handle.port)
-    }
-
-    pub(crate) fn token(&self) -> &str {
-        &self.token
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lifetime_fixture() -> Self {
-        // Exercise production bridge/handle Drop with a real listener without
-        // constructing a Wry AppHandle. Handler policy has separate tests.
-        let listener = TcpListener::bind((LOCAL_API_HOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let signal = shutdown.clone();
-        let join = thread::spawn(move || {
-            while !signal.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(10));
-            }
-            drop(listener);
-        });
-        Self {
-            handle: LocalApiHandle {
-                port,
-                shutdown,
-                join: Some(join),
-            },
-            token: generate_local_api_token(),
-        }
-    }
-}
-
-pub(crate) fn start_private_mcp_api_bridge(
-    app: tauri::AppHandle,
-    state: &LocalApiServerState,
-    allow_write: bool,
-) -> Result<PrivateMcpApiBridge, String> {
-    let token = generate_local_api_token();
-    let handle =
-        start_runtime_with_access(app, 0, token.clone(), state.write_lock.clone(), allow_write)?;
-    Ok(PrivateMcpApiBridge { handle, token })
 }
 
 #[derive(Default)]
@@ -205,30 +168,26 @@ fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[derive(Debug)]
-struct ApiRequest {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
+pub(crate) struct ApiRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: HashMap<String, String>,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
 }
 
 #[derive(Debug)]
-struct ApiResponse {
-    status: u16,
-    body: Value,
+pub(crate) struct ApiResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl ApiResponse {
-    fn ok(body: Value) -> Self {
+    pub(crate) fn ok(body: Value) -> Self {
         Self { status: 200, body }
     }
 
-    fn created(body: Value) -> Self {
-        Self { status: 201, body }
-    }
-
-    fn error(status: u16, message: impl Into<String>) -> Self {
+    pub(crate) fn error(status: u16, message: impl Into<String>) -> Self {
         Self {
             status,
             body: json!({ "error": message.into() }),
@@ -236,13 +195,13 @@ impl ApiResponse {
     }
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn generate_uuid_v4() -> String {
+pub(crate) fn generate_uuid_v4() -> String {
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -357,13 +316,30 @@ fn stop_runtime(runtime: &mut LocalApiRuntime) {
     drop(runtime.handle.take());
 }
 
+pub(crate) fn start_mcp_listener(
+    app: tauri::AppHandle,
+    state: &LocalApiServerState,
+    port: u16,
+    token: String,
+    allow_write: bool,
+) -> Result<LocalApiHandle, String> {
+    start_runtime_with_access(
+        app,
+        port,
+        token,
+        state.write_lock.clone(),
+        allow_write,
+        true,
+    )
+}
+
 fn start_runtime(
     app: tauri::AppHandle,
     port: u16,
     token: String,
     write_lock: Arc<Mutex<()>>,
 ) -> Result<LocalApiHandle, String> {
-    start_runtime_with_access(app, port, token, write_lock, true)
+    start_runtime_with_access(app, port, token, write_lock, true, false)
 }
 
 fn start_runtime_with_access(
@@ -372,10 +348,32 @@ fn start_runtime_with_access(
     token: String,
     write_lock: Arc<Mutex<()>>,
     allow_write: bool,
+    mcp: bool,
 ) -> Result<LocalApiHandle, String> {
     ensure_data_file(&app)?;
-    let listener = TcpListener::bind((LOCAL_API_HOST, port))
-        .map_err(|error| format!("Failed to start local API server on port {port}: {error}"))?;
+    start_http_listener(port, allow_write, move |access, port, request| {
+        if mcp {
+            crate::mcp_server::handle_mcp_request(&token, access, port, request, |operation| {
+                execute_operation(&app, &write_lock, access, operation)
+            })
+        } else {
+            handle_api_request(&app, &token, &write_lock, access, request)
+        }
+    })
+}
+
+pub(crate) fn start_http_listener(
+    port: u16,
+    allow_write: bool,
+    handler: impl Fn(&LocalApiAccess, u16, ApiRequest) -> ApiResponse + Send + Sync + 'static,
+) -> Result<LocalApiHandle, String> {
+    let listener = TcpListener::bind((LOCAL_API_HOST, port)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            "port_in_use".to_string()
+        } else {
+            "start_failed".to_string()
+        }
+    })?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("Failed to configure local API server: {error}"))?;
@@ -390,6 +388,7 @@ fn start_runtime_with_access(
         allow_write,
         shutdown: shutdown.clone(),
     };
+    let handler = Arc::new(handler);
     let active_connections = Arc::new(AtomicUsize::new(0));
     let join = thread::spawn(move || {
         while !thread_shutdown.load(Ordering::SeqCst) {
@@ -398,21 +397,19 @@ fn start_runtime_with_access(
                     let Some(stream) = accept_or_reject(stream, &active_connections) else {
                         continue;
                     };
-                    let app = app.clone();
-                    let token = token.clone();
-                    let write_lock = write_lock.clone();
+                    let handler = handler.clone();
                     let active_connections = active_connections.clone();
                     let access = access.clone();
                     thread::spawn(move || {
                         let _slot_guard = ConnectionSlotGuard(active_connections);
-                        handle_connection(app, token, write_lock, access, stream);
+                        handle_connection(&access, port, &*handler, stream);
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
                 }
-                Err(error) => {
-                    log::warn!("Local API accept failed: {error}");
+                Err(_) => {
+                    log::warn!("Local HTTP listener accept failed");
                     thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -570,18 +567,17 @@ fn accept_or_reject(
 }
 
 fn handle_connection(
-    app: tauri::AppHandle,
-    token: String,
-    write_lock: Arc<Mutex<()>>,
-    access: LocalApiAccess,
+    access: &LocalApiAccess,
+    port: u16,
+    handler: &impl Fn(&LocalApiAccess, u16, ApiRequest) -> ApiResponse,
     mut stream: TcpStream,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let response = match read_request(&mut stream, deadline) {
-        Ok(Some(request)) => handle_api_request(&app, &token, &write_lock, &access, request),
+        Ok(Some(request)) => handler(access, port, request),
         Ok(None) => return,
-        Err(error) => ApiResponse::error(400, error),
+        Err(_) => ApiResponse::error(400, "Invalid HTTP request"),
     };
     let _ = write_response(&mut stream, response);
 }
@@ -615,6 +611,9 @@ fn read_request(stream: &mut impl Read, deadline: Instant) -> Result<Option<ApiR
         }
     };
 
+    if header_end > REQUEST_HEADER_LIMIT_BYTES {
+        return Err("Request headers too large".into());
+    }
     let header_bytes = &buffer[..header_end];
     let header_text = std::str::from_utf8(header_bytes)
         .map_err(|_| "Invalid HTTP header encoding".to_string())?;
@@ -630,13 +629,19 @@ fn read_request(stream: &mut impl Read, deadline: Instant) -> Result<Option<ApiR
     let target = request_parts
         .next()
         .ok_or_else(|| "Missing HTTP target".to_string())?;
+    if !matches!(request_parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+        || request_parts.next().is_some()
+        || !target.starts_with('/')
+    {
+        return Err("Invalid HTTP request line".into());
+    }
     let (path, query) = parse_request_target(target);
 
     let mut content_length = 0_usize;
     let mut headers = HashMap::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
-            continue;
+            return Err("Invalid HTTP header".into());
         };
         let header_name = name.trim().to_ascii_lowercase();
         let header_value = value.trim().to_string();
@@ -646,7 +651,10 @@ fn read_request(stream: &mut impl Read, deadline: Instant) -> Result<Option<ApiR
                 .parse::<usize>()
                 .map_err(|_| "Invalid Content-Length".to_string())?;
         }
-        headers.insert(header_name, header_value);
+        if header_name == "transfer-encoding" || headers.insert(header_name, header_value).is_some()
+        {
+            return Err("Unsupported duplicate or transfer-encoded header".into());
+        }
     }
     if content_length > REQUEST_BODY_LIMIT_BYTES {
         return Err("Request body too large".to_string());
@@ -711,6 +719,10 @@ fn http_response(response: &ApiResponse) -> String {
     let status_text = match response.status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
+        406 => "Not Acceptable",
+        415 => "Unsupported Media Type",
+        503 => "Service Unavailable",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -721,7 +733,11 @@ fn http_response(response: &ApiResponse) -> String {
         500 => "Internal Server Error",
         _ => "OK",
     };
-    let body = serde_json::to_string_pretty(&response.body).unwrap_or_else(|_| "{}".to_string());
+    let body = if response.status == 202 {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(&response.body).unwrap_or_else(|_| "{}".to_string())
+    };
     format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.status,
@@ -785,19 +801,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-fn is_request_authorized(request: &ApiRequest, token: &str) -> bool {
-    let expected_digest = Sha256::digest(format!("Bearer {token}").as_bytes());
-    let actual_digest = request
-        .headers
-        .get("authorization")
-        .map(|value| Sha256::digest(value.trim().as_bytes()));
+pub(crate) fn is_request_authorized(request: &ApiRequest, token: &str) -> bool {
+    let expected_digest = Sha256::digest(token.as_bytes());
+    let actual_digest = request.headers.get("authorization").and_then(|header| {
+        let mut parts = header.split_whitespace();
+        if !parts.next()?.eq_ignore_ascii_case("Bearer") {
+            return None;
+        }
+        let credential = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Sha256::digest(credential.as_bytes()))
+    });
     match actual_digest {
         Some(actual_digest) => constant_time_eq(&actual_digest, &expected_digest),
         None => false,
     }
 }
 
-fn api_error_response(error: String) -> ApiResponse {
+pub(crate) fn api_error_response(error: String) -> ApiResponse {
+    if error == RECURRENCE_REQUIRES_APP {
+        return recurrence_completion_refusal_response();
+    }
     if matches!(
         error.as_str(),
         "Local API is read-only" | "Local API server is stopped"
@@ -824,168 +850,363 @@ fn api_error_response(error: String) -> ApiResponse {
     ApiResponse::error(500, error)
 }
 
+/// Validated transport adapters invoke these operations directly. Both endpoints
+/// retain the same storage transactions, mutation lock, and durable responses.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LocalOperation {
+    Health,
+    ListTasks(HashMap<String, String>),
+    QueryTasks(Map<String, Value>),
+    ListProjects,
+    GetProject(String),
+    CreateProject(Map<String, Value>),
+    PatchProject {
+        id: String,
+        body: Map<String, Value>,
+    },
+    ProjectLifecycle {
+        id: String,
+        restore: bool,
+    },
+    ListAreas,
+    Search(String),
+    GetTask(String),
+    CreateTask(Map<String, Value>),
+    PatchTask {
+        id: String,
+        body: Map<String, Value>,
+    },
+    DeleteTask(String),
+    TaskAction {
+        id: String,
+        action: String,
+    },
+}
+
+impl LocalOperation {
+    pub(crate) fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateProject(_)
+                | Self::PatchProject { .. }
+                | Self::ProjectLifecycle { .. }
+                | Self::CreateTask(_)
+                | Self::PatchTask { .. }
+                | Self::DeleteTask(_)
+                | Self::TaskAction { .. }
+        )
+    }
+}
+
+pub(crate) fn operation_from_api_request(
+    request: &ApiRequest,
+) -> Result<Option<LocalOperation>, String> {
+    let segments = path_segments(&request.path);
+    let id = || segments[1].clone();
+    let body = || parse_body_object(&request.body);
+    let operation = match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => LocalOperation::Health,
+        ("GET", "/tasks") => LocalOperation::ListTasks(request.query.clone()),
+        ("GET", "/projects") => LocalOperation::ListProjects,
+        ("GET", "/areas" | "/v1/areas") => LocalOperation::ListAreas,
+        ("GET", "/search") => {
+            LocalOperation::Search(request.query.get("query").cloned().unwrap_or_default())
+        }
+        ("POST", "/tasks") => LocalOperation::CreateTask(body()?),
+        ("POST", "/projects") => LocalOperation::CreateProject(body()?),
+        (method, _) if segments.len() == 2 && segments[0] == "tasks" => match method {
+            "GET" => LocalOperation::GetTask(id()),
+            "PATCH" => LocalOperation::PatchTask {
+                id: id(),
+                body: body()?,
+            },
+            "DELETE" => LocalOperation::DeleteTask(id()),
+            _ => return Ok(None),
+        },
+        (method, _) if segments.len() == 2 && segments[0] == "projects" => match method {
+            "GET" => LocalOperation::GetProject(id()),
+            "PATCH" => LocalOperation::PatchProject {
+                id: id(),
+                body: body()?,
+            },
+            "DELETE" => LocalOperation::ProjectLifecycle {
+                id: id(),
+                restore: false,
+            },
+            _ => return Ok(None),
+        },
+        ("POST", _)
+            if segments.len() == 3
+                && segments[0] == "tasks"
+                && matches!(segments[2].as_str(), "complete" | "archive" | "restore") =>
+        {
+            LocalOperation::TaskAction {
+                id: id(),
+                action: segments[2].clone(),
+            }
+        }
+        ("POST", _)
+            if segments.len() == 3 && segments[0] == "projects" && segments[2] == "restore" =>
+        {
+            LocalOperation::ProjectLifecycle {
+                id: id(),
+                restore: true,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(operation))
+}
+
 fn route_api_request(
     app: &tauri::AppHandle,
     write_lock: &Arc<Mutex<()>>,
     access: &LocalApiAccess,
     request: ApiRequest,
 ) -> Result<ApiResponse, String> {
-    let segments = path_segments(&request.path);
+    let Some(operation) = operation_from_api_request(&request)? else {
+        return Ok(ApiResponse::error(404, "Not found"));
+    };
+    let created = matches!(
+        operation,
+        LocalOperation::CreateTask(_) | LocalOperation::CreateProject(_)
+    );
+    let deleted = matches!(
+        operation,
+        LocalOperation::DeleteTask(_) | LocalOperation::ProjectLifecycle { restore: false, .. }
+    );
+    let body = execute_operation(app, write_lock, access, operation)?;
+    Ok(ApiResponse {
+        status: if created { 201 } else { 200 },
+        body: if deleted { json!({ "ok": true }) } else { body },
+    })
+}
 
-    if request.method == "GET" && request.path == "/health" {
-        return Ok(ApiResponse::ok(json!({ "ok": true })));
+pub(crate) fn execute_operation(
+    app: &tauri::AppHandle,
+    write_lock: &Arc<Mutex<()>>,
+    access: &LocalApiAccess,
+    operation: LocalOperation,
+) -> Result<Value, String> {
+    access.ensure_active()?;
+    if operation.writes() {
+        access.ensure_write()?;
     }
-
-    if request.method == "GET" && request.path == "/tasks" {
-        let data = load_data_snapshot(app)?;
-        let tasks = filter_tasks(array_items(&data, "tasks"), &request.query)?;
-        return Ok(ApiResponse::ok(json!({ "tasks": tasks })));
-    }
-
-    if request.method == "GET" && request.path == "/projects" {
-        let data = load_data_snapshot(app)?;
-        let projects = array_items(&data, "projects")
-            .into_iter()
-            .filter(|project| !has_string_field(project, "deletedAt"))
-            .collect::<Vec<_>>();
-        return Ok(ApiResponse::ok(json!({ "projects": projects })));
-    }
-
-    if request.method == "POST" && request.path == "/projects" {
-        let _guard = access.lock_write(write_lock)?;
-        let body = parse_body_object(&request.body)?;
-        let target_area_id = body
-            .get("props")
-            .and_then(Value::as_object)
-            .and_then(|props| props.get("areaId"))
-            .and_then(Value::as_str);
-        let scope = ProjectMutationReadScope::create(target_area_id);
-        let (project_id, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
-            let project = create_project_from_body(&body, data)?;
-            let project_id = project
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "Project id is required".to_string())?
-                .to_string();
-            let project = Value::Object(project);
-            ensure_array_mut(data, "projects")?.push(project.clone());
-            Ok((
-                project_id,
-                ProjectMutationRows {
-                    projects: vec![project],
-                    ..ProjectMutationRows::default()
-                },
-            ))
-        })?;
-        log::info!(
+    match operation {
+        LocalOperation::Health => {
+            return Ok(json!({ "ok": true }));
+        }
+        LocalOperation::ListTasks(query) => {
+            let data = load_data_snapshot(app)?;
+            let tasks = filter_tasks(array_items(&data, "tasks"), &query)?;
+            return Ok(json!({ "tasks": tasks }));
+        }
+        LocalOperation::ListProjects => {
+            let data = load_data_snapshot(app)?;
+            let projects = array_items(&data, "projects")
+                .into_iter()
+                .filter(|project| !has_string_field(project, "deletedAt"))
+                .collect::<Vec<_>>();
+            return Ok(json!({ "projects": projects }));
+        }
+        LocalOperation::CreateProject(body) => {
+            let _guard = access.lock_write(write_lock)?;
+            let target_area_id = body
+                .get("props")
+                .and_then(Value::as_object)
+                .and_then(|props| props.get("areaId"))
+                .and_then(Value::as_str);
+            let scope = ProjectMutationReadScope::create(target_area_id);
+            let (project_id, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
+                let project = create_project_from_body(&body, data)?;
+                let project_id = project
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Project id is required".to_string())?
+                    .to_string();
+                let project = Value::Object(project);
+                ensure_array_mut(data, "projects")?.push(project.clone());
+                Ok((
+                    project_id,
+                    ProjectMutationRows {
+                        projects: vec![project],
+                        ..ProjectMutationRows::default()
+                    },
+                ))
+            })?;
+            log::info!(
             "Desktop Local API project write persisted extra.releaseCheck=v1.3.1/local-api-project-write"
         );
-        return Ok(ApiResponse::created(
-            json!({ "project": persisted_project(&persisted, &project_id)? }),
-        ));
-    }
-
-    if segments.len() == 2 && segments[0] == "projects" && request.method == "GET" {
-        let data = load_data_snapshot(app)?;
-        let project =
-            find_project(&data, &segments[1]).ok_or_else(|| "Project not found".to_string())?;
-        return Ok(ApiResponse::ok(json!({ "project": project })));
-    }
-
-    let delete_project =
-        segments.len() == 2 && segments[0] == "projects" && request.method == "DELETE";
-    let restore_project = segments.len() == 3
-        && segments[0] == "projects"
-        && segments[2] == "restore"
-        && request.method == "POST";
-    if delete_project || restore_project {
-        let _guard = access.lock_write(write_lock)?;
-        let scope = ProjectMutationReadScope::lifecycle(&segments[1]);
-        let (changed, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
-            let rows = apply_project_delete_or_restore(data, &segments[1], restore_project)?;
-            Ok((!rows.projects.is_empty(), rows))
-        })?;
-        let operation = if restore_project { "restore" } else { "delete" };
-        let outcome = if changed { "persisted" } else { "unchanged" };
-        log::info!(
+            return Ok(json!({ "project": persisted_project(&persisted, &project_id)? }));
+        }
+        LocalOperation::GetProject(id) => {
+            let data = load_data_snapshot(app)?;
+            let project =
+                find_project(&data, &id).ok_or_else(|| "Project not found".to_string())?;
+            return Ok(json!({ "project": project }));
+        }
+        LocalOperation::ProjectLifecycle {
+            id,
+            restore: restore_project,
+        } => {
+            let _guard = access.lock_write(write_lock)?;
+            let scope = ProjectMutationReadScope::lifecycle(&id);
+            let (changed, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
+                let rows = apply_project_delete_or_restore(data, &id, restore_project)?;
+                Ok((!rows.projects.is_empty(), rows))
+            })?;
+            let operation = if restore_project { "restore" } else { "delete" };
+            let outcome = if changed { "persisted" } else { "unchanged" };
+            log::info!(
             "Desktop Local API project lifecycle completed extra.releaseCheck=v1.3.1/local-api-project-lifecycle operation={operation} outcome={outcome}"
         );
-        return Ok(ApiResponse::ok(if restore_project {
-            json!({ "project": persisted_project(&persisted, &segments[1])? })
-        } else {
-            json!({ "ok": true })
-        }));
-    }
-
-    if segments.len() == 2 && segments[0] == "projects" && request.method == "PATCH" {
-        let _guard = access.lock_write(write_lock)?;
-        let body = parse_body_object(&request.body)?;
-        let scope = ProjectMutationReadScope::patch(
-            &segments[1],
-            body.get("areaId").and_then(Value::as_str),
-            body.contains_key("areaId"),
-            body.contains_key("status"),
-        );
-        let (_, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
-            let (project, tasks, sections) = patch_project_in_data(data, &segments[1], &body)?;
-            Ok((
-                (),
-                ProjectMutationRows {
-                    projects: vec![project],
-                    tasks,
-                    sections,
-                },
-            ))
-        })?;
-        log::info!(
+            return Ok(json!({ "project": persisted_project(&persisted, &id)? }));
+        }
+        LocalOperation::PatchProject { id, body } => {
+            let _guard = access.lock_write(write_lock)?;
+            let scope = ProjectMutationReadScope::patch(
+                &id,
+                body.get("areaId").and_then(Value::as_str),
+                body.contains_key("areaId"),
+                body.contains_key("status"),
+            );
+            let (_, persisted) = mutate_project_rows_with_retries(app, scope, |data| {
+                let (project, tasks, sections) = patch_project_in_data(data, &id, &body)?;
+                Ok((
+                    (),
+                    ProjectMutationRows {
+                        projects: vec![project],
+                        tasks,
+                        sections,
+                    },
+                ))
+            })?;
+            log::info!(
             "Desktop Local API project write persisted extra.releaseCheck=v1.3.1/local-api-project-write"
         );
-        return Ok(ApiResponse::ok(
-            json!({ "project": persisted_project(&persisted, &segments[1])? }),
-        ));
+            return Ok(json!({ "project": persisted_project(&persisted, &id)? }));
+        }
+        LocalOperation::ListAreas => {
+            let data = load_data_snapshot(app)?;
+            let areas = array_items(&data, "areas")
+                .into_iter()
+                .filter(|area| !has_string_field(area, "deletedAt"))
+                .collect::<Vec<_>>();
+            return Ok(json!({ "areas": areas }));
+        }
+        LocalOperation::Search(query) => {
+            let data = load_data_snapshot(app)?;
+            return Ok(search_data(&data, &query));
+        }
+        LocalOperation::GetTask(id) => {
+            let data = load_data_snapshot(app)?;
+            let task = find_task(&data, &id).ok_or_else(|| "Task not found".to_string())?;
+            return Ok(json!({ "task": task }));
+        }
+        LocalOperation::CreateTask(body) => {
+            let _guard = access.lock_write(write_lock)?;
+            let props = body.get("props").and_then(Value::as_object);
+            let scope = TaskMutationReadScope::create(
+                props
+                    .and_then(|props| props.get("projectId"))
+                    .and_then(Value::as_str),
+                props
+                    .and_then(|props| props.get("sectionId"))
+                    .and_then(Value::as_str),
+                props
+                    .and_then(|props| props.get("areaId"))
+                    .and_then(Value::as_str),
+                props
+                    .and_then(|props| props.get("isFocusedToday"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
+            );
+            let operation = LocalOperation::CreateTask(body);
+            let (task_id, persisted) = mutate_task_rows_with_retries(app, scope, |data| {
+                mutate_task_operation(data, &operation)
+            })?;
+            let task = persisted_task(&persisted, &task_id)?;
+            let now = OffsetDateTime::now_utc();
+            if task.get("isFocusedToday").and_then(Value::as_bool) == Some(true)
+                && task
+                    .as_object()
+                    .is_some_and(|task| local_api_task_is_future_start(task, now))
+            {
+                let count = local_api_focused_task_count(&persisted, now);
+                log::info!(
+                "Desktop Local API scheduled Focus queued extra.releaseCheck=v1.3.3/local-api-scheduled-focus operation=create outcome=queued count={count}"
+            );
+            }
+            return Ok(json!({ "task": task }));
+        }
+        LocalOperation::PatchTask { id, body } => {
+            let _guard = access.lock_write(write_lock)?;
+            let is_triage = body.contains_key("status");
+            let scope = TaskMutationReadScope::patch(
+                &id,
+                body.get("projectId").and_then(Value::as_str),
+                body.get("sectionId").and_then(Value::as_str),
+                body.get("areaId").and_then(Value::as_str),
+            );
+            let operation = LocalOperation::PatchTask {
+                id: id.clone(),
+                body,
+            };
+            let (_, persisted) = mutate_task_rows_with_retries(app, scope, |data| {
+                mutate_task_operation(data, &operation)
+            })?;
+            if is_triage {
+                log::info!(
+                "Desktop Local API task triage persisted extra.releaseCheck=v1.3.1/local-api-task-triage"
+            );
+            }
+            return Ok(json!({ "task": persisted_task(&persisted, &id)? }));
+        }
+        LocalOperation::DeleteTask(id) => {
+            let _guard = access.lock_write(write_lock)?;
+            let scope = TaskMutationReadScope::existing(&id, false);
+            let operation = LocalOperation::DeleteTask(id.clone());
+            let (_, persisted) = mutate_task_rows_with_retries(app, scope, |data| {
+                mutate_task_operation(data, &operation)
+            })?;
+            return Ok(json!({ "task": persisted_task(&persisted, &id)? }));
+        }
+        LocalOperation::TaskAction { id, action } => {
+            let action = action.as_str();
+            if !matches!(action, "complete" | "archive" | "restore") {
+                return Err("Unsupported task action".into());
+            }
+            let _guard = access.lock_write(write_lock)?;
+            let scope = TaskMutationReadScope::existing(&id, action == "restore");
+            let operation = LocalOperation::TaskAction {
+                id: id.clone(),
+                action: action.into(),
+            };
+            let mutation = mutate_task_rows_with_retries(app, scope, |data| {
+                mutate_task_operation(data, &operation)
+            });
+            let (_, persisted) = match mutation {
+                Ok(result) => result,
+                Err(error) if error == RECURRENCE_REQUIRES_APP => {
+                    return Err(RECURRENCE_REQUIRES_APP.to_string());
+                }
+                Err(error) => return Err(error),
+            };
+            return Ok(json!({ "task": persisted_task(&persisted, &id)? }));
+        }
+        LocalOperation::QueryTasks(input) => {
+            let data = load_data_snapshot(app)?;
+            Ok(json!({ "tasks": crate::local_query::query_tasks(&data, &input)? }))
+        }
     }
+}
 
-    if request.method == "GET" && (request.path == "/areas" || request.path == "/v1/areas") {
-        let data = load_data_snapshot(app)?;
-        let areas = array_items(&data, "areas")
-            .into_iter()
-            .filter(|area| !has_string_field(area, "deletedAt"))
-            .collect::<Vec<_>>();
-        return Ok(ApiResponse::ok(json!({ "areas": areas })));
-    }
-
-    if request.method == "GET" && request.path == "/search" {
-        let data = load_data_snapshot(app)?;
-        let query = request.query.get("query").cloned().unwrap_or_default();
-        return Ok(ApiResponse::ok(search_data(&data, &query)));
-    }
-
-    if segments.len() == 2 && segments[0] == "tasks" && request.method == "GET" {
-        let data = load_data_snapshot(app)?;
-        let task = find_task(&data, &segments[1]).ok_or_else(|| "Task not found".to_string())?;
-        return Ok(ApiResponse::ok(json!({ "task": task })));
-    }
-
-    if request.method == "POST" && request.path == "/tasks" {
-        let _guard = access.lock_write(write_lock)?;
-        let body = parse_body_object(&request.body)?;
-        let props = body.get("props").and_then(Value::as_object);
-        let scope = TaskMutationReadScope::create(
-            props
-                .and_then(|props| props.get("projectId"))
-                .and_then(Value::as_str),
-            props
-                .and_then(|props| props.get("sectionId"))
-                .and_then(Value::as_str),
-            props
-                .and_then(|props| props.get("areaId"))
-                .and_then(Value::as_str),
-            props
-                .and_then(|props| props.get("isFocusedToday"))
-                .and_then(Value::as_bool)
-                == Some(true),
-        );
-        let (task_id, persisted) = mutate_task_rows_with_retries(app, scope, |data| {
+fn mutate_task_operation(
+    data: &mut Value,
+    operation: &LocalOperation,
+) -> Result<(String, Vec<Value>), String> {
+    match operation {
+        LocalOperation::CreateTask(body) => {
             let task = create_task_from_body(&body, &device_id_from_data(data), data)?;
             let task_id = task
                 .get("id")
@@ -995,72 +1216,25 @@ fn route_api_request(
             let task = Value::Object(task);
             ensure_array_mut(data, "tasks")?.push(task.clone());
             Ok((task_id, vec![task]))
-        })?;
-        let task = persisted_task(&persisted, &task_id)?;
-        let now = OffsetDateTime::now_utc();
-        if task.get("isFocusedToday").and_then(Value::as_bool) == Some(true)
-            && task
-                .as_object()
-                .is_some_and(|task| local_api_task_is_future_start(task, now))
-        {
-            let count = local_api_focused_task_count(&persisted, now);
-            log::info!(
-                "Desktop Local API scheduled Focus queued extra.releaseCheck=v1.3.3/local-api-scheduled-focus operation=create outcome=queued count={count}"
-            );
         }
-        return Ok(ApiResponse::created(json!({ "task": task })));
-    }
-
-    if segments.len() == 2 && segments[0] == "tasks" && request.method == "PATCH" {
-        let _guard = access.lock_write(write_lock)?;
-        let body = parse_body_object(&request.body)?;
-        let is_triage = body.contains_key("status");
-        let scope = TaskMutationReadScope::patch(
-            &segments[1],
-            body.get("projectId").and_then(Value::as_str),
-            body.get("sectionId").and_then(Value::as_str),
-            body.get("areaId").and_then(Value::as_str),
-        );
-        let (_, persisted) = mutate_task_rows_with_retries(app, scope, |data| {
-            let task = patch_task_in_data(data, &segments[1], &body)?;
-            Ok(((), vec![task]))
-        })?;
-        if is_triage {
-            log::info!(
-                "Desktop Local API task triage persisted extra.releaseCheck=v1.3.1/local-api-task-triage"
-            );
+        LocalOperation::PatchTask { id, body } => {
+            let task = patch_task_in_data(data, &id, &body)?;
+            Ok((id.clone(), vec![task]))
         }
-        return Ok(ApiResponse::ok(
-            json!({ "task": persisted_task(&persisted, &segments[1])? }),
-        ));
-    }
-
-    if segments.len() == 2 && segments[0] == "tasks" && request.method == "DELETE" {
-        let _guard = access.lock_write(write_lock)?;
-        let scope = TaskMutationReadScope::existing(&segments[1], false);
-        mutate_task_rows_with_retries(app, scope, |data| {
+        LocalOperation::DeleteTask(id) => {
             let device_id = device_id_from_data(data);
-            let task = update_task_in_data(data, &segments[1], |task| {
+            let task = update_task_in_data(data, &id, |task| {
                 let now = now_iso();
                 task.insert("deletedAt".to_string(), Value::String(now.clone()));
                 task.insert("updatedAt".to_string(), Value::String(now));
                 bump_task_revision(task, &device_id);
                 Ok(())
             })?;
-            Ok(((), vec![task]))
-        })?;
-        return Ok(ApiResponse::ok(json!({ "ok": true })));
-    }
-
-    if segments.len() == 3 && segments[0] == "tasks" && request.method == "POST" {
-        let action = segments[2].as_str();
-        if !matches!(action, "complete" | "archive" | "restore") {
-            return Ok(ApiResponse::error(404, "Not found"));
+            Ok((id.clone(), vec![task]))
         }
-        let _guard = access.lock_write(write_lock)?;
-        let scope = TaskMutationReadScope::existing(&segments[1], action == "restore");
-        let mutation = mutate_task_rows_with_retries(app, scope, |data| {
-            if action == "complete" && recurrence_completion_refusal(data, &segments[1]).is_some() {
+        LocalOperation::TaskAction { id, action } => {
+            let action = action.as_str();
+            if action == "complete" && recurrence_completion_refusal(data, &id).is_some() {
                 return Err(RECURRENCE_REQUIRES_APP.to_string());
             }
             let device_id = device_id_from_data(data);
@@ -1071,7 +1245,7 @@ fn route_api_request(
             };
             let now = now_iso();
             let mut recurring_follow_up: Option<Map<String, Value>> = None;
-            let task = update_task_in_data(data, &segments[1], |task| {
+            let task = update_task_in_data(data, &id, |task| {
                 let previous_status = task
                     .get("status")
                     .and_then(|value| value.as_str())
@@ -1093,21 +1267,10 @@ fn route_api_request(
                 ensure_array_mut(data, "tasks")?.push(next_task.clone());
                 changed_tasks.push(next_task);
             }
-            Ok(((), changed_tasks))
-        });
-        let (_, persisted) = match mutation {
-            Ok(result) => result,
-            Err(error) if error == RECURRENCE_REQUIRES_APP => {
-                return Ok(recurrence_completion_refusal_response());
-            }
-            Err(error) => return Err(error),
-        };
-        return Ok(ApiResponse::ok(
-            json!({ "task": persisted_task(&persisted, &segments[1])? }),
-        ));
+            Ok((id.clone(), changed_tasks))
+        }
+        _ => Err("Unsupported task mutation".into()),
     }
-
-    Ok(ApiResponse::error(404, "Not found"))
 }
 
 fn path_segments(path: &str) -> Vec<String> {
@@ -1295,7 +1458,7 @@ fn live_project_area<'a>(data: &'a Value, area_id: &str) -> Option<&'a Value> {
     })
 }
 
-fn sanitize_project_fields(
+pub(crate) fn sanitize_project_fields(
     fields: &Map<String, Value>,
     allow_title: bool,
 ) -> Result<Map<String, Value>, String> {
@@ -3887,7 +4050,7 @@ fn normalize_task_triage_patch(
     }
 }
 
-fn sanitize_task_patch_map(patch: &mut Map<String, Value>) -> Result<(), String> {
+pub(crate) fn sanitize_task_patch_map(patch: &mut Map<String, Value>) -> Result<(), String> {
     for key in ["tags", "contexts"] {
         if let Some(items) = patch.get_mut(key).and_then(Value::as_array_mut) {
             for item in items {
@@ -4144,7 +4307,7 @@ fn compute_relative_start_time(due_date: &str, offset: &Value) -> Option<String>
     ))
 }
 
-fn valid_iso_date_like(value: &str) -> bool {
+pub(crate) fn valid_iso_date_like(value: &str) -> bool {
     valid_iso_date(value) || valid_iso_datetime(value, true)
 }
 
@@ -4226,6 +4389,49 @@ struct RecurrenceSchedule {
     week_start: Option<String>,
     count: Option<i64>,
     until: Option<String>,
+}
+
+pub(crate) fn normalize_mcp_recurrence(value: &Value) -> Result<Value, String> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let result = if let Some(rrule) = value.as_str() {
+        let parsed = parse_supported_rrule(rrule).ok_or("Invalid task recurrence")?;
+        let mut recurrence = json!({"rule": parsed.rule, "rrule":rrule.trim()})
+            .as_object()
+            .unwrap()
+            .clone();
+        if !parsed.by_day.is_empty() {
+            recurrence.insert("byDay".into(), json!(parsed.by_day));
+        }
+        if !parsed.by_month_day.is_empty() {
+            recurrence.insert("byMonthDay".into(), json!(parsed.by_month_day));
+        }
+        if let Some(value) = parsed.week_start {
+            recurrence.insert("weekStart".into(), json!(value));
+        }
+        if let Some(value) = parsed.count {
+            recurrence.insert("count".into(), json!(value));
+        }
+        if let Some(value) = parsed.until {
+            recurrence.insert("until".into(), json!(value));
+        }
+        if let Some(series) = rrule.split(';').find_map(|token| {
+            token
+                .split_once('=')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("X-MINDWTR-SERIES-ID"))
+                .map(|(_, value)| value)
+        }) {
+            recurrence.insert("seriesId".into(), json!(series));
+        }
+        Value::Object(recurrence)
+    } else {
+        value.clone()
+    };
+    if !result.is_object() || !valid_recurrence(&result) {
+        return Err("Invalid task recurrence".into());
+    }
+    Ok(result)
 }
 
 fn valid_recurrence(value: &Value) -> bool {
@@ -4643,7 +4849,7 @@ fn validate_task_status(status: &str) -> Result<(), String> {
     }
 }
 
-fn percent_decode(raw: &str) -> Option<String> {
+pub(crate) fn percent_decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -4678,7 +4884,167 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_mcp_bridge_auth_and_read_only_block_mutations_before_storage() {
+    fn mcp_shared_http_parser_preserves_http_10_and_rejects_malformed_versions() {
+        for version in ["HTTP/1.0", "HTTP/1.1"] {
+            let raw = format!("GET /tasks {version}\r\nHost: 127.0.0.1:3456\r\n\r\n");
+            let request = read_request(&mut std::io::Cursor::new(raw), far_future_deadline())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                operation_from_api_request(&request).unwrap(),
+                Some(LocalOperation::ListTasks(_))
+            ));
+        }
+        for version in ["HTTP/1", "HTTP/1.2", "HTTP/2", "http/1.1", "HTTP/1.1 extra"] {
+            let raw = format!("GET /tasks {version}\r\n\r\n");
+            assert!(
+                read_request(&mut std::io::Cursor::new(raw), far_future_deadline()).is_err(),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_shared_bearer_auth_accepts_case_insensitive_scheme_and_exact_credential() {
+        let mut request = ApiRequest {
+            method: "GET".into(),
+            path: "/tasks".into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        for authorization in [
+            "Bearer CaseSensitiveToken",
+            "bearer CaseSensitiveToken",
+            "bEaReR\tCaseSensitiveToken",
+        ] {
+            request
+                .headers
+                .insert("authorization".into(), authorization.into());
+            assert!(is_request_authorized(&request, "CaseSensitiveToken"));
+        }
+        for authorization in [
+            "bearer casesensitivetoken",
+            "Bearer",
+            "Basic CaseSensitiveToken",
+            "Bearer CaseSensitiveToken extra",
+        ] {
+            request
+                .headers
+                .insert("authorization".into(), authorization.into());
+            assert!(!is_request_authorized(&request, "CaseSensitiveToken"));
+        }
+    }
+
+    #[test]
+    fn mcp_shared_rest_mutations_persist_through_existing_sqlite_transactions() {
+        use crate::storage::{
+            local_operation_test_commit, local_operation_test_seed, read_sqlite_data,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-native-operations.sqlite");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        local_operation_test_seed(&mut conn, &empty_local_api_data()).unwrap();
+        let input = json!({"title":"Shared task","status":"next","tags":["#fixture"]});
+        let request = ApiRequest {
+            method: "POST".into(),
+            path: "/tasks".into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(
+                &json!({"title":"Shared task","props":{"status":"next","tags":["#fixture"]}}),
+            )
+            .unwrap(),
+        };
+        let rest = operation_from_api_request(&request).unwrap().unwrap();
+        let mcp =
+            crate::mcp_tools::operation("mindwtr_add_task", input.as_object().unwrap()).unwrap();
+        assert_eq!(rest, mcp, "both adapters select the same native operation");
+        let persisted = local_operation_test_commit(
+            &conn,
+            TaskMutationReadScope::create(None, None, None, false),
+            |data| mutate_task_operation(data, &mcp),
+        )
+        .unwrap();
+        let id = persisted["tasks"][0]["id"].as_str().unwrap().to_string();
+        drop(conn);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let reopened = read_sqlite_data(&conn).unwrap();
+        assert_eq!(find_task(&reopened, &id).unwrap()["title"], "Shared task");
+        assert_eq!(find_task(&reopened, &id).unwrap()["rev"], 1);
+        // Another writer changes the row between requests; the common transaction
+        // reloads it before the next REST/MCP patch and preserves that edit.
+        let intervening = LocalOperation::PatchTask {
+            id: id.clone(),
+            body: json!({"description":"Intervening edit"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        local_operation_test_commit(
+            &conn,
+            TaskMutationReadScope::patch(&id, None, None, None),
+            |data| mutate_task_operation(data, &intervening),
+        )
+        .unwrap();
+        let patch = json!({"id":id,"status":"waiting","tags":null});
+        let mcp =
+            crate::mcp_tools::operation("mindwtr_update_task", patch.as_object().unwrap()).unwrap();
+        let request = ApiRequest {
+            method: "PATCH".into(),
+            path: format!("/tasks/{id}"),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&json!({"status":"waiting","tags":[]})).unwrap(),
+        };
+        let rest = operation_from_api_request(&request).unwrap().unwrap();
+        assert_eq!(rest, mcp);
+        local_operation_test_commit(
+            &conn,
+            TaskMutationReadScope::patch(&id, None, None, None),
+            |data| mutate_task_operation(data, &rest),
+        )
+        .unwrap();
+        drop(conn);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let task = find_task(&read_sqlite_data(&conn).unwrap(), &id).unwrap();
+        assert_eq!(task["rev"], 3);
+        assert_eq!(task["description"], "Intervening edit");
+        assert_eq!(task["status"], "waiting");
+        assert_eq!(task["tags"], json!([]));
+        let complete = crate::mcp_tools::operation(
+            "mindwtr_complete_task",
+            json!({"id":id}).as_object().unwrap(),
+        )
+        .unwrap();
+        local_operation_test_commit(&conn, TaskMutationReadScope::existing(&id, false), |data| {
+            mutate_task_operation(data, &complete)
+        })
+        .unwrap();
+        drop(conn);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let task = find_task(&read_sqlite_data(&conn).unwrap(), &id).unwrap();
+        assert_eq!(task["status"], "done");
+        assert_eq!(task["rev"], 4);
+        let invalid = LocalOperation::PatchTask {
+            id: id.clone(),
+            body: json!({"status":"next"}).as_object().unwrap().clone(),
+        };
+        assert!(local_operation_test_commit(
+            &conn,
+            TaskMutationReadScope::patch(&id, None, None, None),
+            |data| mutate_task_operation(data, &invalid)
+        )
+        .is_err());
+        assert_eq!(
+            find_task(&read_sqlite_data(&conn).unwrap(), &id).unwrap(),
+            task,
+            "failed operation rolls back atomically"
+        );
+    }
+
+    #[test]
+    fn local_operation_auth_and_read_only_block_mutations_before_storage() {
         let access = LocalApiAccess {
             allow_write: false,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -4720,7 +5086,7 @@ mod tests {
     }
 
     #[test]
-    fn private_mcp_bridge_revokes_a_write_waiting_for_the_shared_lock() {
+    fn mcp_shared_operation_revokes_a_write_waiting_for_the_shared_lock() {
         let write_lock = Arc::new(Mutex::new(()));
         let access = LocalApiAccess {
             allow_write: true,

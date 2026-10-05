@@ -17,11 +17,8 @@
   "scripts": {
     "dev": "bunx tauri dev",
     "dev:vite": "vite",
-    "dev:native": "bun run build:mcp && bun run dev:vite",
     "build": "bunx tauri build",
     "build:vite": "tsc && vite build",
-    "build:mcp": "bun ../../scripts/build-mcp-sidecar.mjs",
-    "build:native": "bun run build:mcp && bun run build:vite",
     "lint": "../../node_modules/.bin/eslint . --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
     "test": "vitest run",

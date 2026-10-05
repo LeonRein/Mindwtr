@@ -158,59 +158,6 @@ describe('SettingsMcpSection', () => {
         expect(vi.getTimerCount()).toBe(0);
     });
 
-    it('explains unsupported macOS and blocks enabling without a Retry control', async () => {
-        mocks.get.mockResolvedValue({ ...off, error: 'unsupported_os' });
-        const view = openSection();
-        await waitFor(() => expect(view.getByRole('alert')).toHaveTextContent('Built-in MCP requires macOS 13 or later.'));
-        expect(view.getByRole('switch', { name: en['settings.mcpEnable'] })).toBeDisabled();
-        fireEvent.click(view.getByRole('switch', { name: en['settings.mcpEnable'] }));
-        expect(mocks.set).not.toHaveBeenCalled();
-        expect(view.queryByRole('button', { name: en['common.retry'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('switch', { name: en['settings.mcpAllowWrite'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpCopy'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpRotate'] })).not.toBeInTheDocument();
-    });
-
-    it('allows a persisted unsupported feature to be turned off while hiding writes and credentials', async () => {
-        vi.useFakeTimers();
-        mocks.get.mockResolvedValue({ ...running, running: false, allowWrite: true, error: 'unsupported_os' });
-        mocks.set.mockResolvedValue({ ...off, allowWrite: true, error: 'unsupported_os' });
-        const view = openSection();
-        await act(async () => { await Promise.resolve(); });
-        const toggle = view.getByRole('switch', { name: en['settings.mcpEnable'] });
-        expect(toggle).toBeEnabled();
-        expect(toggle).toHaveAttribute('aria-checked', 'true');
-        expect(view.queryByRole('button', { name: en['common.retry'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('switch', { name: en['settings.mcpAllowWrite'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpCopy'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpRotate'] })).not.toBeInTheDocument();
-        expect(view.container).not.toHaveTextContent(running.url!);
-        expect(view.container).not.toHaveTextContent(running.token!);
-        await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
-        expect(mocks.get).toHaveBeenCalledTimes(1);
-        fireEvent.click(toggle);
-        await act(async () => { await Promise.resolve(); });
-        expect(mocks.set).toHaveBeenCalledExactlyOnceWith({ enabled: false, allowWrite: true });
-        expect(toggle).toHaveAttribute('aria-checked', 'false');
-        expect(toggle).toBeDisabled();
-        expect(vi.getTimerCount()).toBe(0);
-    });
-
-    it('keeps unsupported controls hidden if turning off fails', async () => {
-        mocks.get.mockResolvedValue({ ...running, running: false, allowWrite: true, error: 'unsupported_os' });
-        mocks.set.mockRejectedValue(new Error('private native error'));
-        const view = openSection();
-        await waitFor(() => expect(view.getByRole('switch', { name: en['settings.mcpEnable'] })).toBeEnabled());
-        fireEvent.click(view.getByRole('switch', { name: en['settings.mcpEnable'] }));
-        await waitFor(() => expect(view.getByRole('alert')).toHaveTextContent(en['settings.mcpError.config_failed']));
-        expect(view.getByText(en['settings.mcpError.unsupported_os'])).toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['common.retry'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('switch', { name: en['settings.mcpAllowWrite'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpCopy'] })).not.toBeInTheDocument();
-        expect(view.queryByRole('button', { name: en['settings.mcpRotate'] })).not.toBeInTheDocument();
-        expect(view.container).not.toHaveTextContent('private native error');
-    });
-
     it('ignores an old poll response after rotation and cleans up while enabled', async () => {
         vi.useFakeTimers();
         mocks.get.mockResolvedValue(running);

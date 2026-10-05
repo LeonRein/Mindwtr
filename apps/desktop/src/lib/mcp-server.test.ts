@@ -41,11 +41,6 @@ describe('managed MCP adapter', () => {
         expect((await getMcpServerStatus()).error).toBe('config_failed');
     });
 
-    it('preserves the fixed unsupported OS error', async () => {
-        mocks.native.mockResolvedValue({ ...status, running: false, error: 'unsupported_os' });
-        expect((await getMcpServerStatus()).error).toBe('unsupported_os');
-    });
-
     it('copies URL and bearer configuration only for a running loopback server', () => {
         const details = getMcpConnectionDetails(status);
         expect(JSON.parse(details!)).toEqual({
@@ -54,6 +49,5 @@ describe('managed MCP adapter', () => {
         for (const patch of [
             { enabled: false }, { running: false }, { token: null }, { url: 'http://external.example/mcp' },
         ]) expect(getMcpConnectionDetails({ ...status, ...patch })).toBeNull();
-        expect(getMcpConnectionDetails({ ...status, error: 'unsupported_os' })).toBeNull();
     });
 });

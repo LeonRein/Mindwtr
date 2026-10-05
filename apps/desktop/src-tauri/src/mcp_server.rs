@@ -1,28 +1,22 @@
-//! Device-local, opt-in lifecycle for the bundled MCP helper. The helper only
-//! reaches the existing native write path through a private Local API bridge.
+//! Opt-in in-process MCP. REST and MCP invoke the same native operations.
 use crate::config::read_config_verified;
-use crate::local_api::{start_private_mcp_api_bridge, LocalApiServerState, PrivateMcpApiBridge};
+use crate::local_api::{
+    self, ApiRequest, ApiResponse, LocalApiAccess, LocalApiHandle, LocalApiServerState,
+    LocalOperation,
+};
 use crate::{
     get_config_path, get_secrets_path, lock_config_read_modify_write, write_config_files,
     AppConfigToml,
 };
 use rand::RngCore;
 use serde::Serialize;
-use std::io::Read;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
 
-const MCP_HOST: &str = "127.0.0.1";
 const MCP_PORT: u16 = 8722;
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const STOP_GRACE: Duration = Duration::from_millis(200);
-const REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const STDERR_LINE_LIMIT: usize = 4096;
+const PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct McpConfig {
@@ -33,80 +27,21 @@ struct McpConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum McpError {
-    HelperMissing,
     PortInUse,
     StartFailed,
     Exited,
     ConfigFailed,
-    #[cfg(any(target_os = "macos", test))]
-    UnsupportedOs,
 }
 
 impl McpError {
     fn code(self) -> &'static str {
         match self {
-            Self::HelperMissing => "helper_missing",
             Self::PortInUse => "port_in_use",
             Self::StartFailed => "start_failed",
             Self::Exited => "exited",
             Self::ConfigFailed => "config_failed",
-            #[cfg(any(target_os = "macos", test))]
-            Self::UnsupportedOs => "unsupported_os",
         }
     }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_mcp_support(version: Option<&str>) -> Result<(), McpError> {
-    let version = version.ok_or(McpError::UnsupportedOs)?.trim();
-    let components = version.split('.').collect::<Vec<_>>();
-    if components.is_empty()
-        || components.len() > 3
-        || components.iter().any(|part| {
-            part.is_empty()
-                || !part.bytes().all(|byte| byte.is_ascii_digit())
-                || part.parse::<u32>().is_err()
-        })
-    {
-        return Err(McpError::UnsupportedOs);
-    }
-    if components[0]
-        .parse::<u32>()
-        .map_err(|_| McpError::UnsupportedOs)?
-        < 13
-    {
-        return Err(McpError::UnsupportedOs);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn platform_support() -> Result<(), McpError> {
-    // This guard is specific to the Bun helper; keep the host app's older OS
-    // support intact. A fixed-size sysctl read avoids process launch/timeouts.
-    let mut version = [0_u8; 64];
-    let mut length = version.len();
-    let result = unsafe {
-        libc::sysctlbyname(
-            b"kern.osproductversion\0".as_ptr().cast(),
-            version.as_mut_ptr().cast(),
-            &mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 || length == 0 || length > version.len() {
-        return Err(McpError::UnsupportedOs);
-    }
-    let bytes = version[..length]
-        .strip_suffix(&[0])
-        .ok_or(McpError::UnsupportedOs)?;
-    macos_mcp_support(std::str::from_utf8(bytes).ok())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_support() -> Result<(), McpError> {
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -164,7 +99,7 @@ fn read_mcp_config(app: &tauri::AppHandle) -> Result<McpConfig, McpError> {
 
 /// The outer RMW lock remains held across read, token creation, and publication;
 /// unrelated Local API/sync/settings fields cannot be overwritten by a stale
-/// snapshot. Persistence always precedes starting a new child.
+/// snapshot. Persistence always precedes starting a new listener.
 fn update_config(
     app: &tauri::AppHandle,
     requested: Option<(bool, bool, bool)>,
@@ -201,314 +136,46 @@ fn update_config_with(
     Ok(next)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupEvent {
-    Ready,
-    Failed(McpError),
-}
-
-fn parse_startup_line(line: &[u8]) -> Option<StartupEvent> {
-    let event: serde_json::Value = serde_json::from_slice(line).ok()?;
-    match event.get("event").and_then(serde_json::Value::as_str) {
-        Some("mindwtr-mcp-ready")
-            if event.get("port").and_then(serde_json::Value::as_u64) == Some(MCP_PORT as u64) =>
-        {
-            Some(StartupEvent::Ready)
-        }
-        Some("mindwtr-mcp-error") => match event.get("code").and_then(serde_json::Value::as_str) {
-            Some("port_in_use") => Some(StartupEvent::Failed(McpError::PortInUse)),
-            Some("start_failed") => Some(StartupEvent::Failed(McpError::StartFailed)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Drain continuously to prevent a full pipe from stalling the helper, but
-/// retain at most one bounded line and never forward its contents to logs.
-fn drain_stderr(mut stderr: impl Read, events: mpsc::SyncSender<StartupEvent>) {
-    let mut chunk = [0_u8; 1024];
-    let mut line = Vec::with_capacity(STDERR_LINE_LIMIT);
-    let mut overflow = false;
-    loop {
-        let read = match stderr.read(&mut chunk) {
-            Ok(read) => read,
-            Err(_) => return,
-        };
-        if read == 0 {
-            if !overflow {
-                if let Some(event) = parse_startup_line(&line) {
-                    let _ = events.try_send(event);
-                }
-            }
-            return;
-        }
-        for byte in &chunk[..read] {
-            if *byte == b'\n' {
-                if !overflow {
-                    if let Some(event) = parse_startup_line(&line) {
-                        let _ = events.try_send(event);
-                    }
-                }
-                line.clear();
-                overflow = false;
-            } else if line.len() < STDERR_LINE_LIMIT && !overflow {
-                line.push(*byte);
-            } else {
-                overflow = true;
-            }
-        }
-    }
-}
-
-/// Kept independent of AppHandle so timeout, EOF, crash, and reaping behavior
-/// can be exercised with real fixture processes.
-struct ManagedProcess {
-    child: Option<Child>,
-    lease: Option<ChildStdin>,
-}
-
-impl ManagedProcess {
-    fn start(
-        command: &mut Command,
-        timeout: Duration,
-        shutdown: Option<&AtomicBool>,
-    ) -> Result<Self, McpError> {
-        if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            return Err(McpError::StartFailed);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(crate::CREATE_NO_WINDOW);
-        }
-        let mut child = command.spawn().map_err(|_| McpError::StartFailed)?;
-        let lease = child.stdin.take();
-        let stderr = child.stderr.take();
-        let mut process = Self {
-            child: Some(child),
-            lease,
-        };
-        let Some(stderr) = stderr else {
-            return Err(McpError::StartFailed);
-        };
-        let (sender, receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || drain_stderr(stderr, sender));
-        let deadline = Instant::now() + timeout;
-        loop {
-            if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-                return Err(McpError::StartFailed);
-            }
-            match receiver.try_recv() {
-                Ok(StartupEvent::Ready) if process.is_running() => return Ok(process),
-                Ok(StartupEvent::Failed(error)) => return Err(error),
-                Ok(StartupEvent::Ready) => return Err(McpError::StartFailed),
-                Err(_) => {}
-            }
-            if !process.is_running() || Instant::now() >= deadline {
-                return Err(McpError::StartFailed);
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn is_running(&mut self) -> bool {
-        match self.child.as_mut().map(Child::try_wait) {
-            Some(Ok(None)) => true,
-            Some(Ok(Some(_))) => {
-                self.child.take(); // try_wait has already reaped it.
-                self.lease.take();
-                false
-            }
-            Some(Err(_)) => {
-                self.stop();
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn wait_until(child: &mut Child, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return true,
-                Err(_) => return false,
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        false
-    }
-
-    fn stop(&mut self) {
-        self.lease.take(); // EOF asks the helper to close HTTP and exit.
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        if Self::wait_until(&mut child, Instant::now() + STOP_GRACE) {
-            return;
-        }
-        let _ = child.kill();
-        if !Self::wait_until(&mut child, Instant::now() + REAP_TIMEOUT) {
-            // SIGKILL/TerminateProcess has been requested. An exceptional OS
-            // stall must not block quit; retain ownership in a background
-            // reaper rather than leaking a zombie when the OS unblocks.
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-    }
-}
-
-impl Drop for ManagedProcess {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn helper_path_for(executable: &Path, debug_target: Option<&str>) -> Result<PathBuf, McpError> {
-    let directory = executable.parent().ok_or(McpError::HelperMissing)?;
-    let suffix = if cfg!(target_os = "windows") {
-        ".exe"
-    } else {
-        ""
-    };
-    let installed = directory.join(format!("mindwtr-mcp{suffix}"));
-    if installed.is_file() {
-        return Ok(installed);
-    }
-    if let Some(target) = debug_target {
-        let debug = directory.join(format!("mindwtr-mcp-{target}{suffix}"));
-        if debug.is_file() {
-            return Ok(debug);
-        }
-    }
-    Err(McpError::HelperMissing)
-}
-
-fn helper_path() -> Result<PathBuf, McpError> {
-    let executable = std::env::current_exe().map_err(|_| McpError::HelperMissing)?;
-    let target = if cfg!(debug_assertions) {
-        option_env!("MINDWTR_TARGET_TRIPLE")
-    } else {
-        None
-    };
-    helper_path_for(&executable, target)
-}
-
-fn check_port_available(port: u16) -> Result<(), McpError> {
-    TcpListener::bind((MCP_HOST, port))
-        .map(|_| ())
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AddrInUse {
-                McpError::PortInUse
-            } else {
-                McpError::StartFailed
-            }
-        })
-}
-
-fn helper_command(
-    path: &Path,
-    config: &McpConfig,
-    api_url: &str,
-    api_token: &str,
-) -> Result<Command, McpError> {
-    let token = config.token.as_deref().ok_or(McpError::ConfigFailed)?;
-    let mut command = Command::new(path);
-    command
-        .current_dir(path.parent().ok_or(McpError::HelperMissing)?)
-        .env_remove("BUN_BE_BUN")
-        .env_remove("BUN_OPTIONS")
-        .env_remove("NODE_OPTIONS")
-        .env("MINDWTR_MCP_API_URL", api_url)
-        .env("MINDWTR_MCP_API_TOKEN", api_token)
-        .env("MINDWTR_MCP_HTTP_PORT", MCP_PORT.to_string())
-        .env("MINDWTR_MCP_HTTP_TOKEN", token)
-        .env("MINDWTR_MCP_ALLOW_WRITE", config.allow_write.to_string());
-    Ok(command)
-}
-
 #[derive(Default)]
 struct McpRuntime {
-    process: Option<ManagedProcess>,
-    bridge: Option<PrivateMcpApiBridge>,
+    listener: Option<LocalApiHandle>,
     applied_config: Option<McpConfig>,
     last_error: Option<McpError>,
 }
 
 impl McpRuntime {
-    fn fail(&mut self, error: McpError) {
-        self.stop();
-        self.last_error = Some(error);
-    }
-
-    fn status_after_read(
-        &mut self,
-        config: Result<McpConfig, McpError>,
-        support: Result<(), McpError>,
-    ) -> McpServerStatus {
-        self.refresh();
-        match config {
-            Err(error) => {
-                self.fail(error);
-                self.status(McpConfig::default())
-            }
-            Ok(config) => {
-                if self.process.is_some() && self.applied_config.as_ref() != Some(&config) {
-                    // A verified out-of-band disable, credential rotation, or
-                    // policy edit must revoke the old instance before showing
-                    // the new config. Status reads never automatically restart.
-                    self.stop();
-                    self.last_error = config.enabled.then_some(McpError::Exited);
-                }
-                if let Err(error) = support {
-                    self.fail(error);
-                }
-                self.status(config)
-            }
-        }
-    }
-
     fn stop(&mut self) {
-        // Terminate the public endpoint before revoking its private bridge.
-        self.process.take();
-        self.bridge.take();
+        self.listener.take();
         self.applied_config.take();
     }
 
     fn refresh(&mut self) {
         if self
-            .process
-            .as_mut()
-            .is_some_and(|child| !child.is_running())
+            .listener
+            .as_ref()
+            .is_some_and(|listener| !listener.is_running())
         {
             self.stop();
             self.last_error = Some(McpError::Exited);
         }
     }
 
-    fn start(
-        app: &tauri::AppHandle,
-        local_api: &LocalApiServerState,
-        config: &McpConfig,
-        shutdown: &AtomicBool,
-    ) -> Result<(ManagedProcess, Option<PrivateMcpApiBridge>), McpError> {
-        if shutdown.load(Ordering::SeqCst) {
-            return Err(McpError::StartFailed);
+    fn status_after_read(&mut self, config: Result<McpConfig, McpError>) -> McpServerStatus {
+        self.refresh();
+        match config {
+            Err(error) => {
+                self.stop();
+                self.last_error = Some(error);
+                self.status(McpConfig::default())
+            }
+            Ok(config) => {
+                if self.listener.is_some() && self.applied_config.as_ref() != Some(&config) {
+                    self.stop();
+                    self.last_error = config.enabled.then_some(McpError::Exited);
+                }
+                self.status(config)
+            }
         }
-        platform_support()?;
-        let path = helper_path()?;
-        check_port_available(MCP_PORT)?;
-        let bridge = start_private_mcp_api_bridge(app.clone(), local_api, config.allow_write)
-            .map_err(|_| McpError::StartFailed)?;
-        let mut command = helper_command(&path, config, &bridge.url(), bridge.token())?;
-        let process = ManagedProcess::start(&mut command, STARTUP_TIMEOUT, Some(shutdown))?;
-        log::info!("Managed MCP server ready extra.releaseCheck=v1.3.4/bundled-mcp");
-        Ok((process, Some(bridge)))
     }
 
     fn reconcile(
@@ -518,71 +185,69 @@ impl McpRuntime {
         config: &McpConfig,
         shutdown: &AtomicBool,
     ) {
-        self.reconcile_with_support(config, platform_support(), |config| {
-            Self::start(app, local_api, config, shutdown)
+        self.reconcile_with(config, |config| {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(McpError::StartFailed);
+            }
+            let token = config.token.clone().ok_or(McpError::ConfigFailed)?;
+            local_api::start_mcp_listener(
+                app.clone(),
+                local_api,
+                MCP_PORT,
+                token,
+                config.allow_write,
+            )
+            .map_err(|error| {
+                if error == "port_in_use" {
+                    McpError::PortInUse
+                } else {
+                    McpError::StartFailed
+                }
+            })
         });
-    }
-
-    fn reconcile_with_support(
-        &mut self,
-        config: &McpConfig,
-        support: Result<(), McpError>,
-        start: impl FnOnce(
-            &McpConfig,
-        ) -> Result<(ManagedProcess, Option<PrivateMcpApiBridge>), McpError>,
-    ) {
-        if let Err(error) = support {
-            self.fail(error);
-            return;
-        }
-        self.reconcile_with(config, start);
     }
 
     fn reconcile_with(
         &mut self,
         config: &McpConfig,
-        start: impl FnOnce(
-            &McpConfig,
-        ) -> Result<(ManagedProcess, Option<PrivateMcpApiBridge>), McpError>,
+        start: impl FnOnce(&McpConfig) -> Result<LocalApiHandle, McpError>,
     ) {
         self.refresh();
         if !config.enabled {
             self.stop();
             self.last_error = None;
-        } else if self.process.is_none() || self.applied_config.as_ref() != Some(config) {
+        } else if self.listener.is_none() || self.applied_config.as_ref() != Some(config) {
             self.stop();
             match start(config) {
-                Ok((process, bridge)) => {
-                    self.process = Some(process);
-                    self.bridge = bridge;
+                Ok(listener) => {
+                    self.listener = Some(listener);
                     self.applied_config = Some(config.clone());
                     self.last_error = None;
+                    log::info!(
+                        "In-process MCP listener ready extra.releaseCheck=v1.3.4/in-process-mcp"
+                    );
                 }
                 Err(error) => {
                     self.last_error = Some(error);
-                    log::warn!("Managed MCP startup failed code={}", error.code());
+                    log::warn!("In-process MCP startup failed code={}", error.code());
                 }
             }
         }
     }
 
     fn status(&self, config: McpConfig) -> McpServerStatus {
-        let running = self.process.is_some();
         McpServerStatus {
             enabled: config.enabled,
-            running,
+            running: self.listener.is_some(),
             allow_write: config.allow_write,
             port: MCP_PORT,
-            url: running.then(|| format!("http://{MCP_HOST}:{MCP_PORT}/mcp")),
-            token: if config.enabled { config.token } else { None },
+            url: self
+                .listener
+                .as_ref()
+                .map(|_| format!("http://127.0.0.1:{MCP_PORT}/mcp")),
+            token: config.enabled.then_some(config.token).flatten(),
             error: self.last_error.map(|error| error.code().to_string()),
         }
-    }
-}
-
-impl Drop for McpRuntime {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -606,14 +271,12 @@ pub(crate) fn start_configured_mcp_server(
         Err(error) => {
             runtime.stop();
             runtime.last_error = Some(error);
-            log::warn!("Managed MCP configuration failed code={}", error.code());
+            log::warn!("In-process MCP configuration failed code={}", error.code());
         }
     }
 }
 
 pub(crate) fn stop_mcp_server(state: &McpServerState) {
-    // Signal before waiting for the mutex so a helper still awaiting readiness
-    // exits its startup loop promptly. Pending setup cannot restart after quit.
     state.shutting_down.store(true, Ordering::SeqCst);
     lock_recovering(&state.inner).stop();
 }
@@ -623,8 +286,7 @@ pub(crate) fn get_mcp_server_status(
     app: tauri::AppHandle,
     state: tauri::State<'_, McpServerState>,
 ) -> Result<McpServerStatus, String> {
-    let mut runtime = lock_recovering(&state.inner);
-    Ok(runtime.status_after_read(read_mcp_config(&app), platform_support()))
+    Ok(lock_recovering(&state.inner).status_after_read(read_mcp_config(&app)))
 }
 
 #[tauri::command(async)]
@@ -641,18 +303,11 @@ pub(crate) fn set_mcp_server_config(
         runtime.stop();
         return Ok(runtime.status(read_mcp_config(&app).unwrap_or_default()));
     }
-    let support = platform_support();
-    if enabled && support.is_err() {
-        // Refuse enabling on unsupported systems; disabling still proceeds to
-        // the verified config transaction below so an old preference can clear.
-        return Ok(runtime.status_after_read(read_mcp_config(&app), support));
-    }
     match update_config(
         &app,
         Some((enabled, allow_write, regenerate_token.unwrap_or(false))),
     ) {
         Ok(config) => {
-            // Repeating the same config is an explicit retry after exit/failure.
             runtime.reconcile(&app, &local_api, &config, &state.shutting_down);
             Ok(runtime.status(config))
         }
@@ -664,623 +319,536 @@ pub(crate) fn set_mcp_server_config(
     }
 }
 
+fn rpc_error(id: Value, code: i64, message: &str) -> ApiResponse {
+    ApiResponse::ok(json!({"jsonrpc":"2.0", "id": id, "error": {"code": code, "message": message}}))
+}
+
+fn empty_params(params: &Map<String, Value>) -> bool {
+    params.keys().all(|name| name == "_meta")
+}
+
+fn accepts(request: &ApiRequest, media_type: &str) -> bool {
+    request.headers.get("accept").is_some_and(|header| {
+        header.split(',').any(|part| {
+            let mut parts = part.trim().split(';');
+            parts
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(media_type))
+                && !parts.any(|param| {
+                    param
+                        .trim()
+                        .strip_prefix("q=")
+                        .is_some_and(|q| q.parse::<f64>().is_ok_and(|q| q <= 0.0))
+                })
+        })
+    })
+}
+
+pub(crate) fn handle_mcp_request(
+    token: &str,
+    access: &LocalApiAccess,
+    port: u16,
+    request: ApiRequest,
+    mut execute: impl FnMut(LocalOperation) -> Result<Value, String>,
+) -> ApiResponse {
+    if request.headers.get("host").map(String::as_str) != Some(format!("127.0.0.1:{port}").as_str())
+    {
+        return ApiResponse::error(403, "Invalid Host");
+    }
+    if request
+        .headers
+        .get("origin")
+        .is_some_and(|origin| origin != &format!("http://127.0.0.1:{port}"))
+    {
+        return ApiResponse::error(403, "Invalid Origin");
+    }
+    if access.ensure_active().is_err() {
+        return ApiResponse::error(403, "MCP server is stopped");
+    }
+    if !local_api::is_request_authorized(&request, token) {
+        return ApiResponse::error(401, "Unauthorized");
+    }
+    if request.path != "/mcp" || !request.query.is_empty() {
+        return ApiResponse::error(404, "Not found");
+    }
+    if request
+        .headers
+        .get("mcp-protocol-version")
+        .is_some_and(|version| !SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()))
+    {
+        return ApiResponse::error(400, "Unsupported MCP protocol version");
+    }
+    if request.method != "POST" {
+        return ApiResponse::error(405, "Method not allowed");
+    }
+    if !request.headers.get("content-type").is_some_and(|header| {
+        header
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    }) {
+        return ApiResponse::error(415, "Expected application/json");
+    }
+    if !accepts(&request, "application/json") || !accepts(&request, "text/event-stream") {
+        return ApiResponse::error(
+            406,
+            "Accept must include application/json and text/event-stream",
+        );
+    }
+    let message: Value = match serde_json::from_slice(&request.body) {
+        Ok(message) => message,
+        Err(_) => return rpc_error(Value::Null, -32700, "Parse error"),
+    };
+    let Some(message) = message.as_object() else {
+        return rpc_error(Value::Null, -32600, "Invalid request");
+    };
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || message
+            .keys()
+            .any(|name| !matches!(name.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        || message
+            .get("id")
+            .is_some_and(|id| !id.is_string() && id.as_i64().is_none() && id.as_u64().is_none())
+    {
+        return rpc_error(Value::Null, -32600, "Invalid request");
+    }
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return rpc_error(id, -32600, "Invalid request");
+    };
+    let empty = Map::new();
+    let params = match message.get("params") {
+        None => &empty,
+        Some(Value::Object(params)) => params,
+        _ => return rpc_error(id, -32602, "Invalid params"),
+    };
+    if params.get("_meta").is_some_and(|meta| !meta.is_object()) {
+        return rpc_error(id, -32602, "Invalid params");
+    }
+    if !message.contains_key("id") {
+        if method == "notifications/initialized" && empty_params(params) {
+            return ApiResponse {
+                status: 202,
+                body: Value::Null,
+            };
+        }
+        return ApiResponse::error(400, "Unsupported notification");
+    }
+    let result = match method {
+        "initialize" => {
+            if params.keys().any(|name| {
+                !matches!(
+                    name.as_str(),
+                    "protocolVersion" | "capabilities" | "clientInfo" | "_meta"
+                )
+            }) || params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+                || !params.get("capabilities").is_some_and(Value::is_object)
+                || !params
+                    .get("clientInfo")
+                    .and_then(Value::as_object)
+                    .is_some_and(|info| {
+                        info.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                            && info
+                                .get("version")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| !s.is_empty())
+                    })
+            {
+                return rpc_error(id, -32602, "Invalid initialize params");
+            }
+            let requested = params["protocolVersion"].as_str().unwrap();
+            json!({"protocolVersion": if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) { requested } else { PROTOCOL_VERSION },
+                "capabilities": {"tools": {}}, "serverInfo": {"name":"mindwtr-mcp", "version": env!("CARGO_PKG_VERSION")}})
+        }
+        "ping" if empty_params(params) => json!({}),
+        "tools/list" if empty_params(params) => json!({"tools": crate::mcp_tools::tools()}),
+        "tools/call" => {
+            if params
+                .keys()
+                .any(|name| !matches!(name.as_str(), "name" | "arguments" | "_meta"))
+            {
+                return rpc_error(id, -32602, "Invalid tools/call params");
+            }
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
+                return rpc_error(id, -32602, "Invalid tool name");
+            };
+            let arguments = match params.get("arguments") {
+                None => &empty,
+                Some(Value::Object(args)) => args,
+                _ => return rpc_error(id, -32602, "Invalid tool arguments"),
+            };
+            let operation = match crate::mcp_tools::operation(name, arguments) {
+                Ok(operation) => operation,
+                Err(_) => return rpc_error(id, -32602, "Invalid or unsupported tool arguments"),
+            };
+            let writing = operation.writes();
+            if writing && access.ensure_write().is_err() {
+                crate::mcp_tools::error_response(
+                    "read_only",
+                    "MCP is read-only. Enable writes in desktop settings to edit.",
+                )
+            } else {
+                match execute(operation) {
+                    Ok(body) => {
+                        let operation = if writing { "write" } else { "read" };
+                        log::info!("In-process MCP native operation completed extra.releaseCheck=v1.3.4/in-process-mcp operation={operation}");
+                        match crate::mcp_tools::tool_result(name, arguments, body) {
+                            Ok(body) => {
+                                json!({"content":[{"type":"text", "text": serde_json::to_string_pretty(&body).unwrap()}]})
+                            }
+                            Err(()) => {
+                                crate::mcp_tools::error_response("not_found", "Entity not found.")
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let response = local_api::api_error_response(error);
+                        let (code, message) = match response.status {
+                            403 => ("read_only", "MCP access was revoked."),
+                            404 => ("not_found", "Entity not found."),
+                            400 | 409 => ("validation_error", "Invalid input or lifecycle conflict. Check the item in the desktop app."),
+                            _ => ("internal_error", "Native operation failed. For writes, check the desktop app before retrying."),
+                        };
+                        crate::mcp_tools::error_response(code, message)
+                    }
+                }
+            }
+        }
+        "ping" | "tools/list" => return rpc_error(id, -32602, "Invalid params"),
+        _ => return rpc_error(id, -32601, "Method not found"),
+    };
+    ApiResponse::ok(json!({"jsonrpc":"2.0", "id":id, "result":result}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn managed_mcp_macos_minimum_version_and_unknown_version_fail_closed() {
-        for version in [
-            None,
-            Some(""),
-            Some("10.15.7"),
-            Some("12.7.6"),
-            Some("13..1"),
-            Some("13.1beta"),
-            Some("13.0.0.1"),
-            Some("4294967296.0"),
-        ] {
-            assert_eq!(macos_mcp_support(version), Err(McpError::UnsupportedOs));
-        }
-        for version in [
-            "13", "13.0", "13.0.0", "13.6.2", "14.0", "26.0.1", " 13.0.1 ",
-        ] {
-            assert_eq!(macos_mcp_support(Some(version)), Ok(()));
+    fn access(allow_write: bool) -> LocalApiAccess {
+        LocalApiAccess {
+            allow_write,
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
-
-    #[test]
-    fn managed_mcp_unsupported_os_reports_while_disabled_and_refuses_launch() {
-        let mut runtime = McpRuntime::default();
-        for enabled in [false, true] {
-            let config = McpConfig {
-                enabled,
-                token: Some("fixture-token".into()),
-                ..McpConfig::default()
-            };
-            runtime.reconcile_with_support(&config, Err(McpError::UnsupportedOs), |_| {
-                panic!("unsupported OS must never execute the helper")
-            });
-            let status = runtime.status_after_read(Ok(config), Err(McpError::UnsupportedOs));
-            assert_eq!(status.enabled, enabled);
-            assert!(!status.running);
-            assert_eq!(status.error.as_deref(), Some("unsupported_os"));
+    fn request(message: Value) -> ApiRequest {
+        ApiRequest {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([
+                ("host".into(), "127.0.0.1:8722".into()),
+                ("authorization".into(), "Bearer fixture-token".into()),
+                ("content-type".into(), "application/json".into()),
+                (
+                    "accept".into(),
+                    "application/json, text/event-stream".into(),
+                ),
+            ]),
+            body: serde_json::to_vec(&message).unwrap(),
         }
-        // An unsupported host can still publish an explicit disabled setting.
-        let stored = AppConfigToml {
-            mcp_enabled: Some("true".into()),
+    }
+    fn call(method: &str, params: Value, allow_write: bool) -> ApiResponse {
+        handle_mcp_request(
+            "fixture-token",
+            &access(allow_write),
+            MCP_PORT,
+            request(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})),
+            |_| Ok(json!({"tasks":[]})),
+        )
+    }
+    #[test]
+    fn mcp_protocol_negotiation_notifications_and_bounded_scope() {
+        for proposed in ["2025-03-26", "2025-06-18", "2099-01-01"] {
+            let response = call(
+                "initialize",
+                json!({"protocolVersion":proposed,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
+                false,
+            );
+            assert_eq!(
+                response.body["result"]["protocolVersion"],
+                if SUPPORTED_PROTOCOL_VERSIONS.contains(&proposed) {
+                    proposed
+                } else {
+                    PROTOCOL_VERSION
+                }
+            );
+        }
+        assert_eq!(call("ping", json!({}), false).body["result"], json!({}));
+        assert_eq!(
+            call("tools/list", json!({}), false).body["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            13
+        );
+        assert_eq!(
+            call("tools/list", json!({"cursor":"bogus"}), false).body["error"]["code"],
+            -32602
+        );
+        assert_eq!(
+            call("initialize", json!({"protocolVersion":"2025-06-18"}), false).body["error"]
+                ["code"],
+            -32602
+        );
+        let notification = handle_mcp_request(
+            "fixture-token",
+            &access(false),
+            MCP_PORT,
+            request(json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
+            |_| panic!(),
+        );
+        assert_eq!(notification.status, 202);
+        assert!(notification.body.is_null());
+        for invalid in [
+            json!([]),
+            json!({"jsonrpc":"1.0","method":"ping","id":1}),
+            json!({"jsonrpc":"2.0","method":"ping","id":null}),
+            json!({"jsonrpc":"2.0","method":"ping","id":1.5}),
+        ] {
+            assert_eq!(
+                handle_mcp_request(
+                    "fixture-token",
+                    &access(false),
+                    MCP_PORT,
+                    request(invalid),
+                    |_| panic!()
+                )
+                .body["error"]["code"],
+                -32600
+            );
+        }
+    }
+    #[test]
+    fn mcp_http_security_and_negotiated_headers_are_checked_before_operations() {
+        for (field, value, status) in [
+            ("authorization", "Bearer bad", 401),
+            ("host", "attacker.example:8722", 403),
+            ("origin", "https://attacker.example", 403),
+            ("content-type", "text/plain", 415),
+            ("accept", "application/json", 406),
+            ("accept", "application/json;q=0, text/event-stream", 406),
+            ("mcp-protocol-version", "2099-01-01", 400),
+            ("mcp-protocol-version", "2025-03-26", 400),
+        ] {
+            let mut request = request(json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+            request.headers.insert(field.into(), value.into());
+            assert_eq!(
+                handle_mcp_request(
+                    "fixture-token",
+                    &access(false),
+                    MCP_PORT,
+                    request,
+                    |_| panic!()
+                )
+                .status,
+                status,
+                "{field}"
+            );
+        }
+        for method in ["GET", "DELETE", "OPTIONS"] {
+            let mut request = request(json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+            request.method = method.into();
+            assert_eq!(
+                handle_mcp_request(
+                    "fixture-token",
+                    &access(false),
+                    MCP_PORT,
+                    request,
+                    |_| panic!()
+                )
+                .status,
+                405
+            );
+        }
+        let disabled = access(true);
+        disabled.shutdown.store(true, Ordering::SeqCst);
+        assert_eq!(
+            handle_mcp_request(
+                "fixture-token",
+                &disabled,
+                MCP_PORT,
+                request(json!({"jsonrpc":"2.0","id":1,"method":"ping"})),
+                |_| panic!()
+            )
+            .status,
+            403
+        );
+    }
+    #[test]
+    fn mcp_read_only_and_argument_allowlists_block_native_execution() {
+        for (name, arguments) in [
+            ("mindwtr_add_task", json!({"title":"Task"})),
+            ("mindwtr_update_task", json!({"id":"task","title":"Task"})),
+            ("mindwtr_complete_task", json!({"id":"task"})),
+            ("mindwtr_delete_task", json!({"id":"task"})),
+            ("mindwtr_restore_task", json!({"id":"task"})),
+            ("mindwtr_add_project", json!({"title":"Project"})),
+            (
+                "mindwtr_update_project",
+                json!({"id":"project","title":"Project"}),
+            ),
+            ("mindwtr_delete_project", json!({"id":"project"})),
+        ] {
+            let response = handle_mcp_request(
+                "fixture-token",
+                &access(false),
+                MCP_PORT,
+                request(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+                ),
+                |_| panic!("read-only must not execute"),
+            );
+            assert_eq!(response.body["result"]["isError"], true, "{name}");
+            assert!(response.body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("read_only"));
+        }
+        for (name, args) in [
+            ("mindwtr_get_task", json!({"id":1})),
+            (
+                "mindwtr_add_task",
+                json!({"title":"Task","quickAdd":"ignored"}),
+            ),
+            ("mindwtr_update_task", json!({"id":"task","attachments":[]})),
+            ("mindwtr_update_task", json!({"id":"task","status":"done"})),
+            (
+                "mindwtr_add_project",
+                json!({"title":"P","supportNotes":"unsupported"}),
+            ),
+            ("mindwtr_list_tasks", json!({"view":"available"})),
+            ("mindwtr_list_tasks", json!({"limit":"10"})),
+        ] {
+            assert_eq!(
+                call("tools/call", json!({"name":name,"arguments":args}), true).body["error"]
+                    ["code"],
+                -32602,
+                "{name}"
+            );
+        }
+    }
+    fn fixture_listener(port: u16, token: String, allow_write: bool) -> LocalApiHandle {
+        local_api::start_http_listener(port,allow_write,move |access,port,request| handle_mcp_request(&token,access,port,request,|operation| {
+            let data=json!({"tasks":[{"id":"native-fixture-task","title":"Native MCP fixture","status":"inbox","tags":[],"contexts":[],"createdAt":"2026-10-05T12:00:00Z","updatedAt":"2026-10-05T12:00:00Z","rev":1}],"projects":[],"areas":[]});
+            match operation {
+                LocalOperation::QueryTasks(input)=>Ok(json!({"tasks":crate::local_query::query_tasks(&data,&input)?})),
+                LocalOperation::GetTask(id) if id=="native-fixture-task"=>Ok(json!({"task":data["tasks"][0]})),
+                LocalOperation::ListProjects=>Ok(json!({"projects":[]})),
+                LocalOperation::ListAreas=>Ok(json!({"areas":[]})),
+                _=>Err("Task not found".into()),
+            }
+        })).unwrap()
+    }
+    #[test]
+    fn mcp_listener_disable_rotation_and_port_collision() {
+        let mut runtime = McpRuntime::default();
+        let config = McpConfig {
+            enabled: true,
+            token: Some("old".into()),
+            allow_write: true,
+        };
+        runtime.reconcile_with(&config, |_| Ok(fixture_listener(0, "old".into(), true)));
+        let port = runtime.listener.as_ref().unwrap().port;
+        let revoked = runtime.listener.as_ref().unwrap().test_access(true);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        let next = McpConfig {
+            token: Some("new".into()),
+            ..config.clone()
+        };
+        let status = runtime.status_after_read(Ok(next.clone()));
+        assert!(!status.running);
+        assert_eq!(status.error.as_deref(), Some("exited"));
+        assert!(revoked.ensure_write().is_err());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+        runtime.reconcile_with(&next, |_| Ok(fixture_listener(0, "new".into(), true)));
+        let revoked = runtime.listener.as_ref().unwrap().test_access(true);
+        let disabled = McpConfig {
+            enabled: false,
+            ..next
+        };
+        runtime.reconcile_with(&disabled, |_| panic!("disabled must not start"));
+        assert!(!runtime.status(disabled).running);
+        assert!(revoked.ensure_write().is_err());
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert_eq!(
+            local_api::start_http_listener(
+                occupied.local_addr().unwrap().port(),
+                false,
+                |_, _, _| ApiResponse::ok(json!({}))
+            )
+            .err()
+            .as_deref(),
+            Some("port_in_use")
+        );
+    }
+    #[test]
+    fn mcp_configuration_is_persisted_before_start_and_keeps_unrelated_fields() {
+        let original = AppConfigToml {
+            local_api_enabled: Some("true".into()),
+            local_api_token: Some("rest-token".into()),
             ..AppConfigToml::default()
         };
-        let disabled = update_config_with(
-            || Ok(stored),
-            Some((false, false, false)),
-            |next| {
-                assert_eq!(next.mcp_enabled.as_deref(), Some("false"));
+        let config = update_config_with(
+            || Ok(original),
+            Some((true, false, false)),
+            |stored| {
+                assert_eq!(stored.local_api_token.as_deref(), Some("rest-token"));
+                assert_eq!(stored.mcp_enabled.as_deref(), Some("true"));
+                assert_eq!(stored.mcp_token.as_ref().unwrap().len(), 64);
                 Ok(())
             },
         )
         .unwrap();
-        assert!(!disabled.enabled);
-    }
-
-    #[test]
-    fn managed_mcp_verified_first_launch_defaults_without_a_missing_file_failure() {
+        assert!(config.enabled);
+        assert!(!config.allow_write);
+        assert_eq!(
+            update_config_with(
+                || Ok(AppConfigToml::default()),
+                Some((true, true, true)),
+                |_| Err("secret fixture".into())
+            )
+            .err(),
+            Some(McpError::ConfigFailed)
+        );
         let directory = tempfile::tempdir().unwrap();
-        let stored = crate::config::read_config_files_verified(
+        let original = crate::config::read_config_files_verified(
             &directory.path().join("config.toml"),
             &directory.path().join("secrets.toml"),
         )
         .unwrap();
-        assert!(!config_from_toml(&stored).enabled);
-        assert!(!config_from_toml(&stored).allow_write);
+        assert!(!config_from_toml(&original).enabled);
     }
-
-    #[cfg(unix)]
     #[test]
-    fn managed_mcp_verified_config_drift_revokes_old_listener_without_restart() {
-        for change in ["disable", "token", "write", "unsupported"] {
-            let directory = tempfile::tempdir().unwrap();
-            let config_path = directory.path().join("config.toml");
-            let secrets_path = directory.path().join("secrets.toml");
-            let mut stored = AppConfigToml {
-                mcp_enabled: Some("true".into()),
-                mcp_allow_write: Some("false".into()),
-                mcp_token: Some("old-token".into()),
-                ..AppConfigToml::default()
-            };
-            write_config_files(&config_path, &secrets_path, &stored).unwrap();
-            let mut runtime = McpRuntime::default();
-            let mut command = fixture_command(&directory, "printf '{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\\n' >&2\nwhile read -r line; do :; done");
-            runtime.process =
-                Some(ManagedProcess::start(&mut command, Duration::from_secs(1), None).unwrap());
-            let pid = runtime
-                .process
-                .as_ref()
-                .unwrap()
-                .child
-                .as_ref()
-                .unwrap()
-                .id() as i32;
-            let bridge = PrivateMcpApiBridge::lifetime_fixture();
-            let port: u16 = bridge.url().rsplit(':').next().unwrap().parse().unwrap();
-            runtime.bridge = Some(bridge);
-            runtime.applied_config = Some(config_from_toml(&stored));
-            match change {
-                "disable" => stored.mcp_enabled = Some("false".into()),
-                "token" => stored.mcp_token = Some("new-token".into()),
-                "write" => stored.mcp_allow_write = Some("true".into()),
-                "unsupported" => {}
-                _ => unreachable!(),
-            }
-            // A strictly valid file edit is adopted by generation verification.
-            let mut public = stored.clone();
-            public.mcp_token = None;
-            let private = AppConfigToml {
-                mcp_token: stored.mcp_token.clone(),
-                ..AppConfigToml::default()
-            };
-            std::fs::write(&config_path, toml::to_string(&public).unwrap()).unwrap();
-            std::fs::write(&secrets_path, toml::to_string(&private).unwrap()).unwrap();
-            let read = crate::config::read_config_files_verified(&config_path, &secrets_path)
-                .map(|stored| config_from_toml(&stored))
-                .map_err(|_| McpError::ConfigFailed);
-            let support = if change == "unsupported" {
-                macos_mcp_support(None)
-            } else {
-                Ok(())
-            };
-            let status = runtime.status_after_read(read, support);
-            assert!(!status.running);
-            assert!(runtime.process.is_none());
-            assert!(runtime.bridge.is_none());
-            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-            assert!(TcpListener::bind((MCP_HOST, port)).is_ok());
-            assert!(status.url.is_none());
-            if change == "disable" {
-                assert!(!status.enabled);
-                assert!(status.token.is_none());
-                assert!(status.error.is_none());
-            } else {
-                assert!(status.enabled);
-                assert_eq!(
-                    status.error.as_deref(),
-                    Some(if change == "unsupported" {
-                        "unsupported_os"
-                    } else {
-                        "exited"
-                    })
-                );
-                assert_eq!(status.allow_write, change == "write");
-                assert_eq!(
-                    status.token.as_deref(),
-                    Some(if change == "token" {
-                        "new-token"
-                    } else {
-                        "old-token"
-                    })
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_corrupt_or_unreadable_config_revokes_live_child_and_private_bridge() {
-        for secrets in [false, true] {
-            for unreadable in [false, true] {
-                let directory = tempfile::tempdir().unwrap();
-                let config_path = directory.path().join("config.toml");
-                let secrets_path = directory.path().join("secrets.toml");
-                let original = AppConfigToml {
-                    mcp_enabled: Some("true".into()),
-                    mcp_token: Some("live-token".into()),
-                    ..AppConfigToml::default()
-                };
-                write_config_files(&config_path, &secrets_path, &original).unwrap();
-                let mut runtime = McpRuntime::default();
-                let mut command = fixture_command(&directory, "printf '{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\\n' >&2\nwhile read -r line; do :; done");
-                runtime.process = Some(
-                    ManagedProcess::start(&mut command, Duration::from_secs(1), None).unwrap(),
-                );
-                let pid = runtime
-                    .process
-                    .as_ref()
-                    .unwrap()
-                    .child
-                    .as_ref()
-                    .unwrap()
-                    .id() as i32;
-                let bridge = PrivateMcpApiBridge::lifetime_fixture();
-                let port: u16 = bridge.url().rsplit(':').next().unwrap().parse().unwrap();
-                assert!(TcpListener::bind((MCP_HOST, port)).is_err());
-                runtime.bridge = Some(bridge);
-                runtime.applied_config = Some(config_from_toml(&original));
-                let broken_path = if secrets { &secrets_path } else { &config_path };
-                if unreadable {
-                    std::fs::remove_file(broken_path).unwrap();
-                    std::fs::create_dir(broken_path).unwrap(); // Deterministic read failure even for root.
-                } else {
-                    std::fs::write(broken_path, "mcp_enabled = truncated-value\n").unwrap();
-                }
-                let before_public = std::fs::read(&config_path).ok();
-                let before_secrets = std::fs::read(&secrets_path).ok();
-                let read =
-                    || crate::config::read_config_files_verified(&config_path, &secrets_path);
-                let verified = read()
-                    .map(|stored| config_from_toml(&stored))
-                    .map_err(|_| McpError::ConfigFailed);
-                let status = runtime.status_after_read(verified, Ok(()));
-                assert!(!status.enabled);
-                assert!(!status.running);
-                assert!(status.url.is_none());
-                assert!(status.token.is_none());
-                assert_eq!(status.error.as_deref(), Some("config_failed"));
-                assert_eq!(
-                    unsafe { libc::kill(pid, 0) },
-                    -1,
-                    "old helper must be gone and reaped"
-                );
-                assert!(runtime.bridge.is_none());
-                assert!(
-                    TcpListener::bind((MCP_HOST, port)).is_ok(),
-                    "private listener must close"
-                );
-                let update = update_config_with(read, Some((true, true, true)), |_| {
-                    panic!("failed verification must never publish defaults")
-                });
-                assert!(matches!(update, Err(McpError::ConfigFailed)));
-                assert_eq!(std::fs::read(&config_path).ok(), before_public);
-                assert_eq!(std::fs::read(&secrets_path).ok(), before_secrets);
-            }
-        }
-    }
-
-    #[test]
-    fn managed_mcp_defaults_off_and_read_only_and_preserves_local_api() {
-        let mut stored = AppConfigToml {
-            local_api_enabled: Some("true".into()),
-            local_api_port: Some("3457".into()),
-            local_api_token: Some("external-secret".into()),
-            sync_path: Some("/unrelated/path".into()),
-            ..AppConfigToml::default()
-        };
-        let default = config_from_toml(&stored);
-        assert!(!default.enabled);
-        assert!(!default.allow_write);
-        let next = McpConfig {
-            enabled: true,
-            token: Some(generate_token()),
-            ..default
-        };
-        apply_config(&mut stored, &next);
-        assert_eq!(stored.local_api_token.as_deref(), Some("external-secret"));
-        assert_eq!(stored.local_api_port.as_deref(), Some("3457"));
-        assert_eq!(stored.local_api_enabled.as_deref(), Some("true"));
-        assert_eq!(stored.sync_path.as_deref(), Some("/unrelated/path"));
-        assert!(!config_from_toml(&stored).allow_write);
-    }
-
-    #[test]
-    fn managed_mcp_tokens_are_random_and_hidden_while_disabled() {
-        let token = generate_token();
-        assert_eq!(token.len(), 64);
-        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(token, generate_token());
-        let runtime = McpRuntime::default();
-        let mut config = McpConfig {
-            token: Some(token.clone()),
-            ..McpConfig::default()
-        };
-        assert!(runtime.status(config.clone()).token.is_none());
-        config.enabled = true;
-        assert_eq!(
-            runtime.status(config).token.as_deref(),
-            Some(token.as_str())
-        );
-    }
-
-    #[test]
-    fn managed_mcp_startup_parser_only_accepts_fixed_events() {
-        assert_eq!(
-            parse_startup_line(br#"{"event":"mindwtr-mcp-ready","port":8722}"#),
-            Some(StartupEvent::Ready)
-        );
-        assert_eq!(
-            parse_startup_line(br#"{"event":"mindwtr-mcp-ready","port":1234}"#),
-            None
-        );
-        assert_eq!(
-            parse_startup_line(br#"{"event":"mindwtr-mcp-error","code":"port_in_use"}"#),
-            Some(StartupEvent::Failed(McpError::PortInUse))
-        );
-        assert_eq!(
-            parse_startup_line(br#"{"event":"mindwtr-mcp-error","code":"credential secret"}"#),
-            None
-        );
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut flood = vec![b'x'; STDERR_LINE_LIMIT * 4];
-        flood.extend_from_slice(b"\n{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\n");
-        drain_stderr(flood.as_slice(), sender);
-        assert_eq!(receiver.try_recv().unwrap(), StartupEvent::Ready);
-    }
-
-    #[test]
-    fn managed_mcp_port_in_use_has_a_safe_error() {
-        let listener = TcpListener::bind((MCP_HOST, 0)).unwrap();
-        assert_eq!(
-            check_port_available(listener.local_addr().unwrap().port()),
-            Err(McpError::PortInUse)
-        );
-    }
-
-    #[test]
-    fn managed_mcp_helper_lookup_is_adjacent_and_does_not_use_path() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("mindwtr");
-        assert_eq!(
-            helper_path_for(&executable, None),
-            Err(McpError::HelperMissing)
-        );
-        let suffix = if cfg!(target_os = "windows") {
-            ".exe"
-        } else {
-            ""
-        };
-        let target = directory
-            .path()
-            .join(format!("mindwtr-mcp-test-target{suffix}"));
-        std::fs::write(&target, b"fixture").unwrap();
-        assert_eq!(
-            helper_path_for(&executable, Some("test-target")).unwrap(),
-            target
-        );
-        assert_eq!(
-            helper_path_for(&executable, None),
-            Err(McpError::HelperMissing)
-        );
-        let installed = directory.path().join(format!("mindwtr-mcp{suffix}"));
-        std::fs::write(&installed, b"fixture").unwrap();
-        assert_eq!(
-            helper_path_for(&executable, Some("test-target")).unwrap(),
-            installed
-        );
-    }
-
-    #[test]
-    fn managed_mcp_credentials_are_only_environment_and_write_mode_is_explicit() {
-        let config = McpConfig {
-            enabled: true,
-            allow_write: false,
-            token: Some("public-secret".into()),
-        };
-        let command = helper_command(
-            Path::new("/bundled/mindwtr-mcp"),
-            &config,
-            "http://127.0.0.1:12345",
-            "private-secret",
+    #[ignore = "Driven by scripts/test-native-mcp.ts with the official MCP SDK"]
+    fn mcp_sdk_listener_fixture() {
+        let port = std::env::var("MINDWTR_MCP_TEST_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let token = std::env::var("MINDWTR_MCP_TEST_TOKEN").unwrap();
+        let listener = fixture_listener(port, token, false);
+        std::fs::write(
+            std::env::var("MINDWTR_MCP_TEST_READY").unwrap(),
+            listener.port.to_string(),
         )
         .unwrap();
-        assert_eq!(command.get_args().count(), 0);
-        let environment = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().to_string(),
-                    value.map(|value| value.to_string_lossy().to_string()),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(
-            environment["MINDWTR_MCP_HTTP_TOKEN"].as_deref(),
-            Some("public-secret")
-        );
-        assert_eq!(
-            environment["MINDWTR_MCP_API_TOKEN"].as_deref(),
-            Some("private-secret")
-        );
-        assert_eq!(
-            environment["MINDWTR_MCP_ALLOW_WRITE"].as_deref(),
-            Some("false")
-        );
-        assert_eq!(environment["BUN_BE_BUN"], None);
-    }
-
-    #[cfg(unix)]
-    fn fixture_command(directory: &tempfile::TempDir, body: &str) -> Command {
-        use std::os::unix::fs::PermissionsExt;
-        let path = directory.path().join("mindwtr-mcp");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Command::new(path)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_starts_then_stops_and_reaps_after_stdin_eof() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut command = fixture_command(&directory, "printf '{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\\n' >&2\nwhile read -r line; do :; done");
-        let mut child = ManagedProcess::start(&mut command, Duration::from_secs(1), None).unwrap();
-        assert!(child.is_running());
-        child.lease.take(); // Model parent death: all writers of stdin disappear.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while child.is_running() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+        let stop = std::env::var("MINDWTR_MCP_TEST_STOP").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !std::path::Path::new(&stop).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "SDK fixture did not receive stop signal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!child.is_running());
-        assert!(child.child.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_readiness_timeout_kills_and_reaps_the_child() {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let pid_path = directory.path().join("pid");
-        let pid_file = std::fs::File::create(&pid_path).unwrap();
-        let pid_fd = pid_file.as_raw_fd();
-        let mut command = fixture_command(&directory, "while :; do :; done");
-        // Publish the PID before spawn returns and the readiness deadline starts.
-        // The shell may otherwise be killed before its first instruction on CI.
-        // SAFETY: the forked child only uses async-signal-safe getpid/write;
-        // pid_file keeps this descriptor alive through start, and all data is local.
-        unsafe {
-            command.pre_exec(move || {
-                let bytes = libc::getpid().to_ne_bytes();
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    let written = libc::write(
-                        pid_fd,
-                        bytes.as_ptr().add(offset).cast(),
-                        bytes.len() - offset,
-                    );
-                    if written < 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() == Some(libc::EINTR) {
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                    if written == 0 {
-                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                    }
-                    offset += written as usize;
-                }
-                Ok(())
-            });
-        }
-        let started = Instant::now();
-        assert!(matches!(
-            ManagedProcess::start(&mut command, Duration::from_millis(50), None),
-            Err(McpError::StartFailed)
-        ));
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let pid = i32::from_ne_bytes(std::fs::read(pid_path).unwrap().try_into().unwrap());
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            -1,
-            "helper must be gone and reaped"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_error_exit_and_drop_cleanup_do_not_leave_a_child() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut command = fixture_command(&directory, "printf '{\"event\":\"mindwtr-mcp-error\",\"code\":\"port_in_use\"}\\n' >&2\nwhile read -r line; do :; done");
-        assert!(matches!(
-            ManagedProcess::start(&mut command, Duration::from_secs(1), None),
-            Err(McpError::PortInUse)
-        ));
-        let mut command = fixture_command(&directory, "printf '{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\\n' >&2\nwhile read -r line; do :; done");
-        let mut child = ManagedProcess::start(&mut command, Duration::from_secs(1), None).unwrap();
-        let pid = child.child.as_ref().unwrap().id() as i32;
-        child.child.as_mut().unwrap().kill().unwrap();
-        let mut runtime = McpRuntime::default();
-        runtime.process = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while runtime.process.is_some() && Instant::now() < deadline {
-            runtime.refresh();
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(runtime.process.is_none());
-        assert_eq!(runtime.last_error, Some(McpError::Exited));
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        let mut command = fixture_command(
-            &directory,
-            "printf '{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}\\n' >&2\nwhile :; do :; done",
-        );
-        let child = ManagedProcess::start(&mut command, Duration::from_secs(1), None).unwrap();
-        let pid = child.child.as_ref().unwrap().id() as i32;
-        drop(child);
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_rotation_write_mode_disable_and_retry_replace_only_the_managed_child() {
-        let directory = tempfile::tempdir().unwrap();
-        let applied = directory.path().join("applied-config");
-        let fixture = fixture_command(&directory, &format!(
-            "printf '%s|%s' \"$MINDWTR_MCP_HTTP_TOKEN\" \"$MINDWTR_MCP_ALLOW_WRITE\" > '{}'\nprintf '{{\"event\":\"mindwtr-mcp-ready\",\"port\":8722}}\\n' >&2\nwhile read -r line; do :; done",
-            applied.display()
-        ));
-        let path = PathBuf::from(fixture.get_program());
-        let starts = std::cell::Cell::new(0);
-        let start = |config: &McpConfig| {
-            starts.set(starts.get() + 1);
-            let mut command =
-                helper_command(&path, config, "http://127.0.0.1:12345", &generate_token())?;
-            ManagedProcess::start(&mut command, Duration::from_secs(1), None)
-                .map(|process| (process, None))
-        };
-        let mut runtime = McpRuntime::default();
-        let mut config = McpConfig::default();
-        runtime.reconcile_with(&config, |_| panic!("disabled must not execute helper"));
-        config.enabled = true;
-        config.token = Some("initial-token".into());
-        runtime.reconcile_with(&config, start);
-        assert_eq!(
-            std::fs::read_to_string(&applied).unwrap(),
-            "initial-token|false"
-        );
-        let first = runtime
-            .process
-            .as_ref()
-            .unwrap()
-            .child
-            .as_ref()
-            .unwrap()
-            .id() as i32;
-        runtime.reconcile_with(&config, start);
-        assert_eq!(
-            starts.get(),
-            1,
-            "unchanged running config must retain child"
-        );
-        config.token = Some("rotated-token".into());
-        runtime.reconcile_with(&config, start);
-        assert_eq!(
-            unsafe { libc::kill(first, 0) },
-            -1,
-            "old token's helper must be reaped"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&applied).unwrap(),
-            "rotated-token|false"
-        );
-        let second = runtime
-            .process
-            .as_ref()
-            .unwrap()
-            .child
-            .as_ref()
-            .unwrap()
-            .id() as i32;
-        config.allow_write = true;
-        runtime.reconcile_with(&config, start);
-        assert_eq!(unsafe { libc::kill(second, 0) }, -1);
-        assert_eq!(
-            std::fs::read_to_string(&applied).unwrap(),
-            "rotated-token|true"
-        );
-        let third = runtime
-            .process
-            .as_ref()
-            .unwrap()
-            .child
-            .as_ref()
-            .unwrap()
-            .id() as i32;
-        config.enabled = false;
-        runtime.reconcile_with(&config, |_| panic!("disable must not execute helper"));
-        assert_eq!(unsafe { libc::kill(third, 0) }, -1);
-        assert!(runtime.status(config.clone()).token.is_none());
-        config.enabled = true;
-        runtime.reconcile_with(&config, |_| Err(McpError::PortInUse));
-        assert!(runtime.process.is_none());
-        assert_eq!(runtime.last_error, Some(McpError::PortInUse));
-        runtime.reconcile_with(&config, start); // Same enabled config explicitly retries.
-        assert!(runtime.process.is_some());
-        assert!(runtime.last_error.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_mcp_quit_cancels_pending_startup_and_prevents_later_spawn() {
-        let directory = tempfile::tempdir().unwrap();
-        let pid_path = directory.path().join("pid");
-        let mut command = fixture_command(
-            &directory,
-            &format!(
-                "printf '%s' $$ > '{}'\nwhile :; do :; done",
-                pid_path.display()
-            ),
-        );
-        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
-        let quit = shutdown.clone();
-        let signal = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            quit.store(true, Ordering::SeqCst);
-        });
-        let began = Instant::now();
-        assert!(matches!(
-            ManagedProcess::start(&mut command, STARTUP_TIMEOUT, Some(&shutdown)),
-            Err(McpError::StartFailed)
-        ));
-        signal.join().unwrap();
-        assert!(began.elapsed() < Duration::from_secs(2));
-        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        std::fs::remove_file(&pid_path).unwrap();
-        assert!(matches!(
-            ManagedProcess::start(&mut command, STARTUP_TIMEOUT, Some(&shutdown)),
-            Err(McpError::StartFailed)
-        ));
-        assert!(
-            !pid_path.exists(),
-            "a pending setup after quit must never spawn"
-        );
+        drop(listener);
     }
 }

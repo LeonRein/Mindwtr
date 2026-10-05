@@ -420,23 +420,6 @@ jobs:
           # sees data (#1054).
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Sign bundled MCP helper and re-seal host
-        if: env.APPLE_SIGNING_IDENTITY != ''
-        run: |
-          set -euo pipefail
-          APP_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
-          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
-          node scripts/build-mcp-sidecar-sign.mjs "$APP_PATH" "$APPLE_SIGNING_IDENTITY" developer-id
-        shell: bash
-
-      - name: Smoke test signed standalone MCP helper
-        run: |
-          set -euo pipefail
-          APP_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
-          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
-          node scripts/build-mcp-sidecar-smoke.mjs "$APP_PATH/Contents/MacOS/mindwtr-mcp"
-        shell: bash
-
       - name: Build and embed macOS widget
         if: env.APPLE_SIGNING_IDENTITY != ''
         env:

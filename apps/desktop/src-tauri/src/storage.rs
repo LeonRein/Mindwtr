@@ -5153,6 +5153,26 @@ where
     Err("Failed to mutate task rows".to_string())
 }
 
+#[cfg(test)]
+pub(crate) fn local_operation_test_seed(conn: &mut Connection, data: &Value) -> Result<(), String> {
+    conn.execute_batch(SQLITE_SCHEMA)
+        .map_err(|error| error.to_string())?;
+    migrate_json_to_sqlite(conn, data)
+}
+
+#[cfg(test)]
+pub(crate) fn local_operation_test_commit<F>(
+    conn: &Connection,
+    scope: TaskMutationReadScope,
+    mut mutate: F,
+) -> Result<Value, String>
+where
+    F: FnMut(&mut Value) -> Result<(String, Vec<Value>), String>,
+{
+    commit_task_row_mutation(conn, &scope, &mut mutate)?;
+    read_sqlite_data(conn)
+}
+
 fn commit_task_row_mutation<T, F>(
     conn: &Connection,
     scope: &TaskMutationReadScope,

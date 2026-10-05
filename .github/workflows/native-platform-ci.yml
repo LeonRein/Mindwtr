@@ -14,9 +14,6 @@ on:
     paths:
       - ".github/workflows/native-platform-ci.yml"
       - "apps/desktop/src-tauri/**"
-      - "apps/mcp-server/**"
-      - "scripts/build-mcp-sidecar*"
-      - ".bun-version"
       - "apps/desktop/widgets-macos/**"
       - "scripts/build-macos-widget.sh"
       - "scripts/ci/test-build-macos-widget.sh"
@@ -70,9 +67,6 @@ on:
     paths:
       - ".github/workflows/native-platform-ci.yml"
       - "apps/desktop/src-tauri/**"
-      - "apps/mcp-server/**"
-      - "scripts/build-mcp-sidecar*"
-      - ".bun-version"
       - "apps/desktop/widgets-macos/**"
       - "scripts/build-macos-widget.sh"
       - "scripts/ci/test-build-macos-widget.sh"
@@ -262,12 +256,12 @@ jobs:
           windows=false
           while IFS= read -r path; do
             case "$path" in
-              apps/desktop/src-tauri/*|apps/mcp-server/*|scripts/build-mcp-sidecar*|.bun-version|apps/desktop/widgets-macos/*|scripts/build-macos-widget.sh|scripts/ci/test-build-macos-widget.sh|packages/core/src/*|scripts/check-synced-field-parity.ts|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+              apps/desktop/src-tauri/*|apps/desktop/widgets-macos/*|scripts/build-macos-widget.sh|scripts/ci/test-build-macos-widget.sh|packages/core/src/*|scripts/check-synced-field-parity.ts|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
                 macos=true
                 ;;
             esac
             case "$path" in
-              apps/desktop/src-tauri/*|apps/mcp-server/*|scripts/build-mcp-sidecar*|.bun-version|packages/core/src/*|packages/core/package.json|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+              apps/desktop/src-tauri/*|.github/workflows/native-platform-ci.yml)
                 windows=true
                 ;;
             esac
@@ -317,17 +311,6 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: apps/desktop/src-tauri
-
-      - name: Setup Bun for bundled MCP
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: ".bun-version"
-
-      - name: Install bundled MCP build dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Build bundled MCP before native compilation
-        run: bun scripts/build-mcp-sidecar.mjs
 
       - name: Check macOS Rust and Objective-C bridge
         run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
@@ -405,37 +388,6 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: apps/desktop/src-tauri
-
-      - name: Setup Bun for bundled MCP
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: ".bun-version"
-
-      - name: Install bundled MCP build dependencies
-        shell: pwsh
-        run: |
-          node scripts/ci/prepare-windows-bun-install.js
-          $cacheDir = Join-Path $env:RUNNER_TEMP 'bun-install-cache-1'
-          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-          bun install --frozen-lockfile --cache-dir "$cacheDir" --backend copyfile --network-concurrency 8
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "bun install failed, retrying from clean project and cache directories..."
-            if (Test-Path node_modules) {
-              Remove-Item node_modules -Recurse -Force
-            }
-            $cacheDir = Join-Path $env:RUNNER_TEMP 'bun-install-cache-2'
-            if (Test-Path $cacheDir) {
-              Remove-Item $cacheDir -Recurse -Force
-            }
-            New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-            bun install --frozen-lockfile --cache-dir "$cacheDir" --backend copyfile --network-concurrency 1 --concurrent-scripts 1
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
-          }
-
-      - name: Build bundled MCP before native compilation
-        run: bun scripts/build-mcp-sidecar.mjs
 
       - name: Check Windows Rust
         run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

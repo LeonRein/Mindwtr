@@ -67,15 +67,8 @@ test("updates an unpatched Flathub manifest fixture", () => {
   expect(updated).toContain("- VITE_ANALYTICS_RELEASE_VERSION=1.2.5");
   expect(updated).toContain("- VITE_DROPBOX_APP_KEY=fixture-key");
   expect(updated).toContain("- VITE_FEEDBACK_ENDPOINT_URL=https://feedback.fixture/");
-  expect(updated).toContain('https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-linux-x64-baseline.zip');
-  expect(updated).toContain('sha256: 6bddacd6a65855698b9816f2d74871eda4dd0b7fa921140c6445248f94a742fd');
-  expect(updated).toContain('only-arches: [aarch64]');
-  expect(updated).toContain('npm ci --prefix=.flatpak-mcp-install --offline --omit=optional --ignore-scripts');
-  const reactPeer = 'ln -sfn ../../../apps/desktop/node_modules/react packages/core/node_modules/react';
-  expect(updated).toContain(reactPeer);
-  expect(updated.indexOf(reactPeer)).toBeLessThan(updated.indexOf('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs'));
-  expect(updated).toContain('./.flatpak-bun/bun scripts/build-mcp-sidecar.mjs');
-  expect(updated).toContain('/app/bin/mindwtr-mcp');
+  expect(updated).not.toContain('mindwtr-mcp');
+  expect(updated).not.toContain('.flatpak-bun');
 });
 
 test("is idempotent after the workspace repair block has been patched", () => {
@@ -110,6 +103,24 @@ test("removes the rejected host keyring permission from an existing manifest", (
   });
   expect(updated.status, updated.stderr).toBe(0);
   expect(readFileSync(manifest, "utf8")).not.toContain("org.freedesktop.secrets");
+});
+
+test("removes old MCP build, install, and archive blocks", () => {
+  const { manifest, result } = runFixture("unpatched.yml");
+  expect(result.status, result.stderr).toBe(0);
+  const clean = readFileSync(manifest, "utf8");
+  const blocks = ["BUILD", "INSTALL", "BUN SOURCES"].map((name) =>
+    `      # BEGIN MINDWTR MCP ${name}\n      - stale-mcp-content\n      # END MINDWTR MCP ${name}\n`,
+  ).join("");
+  writeFileSync(manifest, clean + blocks);
+  const updated = spawnSync("bash", [script, commit, manifest.replace(/\/[^/]+$/, ""), "."], {
+    cwd: resolve("."), encoding: "utf8",
+    env: { ...process.env, MINDWTR_FLATHUB_MANIFEST_ONLY: "1",
+      ANALYTICS_HEARTBEAT_URL: "https://analytics.fixture/", VITE_ANALYTICS_RELEASE_VERSION: "1.2.5",
+      VITE_DROPBOX_APP_KEY: "fixture-key", VITE_FEEDBACK_ENDPOINT_URL: "https://feedback.fixture/" },
+  });
+  expect(updated.status, updated.stderr).toBe(0);
+  expect(readFileSync(manifest, "utf8")).toBe(clean);
 });
 
 test("fails closed when the generator repair block drifts", () => {

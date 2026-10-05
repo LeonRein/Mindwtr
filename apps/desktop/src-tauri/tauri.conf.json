@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "bun run dev:native",
-    "beforeBuildCommand": "bun run build:native"
+    "beforeDevCommand": "bun run dev:vite",
+    "beforeBuildCommand": "bun run build:vite"
   },
   "app": {
     "windows": [
@@ -31,9 +31,6 @@
   "bundle": {
     "active": true,
     "homepage": "https://mindwtr.app",
-    "externalBin": [
-      "binaries/mindwtr-mcp"
-    ],
     "linux": {
       "deb": {
         "files": {
