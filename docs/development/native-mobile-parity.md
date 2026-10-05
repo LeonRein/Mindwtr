@@ -1868,3 +1868,9 @@ Validation: 453 focused core cases passed, including 46 new cases; typecheck, sc
 A typed native operation can now retire an exact captured baseline generation using the existing descriptor-bound retirement implementation. It reports stable replacement generations or unsafe entries as retained. Missing or replaced managed roots and ambiguous read/durability failures still refuse; a prior absence observation grants no deletion permission. The older published-Add operation keeps its original strict outcomes.
 
 Validation: 157 real-descriptor/FIFO cases passed together with zero skips, including 23 new cases and 134 existing observation/publication/retirement checks. Signed development build, diagnostics-ledger checks and independent review passed without installation. Tests cover real permission refusal and cold retries; injected post-unlink hook errors establish boundary recovery, not an actual filesystem-sync syscall failure. This primitive still requires native Save/Discard journaling and a current shared reference check before it can be called by the editor.
+
+### iOS mixed draft sidecar storage (2026-10-05)
+
+The existing private sidecar now has a separate V3 reader and writer for ordered Add/Remove history. Remove retains exact request, projection and checkpoint evidence across interrupted writes. Older V1/V2 records cannot be overwritten through the V3 API, and the existing APIs remain unchanged. Capacity checks include the actual encoded record.
+
+Validation: 134 storage regression cases passed with zero failures or skips, including 20 new mixed-history cases; the signed development build and independent source review passed. An initial Swift overload ambiguity was corrected by giving the new write/preflight methods distinct names. No phone installation is claimed. Native Remove admission, mixed Save/Discard settlement and editor UI remain unfinished.
