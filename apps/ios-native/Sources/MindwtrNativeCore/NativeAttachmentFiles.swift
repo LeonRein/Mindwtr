@@ -44,6 +44,9 @@ final class NativeAttachmentFiles {
         let directoryIdentity: String
     }
     enum PublishedAttachmentRetirementOutcome: Sendable, Equatable { case removed, absent }
+    enum BaselineAttachmentRetirementOutcome: String, Sendable, Equatable {
+        case removed, absent, generationChanged, unsafeEntry
+    }
     /// Current eligible managed generation, separate from Add publication proof.
     struct BaselineAttachmentProof: Sendable, Equatable {
         let targetURI: String
@@ -206,15 +209,9 @@ final class NativeAttachmentFiles {
         // Cross-platform provider/remote records carry no native file authority.
         // Preserve the URI without attempting resolution or any target IO.
         guard scheme.lowercased() == "file" else { return observed(.unmanaged(targetURI: targetURI)) }
-        let pathBytes = Array(try Self.filePath(targetURI).utf8), prefix = Array((managedRoot.path + "/").utf8)
-        let leafBytes = Array(pathBytes.dropFirst(prefix.count))
-        // Do not drop empty path components: RN's flat suffix rejects both a
-        // trailing slash and doubled separators, even if POSIX resolves them.
-        guard pathBytes.starts(with: prefix), !leafBytes.isEmpty, !leafBytes.contains(47),
-              leafBytes == Array(attachmentID.utf8) || leafBytes.starts(with: Array((attachmentID + ".").utf8)) else {
+        guard let leaf = try baselineLeaf(attachmentID: attachmentID, targetURI: targetURI) else {
             return observed(.unmanaged(targetURI: targetURI))
         }
-        let leaf = String(decoding: leafBytes, as: UTF8.self)
         let documentFD = try openRoot(false); defer { Darwin.close(documentFD) }
         let managedEntry = Parent(fd: documentFD, leaf: "attachments")
         func namedIfPresent(_ parent: Parent) throws -> stat? {
@@ -280,6 +277,15 @@ final class NativeAttachmentFiles {
         guard content.size == before.st_size else { throw NativeAttachmentFilesError.unavailable }
         return observed(.present(.init(targetURI: targetURI, sha256: content.sha256, size: content.size,
             identity: Self.token(Identity(before)), directoryIdentity: try Self.token(Self.identity(managedFD)))))
+    }
+
+    private func baselineLeaf(attachmentID: String, targetURI: String) throws -> String? {
+        let pathBytes = Array(try Self.filePath(targetURI).utf8), prefix = Array((managedRoot.path + "/").utf8)
+        let leafBytes = Array(pathBytes.dropFirst(prefix.count))
+        // Empty components cannot expand RN's exact flat ID-name admission.
+        guard pathBytes.starts(with: prefix), !leafBytes.isEmpty, !leafBytes.contains(47),
+              leafBytes == Array(attachmentID.utf8) || leafBytes.starts(with: Array((attachmentID + ".").utf8)) else { return nil }
+        return String(decoding: leafBytes, as: UTF8.self)
     }
 
     /// Native-only evidence for a future durable copy intent, not editor ownership.
@@ -508,6 +514,37 @@ final class NativeAttachmentFiles {
         let path = try reference(targetURI)
         guard !path.cache, path.components.count == 2, path.components[0] == "attachments",
               !path.components[1].hasPrefix(".") else { throw NativeAttachmentFilesError.invalidRequest }
+        switch try retireGeneration(path: path, proof: proof, retainDifferent: false, checkCancellation: checkCancellation) {
+        case .removed: return .removed
+        case .absent: return .absent
+        case .generationChanged, .unsafeEntry: throw NativeAttachmentFilesError.unavailable
+        }
+    }
+
+    /// Only a separately journaled candidate and latest shared keep decision
+    /// may call this typed facade. An observation of absence is not a proof.
+    func retireBaselineAttachment(attachmentID: String, proof: BaselineAttachmentProof,
+                                  checkCancellation: () throws -> Void = {}) throws -> BaselineAttachmentRetirementOutcome {
+        guard Self.validBaselineAttachmentID(attachmentID), !proof.targetURI.isEmpty,
+              proof.targetURI.utf8.count <= 16 * 1024, !proof.targetURI.utf8.contains(0),
+              Self.validDigest(proof.sha256), proof.size >= 0, proof.size <= 9_007_199_254_740_991,
+              Self.validToken(proof.identity), Self.validToken(proof.directoryIdentity),
+              let leaf = try baselineLeaf(attachmentID: attachmentID, targetURI: proof.targetURI) else {
+            throw NativeAttachmentFilesError.invalidRequest
+        }
+        let outcome = try retireGeneration(path: Reference(cache: false, components: ["attachments", leaf]),
+            proof: PublishedAttachmentProof(sha256: proof.sha256, size: proof.size,
+                identity: proof.identity, directoryIdentity: proof.directoryIdentity),
+            retainDifferent: true, checkCancellation: checkCancellation)
+        let diagnostic = outcome == .removed ? "removed" : outcome == .absent ? "absent" : "retained"
+        NSLog("Native iOS attachment baseline file settled releaseCheck=v1.3.5/ios-baseline-file-settled outcome=%@", diagnostic)
+        return outcome
+    }
+
+    // One descriptor-bound retirement engine. Legacy publication mode retains
+    // its refusal/hook order; only baseline mode can positively keep a generation.
+    private func retireGeneration(path: Reference, proof: PublishedAttachmentProof, retainDifferent: Bool,
+                                  checkCancellation: () throws -> Void) throws -> BaselineAttachmentRetirementOutcome {
         try checkCancellation()
         let parent: Parent
         do { parent = try openParent(path) }
@@ -528,6 +565,22 @@ final class NativeAttachmentFiles {
             try validateParent()
         }
         try validateParent()
+        if retainDifferent {
+            let named: stat?
+            do { named = try Self.named(parent) }
+            catch NativeAttachmentFilesError.missing { named = nil }
+            if let before = named, before.st_mode & mode_t(S_IFMT) != mode_t(S_IFREG) || before.st_nlink != 1 {
+                func validateUnsafe() throws {
+                    try validateParent()
+                    let current = try Self.named(parent)
+                    guard Self.unchanged(before, current), before.st_nlink == current.st_nlink else {
+                        throw NativeAttachmentFilesError.unavailable
+                    }
+                }
+                try validateUnsafe(); try checkCancellation(); try validateUnsafe()
+                return .unsafeEntry
+            }
+        }
         let fd: Int32
         do { fd = try openFile(parent) }
         catch NativeAttachmentFilesError.missing {
@@ -548,14 +601,26 @@ final class NativeAttachmentFiles {
         func validateFile() throws {
             try stable(fd, before: before, parent: parent, path: path)
             try validateParent()
-            guard Self.token(Identity(before)) == proof.identity, before.st_size == proof.size,
-                  before.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
+            guard before.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
+            if !retainDifferent, Self.token(Identity(before)) != proof.identity || before.st_size != proof.size {
+                throw NativeAttachmentFilesError.unavailable
+            }
+            if retainDifferent, try Self.regular(fd).st_nlink != 1 || Self.named(parent).st_nlink != 1 {
+                throw NativeAttachmentFilesError.unavailable
+            }
         }
-        func check() throws { try checkCancellation(); try validateFile() }
+        func check() throws {
+            if retainDifferent { try validateFile() }
+            try checkCancellation(); try validateFile()
+        }
         try check()
+        if retainDifferent, Self.token(Identity(before)) != proof.identity || before.st_size != proof.size {
+            return .generationChanged
+        }
         let content = try hashContents(fd, checkCancellation: check)
         try check()
         guard content.sha256 == proof.sha256, content.size == proof.size else {
+            if retainDifferent { return .generationChanged }
             throw NativeAttachmentFilesError.unavailable
         }
         #if DEBUG

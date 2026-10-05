@@ -57,12 +57,13 @@ enum NativeAttachmentDraftFileRequest: Sendable {
     case publishStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof, targetURI: String, sha256: String)
     case verifyPublication(targetURI: String, stage: NativeAttachmentFiles.ReservedAttachmentStageProof, sha256: String, size: Int64)
     case retirePublished(targetURI: String, proof: NativeAttachmentFiles.PublishedAttachmentProof)
+    case retireBaseline(attachmentID: String, proof: NativeAttachmentFiles.BaselineAttachmentProof)
     case retirePrivateStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof, targetURI: String, operationID: String)
 
     fileprivate var isInstaller: Bool {
         switch self {
         case .prepareStage, .publishStage, .retirePrivateStage: return true
-        case .ensureManagedDirectory, .snapshotSource, .snapshotBaseline, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished: return false
+        case .ensureManagedDirectory, .snapshotSource, .snapshotBaseline, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished, .retireBaseline: return false
         }
     }
 
@@ -136,6 +137,12 @@ enum NativeAttachmentDraftFileRequest: Sendable {
             input = ["op": "retirePublished", "targetURI": targetURI,
                      "proof": ["sha256": proof.sha256, "size": proof.size,
                                "identity": proof.identity, "directoryIdentity": proof.directoryIdentity]]
+        case .retireBaseline(let attachmentID, let proof):
+            guard NativeAttachmentFiles.validBaselineAttachmentID(attachmentID) else { throw NativeAttachmentFilesError.invalidRequest }
+            try uri(proof.targetURI); try digest(proof.sha256); try token(proof.identity); try token(proof.directoryIdentity)
+            guard proof.size >= 0, proof.size <= 9_007_199_254_740_991 else { throw NativeAttachmentFilesError.invalidRequest }
+            input = ["op": "retireBaseline", "attachmentID": attachmentID, "proof": ["targetURI": proof.targetURI,
+                "sha256": proof.sha256, "size": proof.size, "identity": proof.identity, "directoryIdentity": proof.directoryIdentity]]
         case .retirePrivateStage(let stage, let targetURI, let operationID):
             try uri(targetURI)
             guard operationID.utf8.count == 32,
@@ -362,6 +369,9 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
             case .removed: return ["status": "removed"]
             case .absent: return ["status": "absent"]
             }
+        case .retireBaseline(let attachmentID, let proof):
+            let outcome = try files.retireBaselineAttachment(attachmentID: attachmentID, proof: proof, checkCancellation: token.check)
+            return ["status": outcome.rawValue]
         case .retirePrivateStage(let stage, let targetURI, let operationID):
             try token.check()
             // Once entered, the existing installer finishes durability even if
