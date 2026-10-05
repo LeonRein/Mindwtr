@@ -1122,11 +1122,11 @@ struct NativeAttachmentDraftStore {
 
     /// CoreHost alone supplies the fully validated, durable settled journal.
     /// Missing confirms parent durability; it never permits another file job.
-    func releaseSavedMixedMatching(fingerprint: String) throws {
+    func releaseSavedMixedMatching(fingerprint: String, allowsEmptyHistory: Bool = false) throws {
         try Self.require(Self.digest(fingerprint))
         if let binding = try readVersioned() {
             guard case .mixed(let record) = binding.record else { throw NativeAttachmentDraftStoreError.corrupt }
-            try Self.require(record.session.state == .active && !record.operations.isEmpty
+            try Self.require(record.session.state == .active && (allowsEmptyHistory || !record.operations.isEmpty)
                 && record.discard == nil && record.checkpointAdvance == nil
                 && record.operations.allSatisfy { entry in
                     if case .add(let op) = entry { return op.phase == .checkpointed && op.reason == nil }

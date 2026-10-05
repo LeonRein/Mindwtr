@@ -156,6 +156,15 @@ afterEach(async () => {
 });
 
 describe('internal complete owned editor Save', () => {
+    it('keeps an unchanged checklist bound after Swift sorts the prepared envelope keys', async () => {
+        const envelope = await plan(await request({ edits: { title: 'Sorted wire' } }));
+        const sorted = JSON.parse(JSON.stringify(envelope, (_field, value: unknown) =>
+            value && typeof value === 'object' && !Array.isArray(value)
+                ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))) : value)) as OwnedEditorCompleteSaveEnvelope;
+        const validation = unwrap(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(sorted));
+        expect(unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(sorted))).toEqual(validation.result);
+        expect(await rawTask()).toMatchObject({ title: 'Sorted wire', checklist: [item('one', 'First'), item('two', 'Second')] });
+    });
     it('atomically saves checklist, ordinary fields and mixed files from raw data, retaining concurrent cloud metadata and unrelated cells', async () => {
         const input = await request({ edits: { title: 'Edited', description: 'Edited notes' }, checklist: [item('one', 'Changed', true), item('three', 'Third')] });
         const durable = await rawTask(); durable.attachments![1].cloudKey = 'retained-cloud';

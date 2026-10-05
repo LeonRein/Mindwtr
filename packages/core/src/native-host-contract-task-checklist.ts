@@ -518,7 +518,7 @@ const directSaveUpdates = (source: Task, request: NativeChecklistSaveRequest, pr
     const draft = applyTaskDraftPatch(createTaskDraft(source), nativeTaskDraftPatchValues(draftRequest(request)));
     // Swift's sorted JSON keys must not turn an unchanged checklist into a draft edit.
     const editSource = { ...source, checklist: toChecklist(source.checklist) };
-    const updates = buildTaskEditUpdatePatch({ draft, checklist: request.checklist.value,
+    const updates = buildTaskEditUpdatePatch({ draft, checklist: toChecklist(request.checklist.value),
         attachments }, editSource);
     if (!updates) return null;
     if (request.attachments && !same(source.attachments ?? [], attachments)) updates.attachments = attachments;

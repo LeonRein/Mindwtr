@@ -146,6 +146,16 @@ public final class CoreHost: @unchecked Sendable {
                 expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
+    func saveAttachmentDraftComplete(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.saveAttachmentDraftComplete(saveRequestJSON: saveRequestJSON,
+                expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func readAttachmentDraft() async throws -> String {
         try await perform { try $0.readAttachmentDraft() }
     }
@@ -426,6 +436,7 @@ private final class Engine: @unchecked Sendable {
         var stages: [String?]
     }
     private struct MixedSaveJournal {
+        let selection: NativeAttachmentDraftCoordinator.MixedSaveSelection
         let fingerprint: String
         let envelopeJSON: String
         let snapshot: EditorDraftSnapshot
@@ -1769,6 +1780,60 @@ private final class Engine: @unchecked Sendable {
               attachments["base"] is [Any], attachments["value"] is [Any] else { throw ownedSaveFailure }
         return original
     }
+    private static func completeSaveRequest(_ value: Any?, taskID: String? = nil) throws -> [String: Any] {
+        guard let request = value as? [String: Any],
+              Set(request.keys) == Set(["id", "requestId", "base", "patch", "scheduleBase", "checklist", "attachments"]
+                + (request["recurrenceBase"] == nil ? [] : ["recurrenceBase"])
+                + (request["intent"] == nil ? [] : ["intent"])),
+              let id = request["id"] as? String, !id.isEmpty, taskID.map({ ownedEqual(id, $0) }) ?? true,
+              ownedDiscardUUID(request["requestId"])?.utf8.count == 36,
+              request["base"] is [String: Any], request["patch"] is [String: Any], request["scheduleBase"] is [String: Any],
+              request["recurrenceBase"] == nil || request["recurrenceBase"] is [String: Any],
+              request["intent"] == nil || ["cancel", "skip"].contains(request["intent"] as? String ?? ""),
+              let checklist = request["checklist"] as? [String: Any], Set(checklist.keys) == Set(["base", "value"]),
+              checklist["base"] is [Any], checklist["value"] is [Any],
+              let attachments = request["attachments"] as? [String: Any], Set(attachments.keys) == Set(["base", "value"]),
+              attachments["base"] is [Any], attachments["value"] is [Any] else { throw ownedSaveFailure }
+        return request
+    }
+    private static func completeOriginalRequest(_ attempt: EditorDraftAttempt) throws -> [String: Any] {
+        guard attempt.method == "attachmentDraftSave", attempt.argumentsJSON.utf8.count <= 2_000_000,
+              let args = try NativeJSON.jsonObject(with: Data(attempt.argumentsJSON.utf8)) as? [String], args.count == 1,
+              args[0].utf8.count <= 2_000_000 else { throw ownedSaveFailure }
+        return try completeSaveRequest(NativeJSON.jsonObject(with: Data(args[0].utf8)), taskID: attempt.taskID)
+    }
+    /// Structural selected-proof grammar before runtime/storage activation.
+    /// Shared validation subsequently proves every witness and affected row.
+    private static func completeSaveEnvelope(_ value: Any?) throws -> [String: Any] {
+        guard let envelope = value as? [String: Any], Set(envelope.keys) == Set(["request", "prepared"]),
+              let request = envelope["request"] as? [String: Any],
+              Set(request.keys) == Set(["version", "kind", "checkpoint", "ownedDraft", "saveRequest"]),
+              isInteger(request["version"], equalTo: 2), request["kind"] as? String == "owned-editor-file-edit-save",
+              let prepared = envelope["prepared"] as? [String: Any], Set(prepared.keys) == Set(["version", "kind", "request", "decision"]),
+              isInteger(prepared["version"], equalTo: 2), prepared["kind"] as? String == "owned-editor-file-edit-save",
+              equalJSON(prepared["request"], request), let decision = prepared["decision"] as? [String: Any],
+              Set(decision.keys) == Set(["kind", "prepared"]), let proof = decision["prepared"] as? [String: Any],
+              isInteger(proof["version"], equalTo: 2), equalJSON(proof["request"], request["saveRequest"]),
+              proof["witness"] is [String: Any], proof["result"] is [String: Any] else { throw ownedSaveFailure }
+        _ = try completeSaveRequest(request["saveRequest"])
+        switch decision["kind"] as? String {
+        case "changed":
+            guard Set(proof.keys) == Set(["version", "kind", "request", "witness", "effect", "result", "rawBefore"]),
+                  proof["kind"] as? String == "save", let effect = proof["effect"] as? [String: Any],
+                  effect["tasks"] is [[String: Any]], effect["projects"] is [[String: Any]], effect["sections"] is [[String: Any]],
+                  proof["rawBefore"] is [String: Any] else { throw ownedSaveFailure }
+        case "noop":
+            guard Set(proof.keys) == Set(["version", "kind", "request", "witness", "rawBefore", "result"]),
+                  proof["kind"] as? String == "noop", proof["rawBefore"] is [String: Any] else { throw ownedSaveFailure }
+        default: throw ownedSaveFailure
+        }
+        return envelope
+    }
+    private static func mixedSaveSelection(_ version: Any?) -> NativeAttachmentDraftCoordinator.MixedSaveSelection? {
+        if isInteger(version, equalTo: 2) { return .legacy }
+        if isInteger(version, equalTo: 3) { return .complete }
+        return nil
+    }
     /// Does not read files or assert a Save outcome. Startup separately binds
     /// the native files, then pure shared validation proves the complete effect.
     private func ownedSaveJournal(_ command: PendingCommand, checkingNative: Bool = true) throws -> OwnedSaveJournal {
@@ -1928,14 +1993,15 @@ private final class Engine: @unchecked Sendable {
             "stages": zip(stages, state.stages).map { ["requestId": $0.0, "outcome": $0.1.map { $0 as Any } ?? NSNull()] }] as [String: Any])
     }
     private func mixedSaveState(_ raw: String, authorities: [NativeAttachmentDraftCoordinator.MixedSaveAuthority],
-                                stages: [String]) throws -> MixedSaveSettlement {
+                                stages: [String], selection: NativeAttachmentDraftCoordinator.MixedSaveSelection = .legacy) throws -> MixedSaveSettlement {
         guard raw.utf8.count <= Self.ownedSaveMaximumBytes,
               let value = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
               Set(value.keys) == Set(["version", "kind", "phase", "resultJSON", "targets", "stages"]),
               Self.isInteger(value["version"], equalTo: 1), value["kind"] as? String == "owned-editor-file-edit-settlement",
               let phase = value["phase"] as? String, ["domainSaved", "settled"].contains(phase),
               let result = value["resultJSON"] as? String, let resultValue = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any],
-              Set(resultValue.keys) == Set(["id", "draft"]), resultValue["id"] is String, resultValue["draft"] is [String: Any],
+              Set(resultValue.keys) == Set(["id", "draft"] + (selection == .complete && resultValue["cancellation"] != nil ? ["cancellation"] : [])),
+              resultValue["id"] is String, resultValue["draft"] is [String: Any],
               let targets = value["targets"] as? [[String: Any]], targets.count == authorities.count,
               let privateStages = value["stages"] as? [[String: Any]], privateStages.count == stages.count else { throw Self.ownedSaveFailure }
         var outcomes: [String?] = [], stageOutcomes: [String?] = [], unresolved = false
@@ -1976,11 +2042,12 @@ private final class Engine: @unchecked Sendable {
               let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
               let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
               Set(wrapper.keys) == Set(["version", "recordSHA256", "envelope", "candidates", "stages"]),
-              Self.isInteger(wrapper["version"], equalTo: 2), let fingerprint = wrapper["recordSHA256"] as? String,
+              let selection = Self.mixedSaveSelection(wrapper["version"]),
+              let fingerprint = wrapper["recordSHA256"] as? String,
               fingerprint.utf8.count == 64, fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               let envelope = wrapper["envelope"] as? [String: Any], Set(envelope.keys) == Set(["request", "prepared"]),
               let request = envelope["request"] as? [String: Any], Set(request.keys) == Set(["version", "kind", "checkpoint", "ownedDraft", "saveRequest"]),
-              Self.isInteger(request["version"], equalTo: 1), request["kind"] as? String == "owned-editor-file-edit-save",
+              Self.isInteger(request["version"], equalTo: selection.envelopeVersion), request["kind"] as? String == "owned-editor-file-edit-save",
               let checkpoint = request["checkpoint"] as? [String: Any], Set(checkpoint.keys) == Set(["version", "sessionID", "taskID", "generation", "payloadJSON"]),
               Self.isInteger(checkpoint["version"], equalTo: 1), let snapshot = try? JSONDecoder().decode(EditorDraftSnapshot.self, from: Data(Self.ownedJSON(checkpoint).utf8)),
               let owned = request["ownedDraft"] as? [String: Any],
@@ -1988,16 +2055,21 @@ private final class Engine: @unchecked Sendable {
               Self.isInteger(owned["version"], equalTo: 3), let task = owned["taskID"] as? String, Self.ownedEqual(task, snapshot.taskID),
               let payload = owned["beforePayloadJSON"] as? String, Self.ownedEqual(payload, snapshot.payloadJSON),
               owned["initialPayloadJSON"] is String, owned["managedDirectoryURI"] is String,
-              let history = owned["priorOperations"] as? [[String: Any]], (1...128).contains(history.count),
-              let save = request["saveRequest"] as? [String: Any], Self.equalJSON(try Self.ownedOriginalRequest(attempt), save),
+              let history = owned["priorOperations"] as? [[String: Any]], (selection.allowsEmptyHistory ? 0...128 : 1...128).contains(history.count),
+              let save = request["saveRequest"] as? [String: Any],
+              Self.equalJSON(try (selection == .complete ? Self.completeOriginalRequest(attempt) : Self.ownedOriginalRequest(attempt)), save),
               let prepared = envelope["prepared"] as? [String: Any], Set(prepared.keys) == Set(["version", "kind", "request", "decision"]),
-              Self.isInteger(prepared["version"], equalTo: 1), prepared["kind"] as? String == "owned-editor-file-edit-save",
+              Self.isInteger(prepared["version"], equalTo: selection.envelopeVersion), prepared["kind"] as? String == "owned-editor-file-edit-save",
               Self.equalJSON(prepared["request"], request), let decision = prepared["decision"] as? [String: Any],
               let entries = wrapper["candidates"] as? [[String: Any]], let stages = wrapper["stages"] as? [String] else { throw Self.ownedSaveFailure }
-        switch decision["kind"] as? String {
+        if selection == .complete { _ = try Self.completeSaveEnvelope(envelope) }
+        else { switch decision["kind"] as? String {
         case "changed": guard Set(decision.keys) == Set(["kind", "prepared"]), decision["prepared"] is [String: Any] else { throw Self.ownedSaveFailure }
         case "noop": guard Set(decision.keys) == Set(["kind", "preparedAt", "deviceIdBefore", "scope", "effect"]) else { throw Self.ownedSaveFailure }
         default: throw Self.ownedSaveFailure
+        } }
+        if history.isEmpty {
+            guard entries.isEmpty, stages.isEmpty, Self.equalJSON(owned["initialPayloadJSON"], snapshot.payloadJSON) else { throw Self.ownedSaveFailure }
         }
         try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
         var addIDs: [String] = []
@@ -2020,7 +2092,7 @@ private final class Engine: @unchecked Sendable {
         }
         let settlement: MixedSaveSettlement?
         switch command.terminal {
-        case .success(let raw): settlement = try mixedSaveState(raw, authorities: authorities, stages: stages)
+        case .success(let raw): settlement = try mixedSaveState(raw, authorities: authorities, stages: stages, selection: selection)
         case .rejected(let message):
             guard isDefiniteRejection(message, method: command.method) else { throw Self.ownedSaveFailure }
             settlement = nil
@@ -2034,7 +2106,7 @@ private final class Engine: @unchecked Sendable {
                       Self.ownedEqual(try NativeAttachmentDraftStore.mixedFingerprint(record), fingerprint),
                       Self.ownedEqual(record.session.checkpoint, snapshot),
                       Self.equalJSON(try NativeJSON.jsonObject(with: Data(NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record,
-                        managedDirectoryURI: mixedSaveManagedURI()).utf8)), owned) else { throw Self.ownedSaveFailure }
+                        managedDirectoryURI: mixedSaveManagedURI(), selection: selection).utf8)), owned) else { throw Self.ownedSaveFailure }
             } else { guard settlement?.phase == "settled" else { throw Self.ownedSaveFailure } }
             let retainedEditor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
             if let current = try editorDrafts.read() {
@@ -2045,7 +2117,7 @@ private final class Engine: @unchecked Sendable {
             } else { guard settlement != nil else { throw Self.ownedSaveFailure } }
             guard try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == retainedEditor else { throw Self.ownedSaveFailure }
         }
-        return .init(fingerprint: fingerprint, envelopeJSON: try Self.ownedJSON(envelope), snapshot: snapshot, attempt: attempt,
+        return .init(selection: selection, fingerprint: fingerprint, envelopeJSON: try Self.ownedJSON(envelope), snapshot: snapshot, attempt: attempt,
             authorities: authorities, stages: stages, binding: binding, settlement: settlement)
     }
     private func decodeMixedSaveJournal(_ data: Data, checkingNative: Bool) throws -> PendingCommand {
@@ -2065,10 +2137,17 @@ private final class Engine: @unchecked Sendable {
         let captured = try mixedSaveJournal(command, checkingNative: false)
         let raw = try invoke("attachmentFileEditSaveValidate", arguments: [captured.envelopeJSON])
         guard let validation = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
-              Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.isInteger(validation["version"], equalTo: 1),
+              Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.isInteger(validation["version"], equalTo: captured.selection.envelopeVersion),
               validation["kind"] as? String == "owned-editor-file-edit-save", let expected = validation["result"] as? [String: Any],
-              Set(expected.keys) == Set(["id", "draft"]), let id = expected["id"] as? String, Self.ownedEqual(id, captured.snapshot.taskID),
+              Set(expected.keys) == Set(["id", "draft"] + (captured.selection == .complete && expected["cancellation"] != nil ? ["cancellation"] : [])),
+              let id = expected["id"] as? String, Self.ownedEqual(id, captured.snapshot.taskID),
               expected["draft"] is [String: Any], let plan = validation["settlementPlan"] as? [[String: Any]] else { throw Self.ownedSaveFailure }
+        if let cancellation = expected["cancellation"] {
+            guard let metadata = cancellation as? [String: Any], Set(metadata.keys) == Set(["cancelledAt", "undoEnabled", "message", "undoLabel"]),
+                  let at = metadata["cancelledAt"] as? String, Self.isCanonicalReviewInstant(at), Self.isBoolean(metadata["undoEnabled"]),
+                  (metadata["message"] as? String).map({ !$0.isEmpty && $0.utf16.count <= 512 }) == true,
+                  (metadata["undoLabel"] as? String).map({ !$0.isEmpty && $0.utf16.count <= 80 }) == true else { throw Self.ownedSaveFailure }
+        }
         let acknowledged = result ?? captured.settlement?.resultJSON
         if let acknowledged {
             guard let value = try NativeJSON.jsonObject(with: Data(acknowledged.utf8)) as? [String: Any], Self.equalJSON(expected, value) else { throw Self.ownedSaveFailure }
@@ -2198,7 +2277,7 @@ private final class Engine: @unchecked Sendable {
         if editorAbsent { guard turn.editor == nil else { throw Self.ownedSaveFailure } }
         if sidecarAbsent { guard !present else { throw Self.ownedSaveFailure } }
         try requireMixedSaveOwner(turn, cancellation: cancellation)
-        return .init(fingerprint: captured.fingerprint, envelopeJSON: captured.envelopeJSON, snapshot: captured.snapshot,
+        return .init(selection: captured.selection, fingerprint: captured.fingerprint, envelopeJSON: captured.envelopeJSON, snapshot: captured.snapshot,
             attempt: captured.attempt, authorities: captured.authorities, stages: captured.stages,
             binding: present ? turn.record : nil, settlement: state)
     }
@@ -2251,13 +2330,24 @@ private final class Engine: @unchecked Sendable {
     }
     func saveAttachmentDraftMixed(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int,
                                   cancellation: NativeAttachmentCancellation) throws -> String {
+        try saveAttachmentDraftMixed(saveRequestJSON: saveRequestJSON, expectedSession: expectedSession,
+            expectedGeneration: expectedGeneration, selection: .legacy, cancellation: cancellation)
+    }
+    func saveAttachmentDraftComplete(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int,
+                                     cancellation: NativeAttachmentCancellation) throws -> String {
+        try saveAttachmentDraftMixed(saveRequestJSON: saveRequestJSON, expectedSession: expectedSession,
+            expectedGeneration: expectedGeneration, selection: .complete, cancellation: cancellation)
+    }
+    private func saveAttachmentDraftMixed(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int,
+                                         selection: NativeAttachmentDraftCoordinator.MixedSaveSelection,
+                                         cancellation: NativeAttachmentCancellation) throws -> String {
         do {
             let prepared = try attachmentDraftCoordinatorV3(cancellation: cancellation).prepareMixedSave(saveRequestJSON,
-                session: expectedSession, generation: expectedGeneration, cancellation: cancellation)
+                session: expectedSession, generation: expectedGeneration, selection: selection, cancellation: cancellation)
             let attempt = EditorDraftAttempt(id: UUID().uuidString.lowercased(), sessionID: prepared.snapshot.sessionID,
                 taskID: prepared.snapshot.taskID, generation: prepared.snapshot.generation, method: "attachmentDraftSave",
                 argumentsJSON: try Self.ownedJSON([saveRequestJSON]))
-            let wrapper = try Self.ownedJSON(["version": 2, "recordSHA256": prepared.fingerprint,
+            let wrapper = try Self.ownedJSON(["version": selection.wrapperVersion, "recordSHA256": prepared.fingerprint,
                 "envelope": try NativeJSON.jsonObject(with: Data(prepared.envelopeJSON.utf8)),
                 "candidates": try prepared.candidates.map { ["index": $0.index, "authority": try $0.authority.object()] as [String: Any] },
                 "stages": prepared.stages] as [String: Any])
@@ -2295,7 +2385,9 @@ private final class Engine: @unchecked Sendable {
                                           before: AttachmentDraftBoundary, after: AttachmentDraftBoundary) throws {
         guard let captured = turn.validated else { throw Self.ownedSaveFailure }
         let state: MixedSaveSettlement?
-        if case .success(let raw) = command.terminal { state = try mixedSaveState(raw, authorities: captured.authorities, stages: captured.stages) }
+        if case .success(let raw) = command.terminal {
+            state = try mixedSaveState(raw, authorities: captured.authorities, stages: captured.stages, selection: captured.selection)
+        }
         else { state = nil }
         pending = command
         _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, promotion: true, proposedState: state)
@@ -2415,7 +2507,7 @@ private final class Engine: @unchecked Sendable {
                 let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
                 guard let binding = captured.binding, case .mixed(let record) = binding.record else { throw Self.ownedSaveFailure }
                 try mixedSaveCoordinator(command, turn: turn, cancellation: cancellation).verifyMixedSavePublished(record,
-                    envelopeJSON: captured.envelopeJSON, cancellation: cancellation)
+                    envelopeJSON: captured.envelopeJSON, selection: captured.selection, cancellation: cancellation)
                 #if DEBUG
                 try attachmentDraftHooks?.boundary?(.beforeSaveCommit)
                 #endif
@@ -2438,12 +2530,16 @@ private final class Engine: @unchecked Sendable {
                     targets: Array(repeating: nil, count: validated.1.count), stages: Array(repeating: nil, count: captured.stages.count))
                 command.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages)); savedResult = result
                 try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveTerminal, after: .afterSaveTerminal)
-                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["mixed-save", "domainSaved"])
+                if captured.selection == .complete { rememberConfirmedTaskCancellation(command) }
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: [captured.selection == .complete ? "complete-save" : "mixed-save", "domainSaved"])
                 _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
             }
             if case .rejected = command.terminal { return try finishMixedSaveRejection(command, turn: turn, cancellation: cancellation) }
             guard var state = try mixedSaveJournal(command).settlement else { throw Self.ownedSaveFailure }
             let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+            // Retained terminal replay validates and re-ACKs the exact complete
+            // cancellation before cleanup; preparation/unknown SQL grants none.
+            if captured.selection == .complete { rememberConfirmedTaskCancellation(command) }
             if state.phase != "settled" {
                 #if DEBUG
                 try attachmentDraftHooks?.boundary?(.beforeSaveEditorDetach)
@@ -2496,13 +2592,14 @@ private final class Engine: @unchecked Sendable {
             try attachmentDraftHooks?.boundary?(.beforeSaveRelease)
             #endif
             _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
-            try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseSavedMixedMatching(fingerprint: captured.fingerprint)
+            try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseSavedMixedMatching(fingerprint: captured.fingerprint,
+                allowsEmptyHistory: captured.selection == .complete)
             #if DEBUG
             try attachmentDraftHooks?.boundary?(.afterSaveRelease)
             #endif
             _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true, sidecarAbsent: true)
             try clearMixedSave(command, turn: turn, cancellation: cancellation, settled: true)
-            _ = try? invoke("attachmentDraftAcknowledged", arguments: ["mixed-save", "settled"])
+            _ = try? invoke("attachmentDraftAcknowledged", arguments: [captured.selection == .complete ? "complete-save" : "mixed-save", "settled"])
             return .success(state.resultJSON)
         } catch let rejected as CoreHostRejection { throw rejected }
         catch {
@@ -3486,9 +3583,12 @@ private final class Engine: @unchecked Sendable {
                       current.attempt.map({ Self.ownedEqual($0, attempt) }) == true else { throw Self.ownedSaveFailure }
             }
             try requireExactOwner()
-            let lineage = try NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record, managedDirectoryURI: mixedSaveManagedURI())
+            let selection: NativeAttachmentDraftCoordinator.MixedSaveSelection
+            if (try? Self.completeOriginalRequest(attempt)) != nil { selection = .complete }
+            else { _ = try Self.ownedOriginalRequest(attempt); selection = .legacy }
+            let lineage = try NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record,
+                managedDirectoryURI: mixedSaveManagedURI(), selection: selection)
             _ = try invoke("attachmentDraftValidateLineageV3", arguments: [lineage])
-            _ = try Self.ownedOriginalRequest(attempt)
             try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
             try requireExactOwner()
             try editorDrafts.thawOwnedSaveMatching(expected: snapshot, attempt: attempt)
@@ -6066,9 +6166,11 @@ private final class Engine: @unchecked Sendable {
                       let confirmed = confirmedTaskCancellationEnvelope,
                       let cancel = try NativeJSON.jsonObject(with: Data(confirmed.utf8)) as? [String: Any],
                       let original = cancel["request"] as? [String: Any],
-                      Self.equalJSON(request["cancelRequestId"], original["requestId"]) else {
+                      Self.equalJSON(request["cancelRequestId"], Self.isInteger(original["version"], equalTo: 2)
+                        ? (original["saveRequest"] as? [String: Any])?["requestId"] : original["requestId"]) else {
                     throw HostFailure("INVALID_INPUT: Undo needs the confirmed cancellation")
                 }
+                if Self.isInteger(original["version"], equalTo: 2) { _ = try Self.completeSaveEnvelope(cancel) }
                 let input = String(decoding: try JSONSerialization.data(withJSONObject: ["request": request, "cancel": cancel], options: [.sortedKeys]), as: UTF8.self)
                 let value = try invoke("taskCancellationUndoPrepare", arguments: [input])
                 guard let response = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
@@ -7045,6 +7147,9 @@ private final class Engine: @unchecked Sendable {
             faults?.commandDiagnostic?("taskCancellationUndo")
 #endif
             NSLog("Native iOS Task cancellation saved releaseCheck=v1.3.4/ios-task-cancel operation=undo outcome=confirmed")
+            if (try? cancellationUndoIsComplete(command)) == true {
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["complete-cancel-undo", "confirmed"])
+            }
         }
         if command.method == "checklistPreparedCommit", case .success = terminal,
            let args = try? NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String],
@@ -8999,6 +9104,18 @@ private final class Engine: @unchecked Sendable {
 
     private func rememberConfirmedTaskCancellation(_ command: PendingCommand) {
         if command.method == "taskCancellationUndoCommit" { confirmedTaskCancellationEnvelope = nil; return }
+        if command.method == Self.mixedSaveMethod {
+            guard case .success = command.terminal,
+                  let captured = try? mixedSaveJournal(command, checkingNative: false), captured.selection == .complete,
+                  captured.settlement != nil,
+                  let envelope = try? Self.completeSaveEnvelope(NativeJSON.jsonObject(with: Data(captured.envelopeJSON.utf8))),
+                  let request = envelope["request"] as? [String: Any],
+                  let save = request["saveRequest"] as? [String: Any], save["intent"] as? String == "cancel",
+                  let prepared = envelope["prepared"] as? [String: Any],
+                  let decision = prepared["decision"] as? [String: Any], decision["kind"] as? String == "changed" else { return }
+            confirmedTaskCancellationEnvelope = captured.envelopeJSON
+            return
+        }
         guard command.method == "checklistPreparedCommit",
               let args = try? NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String],
               let encoded = args.first,
@@ -11198,12 +11315,16 @@ private final class Engine: @unchecked Sendable {
         if command.method == "taskCancellationUndoCommit" {
             guard command.argumentsJSON.utf8.count <= 12_000_000,
                   let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
-                  args[0].utf8.count <= 2_000_000,
                   let envelope = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
                   Set(envelope.keys) == Set(["request", "prepared"]),
                   let request = envelope["request"] as? [String: Any],
                   let prepared = envelope["prepared"] as? [String: Any],
                   Self.equalJSON(prepared["request"], request) else { throw HostFailure("Malformed cancellation Undo journal") }
+            let complete = try cancellationUndoIsComplete(command, envelope: envelope)
+            guard args[0].utf8.count <= (complete ? Self.ownedSaveMaximumBytes : 2_000_000) else {
+                throw HostFailure("Malformed cancellation Undo journal")
+            }
+            if complete { try preflightCompleteCancellationUndo(command, envelope: envelope) }
             let encoded = String(decoding: try JSONSerialization.data(withJSONObject: [String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)]), as: UTF8.self)
             _ = try arguments("taskCancellationUndo", encoded)
             return args
@@ -11243,6 +11364,50 @@ private final class Engine: @unchecked Sendable {
             return args
         }
         return nil
+    }
+
+    private func cancellationUndoIsComplete(_ command: PendingCommand, envelope supplied: [String: Any]? = nil) throws -> Bool {
+        let envelope: [String: Any]
+        if let supplied { envelope = supplied }
+        else {
+            guard let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
+                  let parsed = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any] else {
+                throw HostFailure("Malformed cancellation Undo journal")
+            }
+            envelope = parsed
+        }
+        guard let request = envelope["request"] as? [String: Any], let prepared = envelope["prepared"] as? [String: Any],
+              let cancel = prepared["cancel"] as? [String: Any], let original = cancel["request"] as? [String: Any] else {
+            throw HostFailure("Malformed cancellation Undo journal")
+        }
+        if Self.isInteger(prepared["version"], equalTo: 2) {
+            _ = try Self.completeSaveEnvelope(cancel)
+            guard Set(prepared.keys) == Set(["version", "kind", "request", "cancel", "witness", "effect", "result", "rawBefore"]),
+                  prepared["kind"] as? String == "undo", Self.equalJSON(prepared["request"], request),
+                  prepared["witness"] is [String: Any], prepared["effect"] is [String: Any], prepared["rawBefore"] is [String: Any],
+                  let save = original["saveRequest"] as? [String: Any], save["intent"] as? String == "cancel",
+                  let cancelPrepared = cancel["prepared"] as? [String: Any], let decision = cancelPrepared["decision"] as? [String: Any],
+                  decision["kind"] as? String == "changed", Self.equalJSON(request["cancelRequestId"], save["requestId"]),
+                  let result = prepared["result"] as? [String: Any], Set(result.keys) == Set(["id"]),
+                  Self.equalJSON(result["id"], save["id"]) else { throw HostFailure("Malformed cancellation Undo journal") }
+            return true
+        }
+        guard Self.isInteger(prepared["version"], equalTo: 1), prepared["kind"] as? String == "undo",
+              original["version"] == nil, original["intent"] as? String == "cancel",
+              Self.equalJSON(request["cancelRequestId"], original["requestId"]) else { throw HostFailure("Malformed cancellation Undo journal") }
+        return false
+    }
+    private func preflightCompleteCancellationUndo(_ command: PendingCommand, envelope: [String: Any]) throws {
+        guard let prepared = envelope["prepared"] as? [String: Any], let result = prepared["result"] as? [String: Any],
+              Set(result.keys) == Set(["id"]), result["id"] is String else { throw Self.ownedSaveFailure }
+        var initial = command; initial.terminal = nil
+        var success = initial; success.terminal = .success(try Self.ownedJSON(result))
+        var rejection = initial; rejection.terminal = .rejected(String(repeating: "\u{0000}", count: Self.ownedSaveRejectionBytes))
+        // Reserve the actual Foundation escaping layers before any selected
+        // Undo commit; legacy Undo keeps its historical journal budget.
+        for representation in [command, initial, success, rejection] {
+            guard try JSONEncoder().encode(representation).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        }
     }
 
     private func journalLegacyAndCaptureArguments(_ command: PendingCommand) throws -> [Any] {
@@ -13647,6 +13812,11 @@ private final class Engine: @unchecked Sendable {
 
 
     private func persist(_ command: PendingCommand, mixedGuard: (() throws -> Void)? = nil) throws {
+        if command.method == "taskCancellationUndoCommit", try cancellationUndoIsComplete(command) {
+            // The same selected reader reserves future terminal capacity and
+            // bounds an actual terminal before generic persistence can write it.
+            _ = try journalArguments(command)
+        }
         if command.method == Self.mixedSaveMethod {
             let data = try ownedEncoded(command)
             guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }

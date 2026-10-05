@@ -3428,6 +3428,22 @@ export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLine
     readNativeAttachmentDraftRemoveFrozen } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft.ts'))};
 export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
 import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
+import { createNativeHostContract as createRealCompleteContract } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract.ts'))};
+import { NativeReceiptSqliteAdapter as RealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
+import { setStorageAdapter as setRealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/store.ts'))};
+const realCompleteContract = createRealCompleteContract();
+let realCompleteActivation;
+async function completeFixtureContract() {
+  if (!realCompleteActivation) realCompleteActivation = (async () => {
+    if (!globalThis.completeSqliteClient) throw new Error('complete SQLite fixture unavailable');
+    if (globalThis.completeSeed) await new RealCompleteAdapter(globalThis.completeSqliteClient).saveData(globalThis.completeSeed);
+    const adapter = new RealCompleteAdapter(globalThis.completeSqliteClient, { rejectConcurrentWrites: true });
+    setRealCompleteAdapter(adapter);
+    const ready = await realCompleteContract.activate({ writeSafetyReady: true, recoveryLoad: true });
+    if (!ready.ok) throw new Error('complete SQLite fixture activation failed: ' + JSON.stringify(ready));
+  })();
+  await realCompleteActivation; return realCompleteContract;
+}
 export { taskRevisionOf } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
 // File-only changed/noop fixtures have no ordinary patch fields. Refuse any
 // field edit rather than manufacturing a second editor field policy here.
@@ -3572,6 +3588,24 @@ export function createNativeHostContract(bindings = {}) {
     validatePreparedOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['validate', input]);
         return globalThis.realMixedSaveValidation ? realMixedSaveMethods.validatePreparedOwnedEditorFileEditTaskDraftSave(input) : globalThis.fileEditSaveReply; },
     async commitPreparedOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['commit', input]); return globalThis.fileEditSaveReply; },
+    async prepareOwnedEditorCompleteTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['completePrepare', input]);
+        return (await completeFixtureContract()).prepareOwnedEditorCompleteTaskDraftSave(input); },
+    validatePreparedOwnedEditorCompleteTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['completeValidate', input]);
+        return realCompleteContract.validatePreparedOwnedEditorCompleteTaskDraftSave(input); },
+    async commitPreparedOwnedEditorCompleteTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['completeCommit', input]);
+        return (await completeFixtureContract()).commitPreparedOwnedEditorCompleteTaskDraftSave(input); },
+    async prepareOwnedEditorCompleteTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['completeUndoPrepare', input]);
+        return (await completeFixtureContract()).prepareOwnedEditorCompleteTaskCancellationUndo(input); },
+    validatePreparedOwnedEditorCompleteTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['completeUndoValidate', input]);
+        return realCompleteContract.validatePreparedOwnedEditorCompleteTaskCancellationUndo(input); },
+    async commitPreparedOwnedEditorCompleteTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['completeUndoCommit', input]);
+        return (await completeFixtureContract()).commitPreparedOwnedEditorCompleteTaskCancellationUndo(input); },
+    async prepareTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['oldUndoPrepare', input]);
+        return realCompleteContract.prepareTaskCancellationUndo(input); },
+    validatePreparedTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['oldUndoValidate', input]);
+        return realCompleteContract.validatePreparedTaskCancellationUndo(input); },
+    async commitPreparedTaskCancellationUndo(input) { globalThis.fileEditSaveInputs.push(['oldUndoCommit', input]);
+        return realCompleteContract.commitPreparedTaskCancellationUndo(input); },
     async prepareOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyPrepare', input]); return globalThis.fileEditSaveReply; },
     validatePreparedOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyValidate', input]); return globalThis.fileEditSaveReply; },
     async commitPreparedOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyCommit', input]); return globalThis.fileEditSaveReply; },
@@ -3804,7 +3838,7 @@ const makeState = (taskCount, fakeDataSequence = [], hostPlatform = undefined, c
         createCount: 0, completeCount: 0, persistenceFailure: null, captureInputs: [],
         snapshotResult: { ok: true, value: { fileName: 'data.2026-09-24T10-00-00.000.snapshot.json', contents: '{}' } }, editorInputs: [], updateInputs: [], focusInputs: [],
         // host-polyfills.js gives QuickJS these; the harness runs host-entry alone.
-        AbortController, setTimeout, TextEncoder, URL,
+        AbortController, setTimeout, clearTimeout, TextEncoder, URL,
         languageInputs: [], projectInputs: [], settings: undefined, persistenceStatus: null, aiInputs: [],
         settingsReadFailure: false, afterLanguage: null, newInputs: [], menuInputs: [],
         fileCalls: [], ingestInputs: [], queueFiles: null, kv: {}, deleteResult: null, sandbox: false,
@@ -4076,8 +4110,9 @@ const poll = async (state, id) => {
     }
     await check(async () => {
         const value = { original: true }; historical.fileEditSaveReply = { ok: true, value };
-        assert.deepEqual(await call(historical, 'attachmentFileEditSaveValidate', {}), { ok: true, value });
-        assert.deepEqual(JSON.parse(JSON.stringify(historical.fileEditSaveInputs)), [['validate', {}]]);
+        const envelope = { request: { version: 1 }, prepared: { version: 1 } };
+        assert.deepEqual(await call(historical, 'attachmentFileEditSaveValidate', envelope), { ok: true, value });
+        assert.deepEqual(JSON.parse(JSON.stringify(historical.fileEditSaveInputs)), [['validate', envelope]]);
     });
     for (const [method, routed] of [['attachmentOwnedSavePrepare', 'legacyPrepare'], ['attachmentOwnedSaveValidate', 'legacyValidate'], ['attachmentOwnedSaveCommit', 'legacyCommit']]) {
         await check(async () => { await call(local, method, {}); assert.deepEqual(JSON.parse(JSON.stringify(local.fileEditSaveInputs.at(-1))), [routed, {}]); });
@@ -4410,6 +4445,173 @@ const poll = async (state, id) => {
         assert.equal((await poll(state, state.MindwtrHost.attachmentRequest('attachmentFileEditSaveRetire', '{}'))).ok, false);
     });
     console.log(`Task259: ${cases} synchronous mixed Save fence checks (real254 file-only pure validation + shared references/revision; NodeVM only)`);
+}
+// Task268: the real bound complete factory prepares/commits against SQLite;
+// the existing VM bridge still owns platform dispatch and same-turn callbacks.
+{
+    const { DatabaseSync } = await import('node:sqlite');
+    const AT = '2026-10-05T10:00:00.000Z', ROOT = 'file:///library/documents/attachments/';
+    const SESSION = '26800000-0000-4000-8000-000000000001', REQUEST = '26800000-0000-4000-8000-000000000002';
+    const configureLocal = (state) => {
+        state.localAttachmentTest = true;
+        for (const name of ['fileCall', 'installerCall', 'fileAbort', 'fileDeleteNow', 'ioNext', 'ioBody']) state.__mindwtrNative[name] = () => '';
+        state.__mindwtrNative.fileDirectories = () => JSON.stringify({ document: 'file:///library/documents/', cache: 'file:///library/cache/' });
+        state.__mindwtrFileCall = async () => null; state.__mindwtrInstallerCall = async () => null;
+    };
+    const databases = []; let cases = 0;
+    const check = async (work) => { await work(); cases++; };
+    const call = (state, method, input) => poll(state, state.MindwtrHost[method](JSON.stringify(input)));
+    const fixture = async ({ empty = false, noop = false, recurring = false, cancel = false, large = false } = {}) => {
+        const baseline = Array.from({ length: 2 }, (_, n) => ({ id: `file${n}`, kind: 'file', title: 'File', uri: ROOT + `${n}.pdf`,
+            size: 3, localStatus: 'available', createdAt: AT, updatedAt: AT }));
+        baseline.push({ ...baseline[0], id: 'old-tombstone', uri: ROOT + 'old.pdf', deletedAt: AT });
+        const source = { id: 'task268', title: 'Task', status: 'next', taskMode: 'list', tags: [], contexts: [], checklist: [],
+            description: large ? 'x'.repeat(270_000) : 'Notes', attachments: baseline, createdAt: AT, updatedAt: AT, rev: 8, revBy: 'before',
+            ...(recurring ? { dueDate: '2026-10-05', recurrence: { rule: 'daily', strategy: 'strict' } } : {}) };
+        const data = { tasks: [source], projects: [], sections: [], areas: [], people: [], settings: { deviceId: 'device268' } };
+        const db = new DatabaseSync(':memory:'); databases.push(db);
+        const state = makeState('auto', [], 'ios', (value) => {
+            configureLocal(value); value.fakeData = JSON.parse(JSON.stringify(data)); value.completeSeed = data;
+            value.completeSqliteClient = { run: async (sql, params = []) => { db.prepare(sql).run(...params); },
+                all: async (sql, params = []) => db.prepare(sql).all(...params),
+                get: async (sql, params = []) => db.prepare(sql).all(...params)[0], exec: async (sql) => { db.exec(sql); } };
+            value.realMixedSaveValidation = true;
+        });
+        assert.equal((await poll(state, state.MindwtrHost.boot())).ok, true);
+        const edited = recurring ? { status: 'done', completedAt: '', focusedToday: false } : noop || cancel ? {} : { title: 'Edited' };
+        const touchedBase = Object.fromEntries(Object.keys(edited).map((field) => [field, field === 'status' ? 'next' : field === 'focusedToday' ? false : field === 'title' ? 'Task' : '']));
+        const initialPayloadJSON = JSON.stringify({ version: 2, taskID: source.id, tab: 'task', touchedBase, edited,
+            raw: { title: edited.title ?? '', note: '', location: '', estimate: '', estimateResolved: '', timeSpent: '', timeSpentResolved: '',
+                tokens: {}, tokenCanonical: {}, tokenResolved: {}, tokenEdited: [], checklistInputs: {}, checklistAppend: '',
+                relativeAmount: '', relativeUnit: '', relativeOwned: false, relativeCommitRequested: false,
+                recurrenceInputs: {}, recurrenceOwned: [], recurrenceCommitRequested: [] }, scheduleEdits: [], scheduleFailedID: null,
+            attachmentsOwned: true, attachmentsBase: baseline, attachments: baseline, linkSheet: {} });
+        const ownedDraft = { version: 3, taskID: source.id, initialPayloadJSON, beforePayloadJSON: initialPayloadJSON,
+            priorOperations: [], managedDirectoryURI: ROOT };
+        if (!empty) for (let index = 0; index < (recurring || cancel ? 1 : 2); index++) {
+            const removed = await call(state, 'attachmentDraftRemovePrepareV3', { ...ownedDraft,
+                requestId: `26800000-0000-4000-8000-${String(index + 3).padStart(12, '0')}`, attachmentId: `file${index}` });
+            assert.equal(removed.ok, true); ownedDraft.beforePayloadJSON = removed.value.afterPayloadJSON;
+            ownedDraft.priorOperations.push({ kind: 'remove', operation: removed.value });
+        }
+        const draft = JSON.parse(ownedDraft.beforePayloadJSON).attachments;
+        if (noop && !empty) source.attachments = draft;
+        const request = { version: 2, kind: 'owned-editor-file-edit-save',
+            checkpoint: { version: 1, sessionID: SESSION, taskID: source.id, generation: ownedDraft.priorOperations.length + 1, payloadJSON: ownedDraft.beforePayloadJSON },
+            ownedDraft, saveRequest: { id: source.id, requestId: REQUEST, base: touchedBase, patch: edited,
+                scheduleBase: { startTime: null, dueDate: recurring ? '2026-10-05' : null, relativeStartOffset: null, reviewAt: null },
+                checklist: { base: [], value: [] }, attachments: { base: baseline, value: draft }, ...(cancel ? { intent: 'cancel' } : {}) } };
+        const prepared = await call(state, 'attachmentFileEditSavePrepare', request);
+        assert.equal(prepared.ok, true, JSON.stringify(prepared)); assert.equal(prepared.value.kind, 'prepared');
+        const envelope = { request, prepared: prepared.value.prepared };
+        const checked = await call(state, 'attachmentFileEditSaveValidate', envelope); assert.equal(checked.ok, true);
+        const after = envelope.prepared.decision.kind === 'changed'
+            ? envelope.prepared.decision.prepared.effect.tasks.find((row) => row.after.id === source.id).after
+            : envelope.prepared.decision.prepared.witness.source;
+        return { state, db, request, envelope, after, plan: checked.value.settlementPlan };
+    };
+    const syncLive = (f) => {
+        f.state.lastLoaded.tasks = f.db.prepare('SELECT id, rev, revBy, updatedAt, attachments FROM tasks ORDER BY id').all()
+            .map((row) => ({ ...row, attachments: JSON.parse(row.attachments ?? '[]') }));
+        f.state.ownerTaskMap = new Map(f.state.lastLoaded.tasks.map((row) => [row.id, row]));
+    };
+    const invoke = (f, index = 0, envelopeJSON = JSON.stringify(f.envelope)) => {
+        const seen = [], callback = (outcome) => function () { assert.equal(arguments.length, 0); seen.push(outcome); return JSON.stringify({ outcome }); };
+        const result = f.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: 1, envelopeJSON, candidateIndex: index }),
+            callback('referenced'), callback('taskChanged'), callback('removed'));
+        return { result: JSON.parse(result), seen };
+    };
+    try {
+        for (const options of [{ empty: true }, { empty: true, noop: true }, { noop: true }, {}]) await check(async () => {
+            const f = await fixture(options); assert.equal(f.envelope.prepared.version, 2);
+            assert.equal(f.envelope.prepared.decision.kind, options.noop ? 'noop' : 'changed');
+            if (options.empty) assert.equal(f.plan.length, 0, 'empty history protects even old baseline tombstones');
+            const committed = await call(f.state, 'attachmentFileEditSaveCommit', f.envelope); assert.equal(committed.ok, true);
+            assert.equal(f.state.fileEditSaveInputs.at(-1)[0], 'completeCommit'); syncLive(f);
+            if (!options.empty) assert.deepEqual(invoke(f), { result: { outcome: 'removed' }, seen: ['removed'] });
+            if (options.empty && options.noop) assert.equal(f.db.prepare('SELECT rev FROM tasks WHERE id = ?').get('task268').rev, 8);
+        });
+        const recurring = await fixture({ recurring: true });
+        await check(async () => {
+            assert.equal((await call(recurring.state, 'attachmentFileEditSaveCommit', recurring.envelope)).ok, true); syncLive(recurring);
+            const child = recurring.state.lastLoaded.tasks.find((row) => row.id !== 'task268'); assert(child);
+            assert(child.attachments.some((row) => row.uri === ROOT + '0.pdf' && !row.deletedAt));
+            const index = recurring.plan.findIndex((row) => row.attachment.uri === ROOT + '0.pdf'); assert(index >= 0);
+            assert.deepEqual(invoke(recurring, index), { result: { outcome: 'referenced' }, seen: ['referenced'] }, 'fresh generated child keeps the source tombstone bytes');
+        });
+        const reusable = await fixture(); assert.equal((await call(reusable.state, 'attachmentFileEditSaveCommit', reusable.envelope)).ok, true); syncLive(reusable);
+        const validations = () => reusable.state.fileEditSaveInputs.filter(([name]) => name === 'completeValidate').length;
+        const first = reusable.plan.findIndex((row) => row.attachment.id === 'file0'), second = reusable.plan.findIndex((row) => row.attachment.id === 'file1');
+        assert(first >= 0 && second >= 0 && second < reusable.plan.length - 1);
+        await check(async () => {
+            const before = validations(); invoke(reusable, first); reusable.state.ownerProjects = [{ attachments: [{ kind: 'file', uri: ROOT + '1.pdf' }] }];
+            assert.deepEqual(invoke(reusable, second), { result: { outcome: 'referenced' }, seen: ['referenced'] });
+            reusable.state.ownerProjects = []; reusable.state.ownerTaskMap = new Map([['task268', { ...reusable.after, rev: reusable.after.rev + 1 }]]);
+            assert.deepEqual(invoke(reusable, second), { result: { outcome: 'taskChanged' }, seen: ['taskChanged'] }); syncLive(reusable);
+            assert.equal(validations() - before, 1, 'exact complete plan hits retain fresh project refs and current revision');
+        });
+        await check(async () => {
+            const before = validations(), raw = JSON.stringify(reusable.envelope);
+            for (const text of [` ${raw}\n`, raw.replaceAll('task268', 't\\u0061sk268'), raw]) invoke(reusable, first, text);
+            assert.equal(validations() - before, 3, 'raw whitespace and Unicode spelling do not share authority');
+            reusable.state.persistenceStatus = { generation: 0, queued: true };
+            assert.throws(() => invoke(reusable, second), /NOT_READY/); reusable.state.persistenceStatus.queued = false;
+            const row = { id: 'inert' }; Object.defineProperty(row, 'attachments', { get() { reusable.state.persistenceStatus.generation++; return []; } });
+            reusable.state.lastLoaded.tasks.push(row); assert.throws(() => invoke(reusable, second), /NOT_READY/); syncLive(reusable);
+        });
+        await check(async () => {
+            const historical = makeState(0, [], 'ios'); historical.sandbox = true; historical.workspaceTransition = true;
+            assert.equal((await call(historical, 'attachmentFileEditSaveValidate', reusable.envelope)).ok, true);
+            for (const version of [0, 3, null]) {
+                const wrong = JSON.parse(JSON.stringify(reusable.envelope)); wrong.request.version = version;
+                assert.equal((await call(historical, 'attachmentFileEditSaveValidate', wrong)).ok, false);
+            }
+            for (const field of ['request', 'prepared']) {
+                const wrong = JSON.parse(JSON.stringify(reusable.envelope)); wrong[field].version = 1;
+                assert.equal((await call(historical, 'attachmentFileEditSaveValidate', wrong)).ok, false);
+                assert.equal((await call(reusable.state, 'attachmentFileEditSaveCommit', wrong)).ok, false);
+            }
+            const old = JSON.parse(JSON.stringify(reusable.envelope)); old.request.version = 1; old.prepared.version = 1; old.prepared.request = old.request;
+            assert.equal((await call(reusable.state, 'attachmentFileEditSaveValidate', old)).ok, false, 'old factory rejects the selected inner grammar');
+            const android = makeState(0, [], 'android', configureLocal);
+            for (const method of ['attachmentFileEditSavePrepare', 'attachmentFileEditSaveValidate', 'attachmentFileEditSaveCommit'])
+                assert.equal((await call(android, method, method.endsWith('Prepare') ? reusable.request : reusable.envelope)).ok, false);
+            assert.equal((await poll(reusable.state, reusable.state.MindwtrHost.attachmentRequest('attachmentFileEditSavePrepare', JSON.stringify(reusable.request)))).ok, false);
+        });
+        const cancel = await fixture({ cancel: true, large: true });
+        await check(async () => {
+            const result = await call(cancel.state, 'attachmentFileEditSaveCommit', cancel.envelope); assert.equal(result.ok, true); assert(result.value.cancellation);
+            const attachments = JSON.parse(cancel.db.prepare('SELECT attachments FROM tasks WHERE id = ?').get('task268').attachments);
+            attachments.push({ ...attachments[0], id: 'later', uri: ROOT + 'later.pdf', deletedAt: undefined });
+            cancel.db.prepare('UPDATE tasks SET title = ?, attachments = ?, rev = rev + 1 WHERE id = ?').run('Later title', JSON.stringify(attachments), 'task268');
+            const request = { requestId: '26800000-0000-4000-8000-000000000099', cancelRequestId: REQUEST };
+            const cold = makeState(0, [], 'ios', (value) => { value.completeSqliteClient = cancel.state.completeSqliteClient; });
+            assert.equal((await poll(cold, cold.MindwtrHost.boot())).ok, true);
+            const prepared = await call(cold, 'taskCancellationUndoPrepare', { request, cancel: cancel.envelope }); assert.equal(prepared.ok, true, JSON.stringify(prepared));
+            const undo = { request, prepared: prepared.value.prepared }, bytes = Buffer.byteLength(JSON.stringify(undo));
+            assert(bytes > 2_000_000 && bytes < 8 * 1024 * 1024, 'selected Undo crosses the old editor bound but stays attachment-bounded');
+            const historical = makeState(0, [], 'ios');
+            assert.equal((await call(historical, 'taskCancellationUndoValidate', undo)).ok, true);
+            assert.equal((await call(cold, 'taskCancellationUndoCommit', undo)).ok, true, 'cold metadata Undo needs no current local attachment capability');
+            const row = cancel.db.prepare('SELECT title, status, attachments FROM tasks WHERE id = ?').get('task268');
+            assert.equal(row.title, 'Later title'); assert.equal(row.status, 'next'); assert(JSON.parse(row.attachments).some((entry) => entry.id === 'later'));
+            for (const mutate of [(value) => { value.prepared.cancel.request.saveRequest.requestId += '\n'; }, (value) => { value.prepared.version = 1; }]) {
+                const wrong = JSON.parse(JSON.stringify(undo)); mutate(wrong); assert.equal((await call(historical, 'taskCancellationUndoValidate', wrong)).ok, false);
+            }
+            const android = makeState(0, [], 'android'); assert.equal((await call(android, 'taskCancellationUndoValidate', undo)).ok, false);
+            assert.equal((await call(historical, 'taskCancellationUndoValidate', { request, prepared: { version: 1, kind: 'undo', oversized: 'x'.repeat(2_000_001) } })).ok, false,
+                'legacy iOS Undo retains its ordinary editor bound');
+        });
+        await check(async () => {
+            reusable.state.order268 = []; reusable.state.input268 = JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(reusable.envelope), candidateIndex: first });
+            reusable.state.keep268 = () => { throw Error('wrong branch'); }; reusable.state.retire268 = () => { reusable.state.order268.push('retire'); return '{"outcome":"absent"}'; };
+            vm.runInNewContext(`Promise.resolve().then(() => order268.push('microtask'));
+                MindwtrHost.attachmentFileEditSaveRetire(input268, keep268, keep268, retire268); order268.push('returned');`, reusable.state);
+            assert.deepEqual(reusable.state.order268, ['retire', 'returned']); await new Promise((done) => setImmediate(done));
+            assert.deepEqual(reusable.state.order268, ['retire', 'returned', 'microtask']);
+        });
+    } finally { for (const db of databases) db.close(); }
+    console.log(`Task268: ${cases} complete Save/Undo/retire checks (real bound266 factory + SQLite, fresh refs and same-turn callbacks; Node VM)`);
 }
 // Task244: production direct handoff plus actual RN live-reference helper.
 // Native proof/lease/filesystem and real-JSC ordering acceptance are Task243.
@@ -4777,6 +4979,29 @@ const poll = async (state, id) => {
         const android = makeState(0);
         assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('provider-add', 'confirmed'))).ok, true);
         assert.equal(android.logText, null);
+    });
+    await check('complete Save and cancellation Undo acknowledgment pairs are fixed and capability-independent on iOS', async () => {
+        const local = makeState(0, [], 'ios');
+        for (const [operation, outcome] of [['complete-save', 'domainSaved'], ['complete-save', 'settled'], ['complete-cancel-undo', 'confirmed']]) {
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(operation, outcome))).ok, true);
+            assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+                { releaseCheck: 'v1.3.5/ios-attachment-complete-save', operation, outcome });
+        }
+        const before = local.logText;
+        for (const operation of ['complete-save', 'complete-cancel-undo']) for (const outcome of ['retained', 'replayed', 'removed', '', 'unknown'])
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(operation, outcome))).ok, true);
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('complete-save', 'confirmed'))).ok, true);
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('complete-cancel-undo', 'settled'))).ok, true);
+        assert.equal(local.logText, before);
+        local.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('complete-save', 'settled'))).ok, true);
+        assert.equal(local.logText, before);
+        for (const platform of ['android', undefined]) {
+            const absent = makeState(0, [], platform);
+            assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('complete-save', 'domainSaved'))).ok, true);
+            assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('complete-cancel-undo', 'confirmed'))).ok, true);
+            assert.equal(absent.logText, null);
+        }
     });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }

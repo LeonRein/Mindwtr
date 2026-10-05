@@ -1067,9 +1067,16 @@ final class NativeAttachmentDraftCoordinator {
         let candidates: [MixedSaveCandidate]
         let stages: [String]
     }
-    static func mixedSaveLineageJSON(_ record: Store.MixedRecord, managedDirectoryURI: String) throws -> String {
+    enum MixedSaveSelection {
+        case legacy, complete
+        var envelopeVersion: Int { self == .complete ? 2 : 1 }
+        var wrapperVersion: Int { self == .complete ? 3 : 2 }
+        var allowsEmptyHistory: Bool { self == .complete }
+    }
+    static func mixedSaveLineageJSON(_ record: Store.MixedRecord, managedDirectoryURI: String,
+                                    selection: MixedSaveSelection = .legacy) throws -> String {
         _ = try Store.mixedFingerprint(record)
-        guard record.session.state == .active, !record.operations.isEmpty, record.discard == nil,
+        guard record.session.state == .active, selection.allowsEmptyHistory || !record.operations.isEmpty, record.discard == nil,
               record.checkpointAdvance == nil, record.operations.allSatisfy({ entry in
                   if case .add(let op) = entry { return op.phase == .checkpointed && op.reason == nil }
                   return entry.checkpointed
@@ -1081,7 +1088,7 @@ final class NativeAttachmentDraftCoordinator {
             }
         }
         return try json(["version": 3, "taskID": record.session.taskID,
-            "initialPayloadJSON": record.operations[0].before.payloadJSON,
+            "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
             "beforePayloadJSON": record.session.checkpoint.payloadJSON, "priorOperations": operations, "managedDirectoryURI": managedDirectoryURI])
     }
     static func mixedSaveAdds(_ record: Store.MixedRecord) -> [Store.Operation] {
@@ -1119,15 +1126,15 @@ final class NativeAttachmentDraftCoordinator {
             return .init(index: index, attachmentID: id, targetURI: uri, reason: reason, authority: authorities[index])
         }
     }
-    func prepareMixedSave(_ raw: String, session: String, generation: Int,
+    func prepareMixedSave(_ raw: String, session: String, generation: Int, selection: MixedSaveSelection = .legacy,
                           cancellation: NativeAttachmentCancellation) throws -> MixedSavePreparation {
         jobs.drain()
         let loaded = try mixedRead(cancellation), record = loaded.record
-        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI)
+        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: selection)
         guard let current = try editor.read(), current.attempt == nil, Self.equal(current.snapshot, record.session.checkpoint),
               Self.equal(session, current.snapshot.sessionID), session.utf8.count == 36, generation == current.snapshot.generation else { throw Self.failure }
         try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
-        let request: [String: Any] = ["version": 1, "kind": "owned-editor-file-edit-save",
+        let request: [String: Any] = ["version": selection.envelopeVersion, "kind": "owned-editor-file-edit-save",
             "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(current.snapshot), as: UTF8.self)),
             "ownedDraft": try Self.object(lineage), "saveRequest": try Self.object(raw, limit: 2_000_000)]
         let response = try mixedInvoke("attachmentFileEditSavePrepare", request, binding: loaded.binding, cancellation: cancellation)
@@ -1136,9 +1143,9 @@ final class NativeAttachmentDraftCoordinator {
               Self.equal(try Self.json(repeated), try Self.json(request)) else { throw Self.failure }
         let envelope = try Self.json(["request": request, "prepared": prepared])
         let validation = try mixedInvoke("attachmentFileEditSaveValidate", try Self.object(envelope), binding: loaded.binding, cancellation: cancellation)
-        guard Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.integer(validation["version"]) == 1,
+        guard Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.integer(validation["version"]) == Int64(selection.envelopeVersion),
               validation["kind"] as? String == "owned-editor-file-edit-save", let result = validation["result"] as? [String: Any],
-              let plan = validation["settlementPlan"] as? [[String: Any]] else { throw Self.failure }
+              let plan = validation["settlementPlan"] as? [[String: Any]], !record.operations.isEmpty || plan.isEmpty else { throw Self.failure }
         let adds = Self.mixedSaveAdds(record), baseline = ((request["saveRequest"] as? [String: Any])?["attachments"] as? [String: Any])?["base"] as? [[String: Any]] ?? []
         var authorities: [MixedSaveAuthority] = []
         for candidate in plan {
@@ -1156,23 +1163,53 @@ final class NativeAttachmentDraftCoordinator {
             } else { throw Self.failure }
         }
         let candidates = try Self.mixedSaveCandidates(plan: plan, envelopeJSON: envelope, authorities: authorities, record: record)
-        try verifyMixedSavePublished(record, envelopeJSON: envelope, cancellation: cancellation)
+        try verifyMixedSavePublished(record, envelopeJSON: envelope, selection: selection, cancellation: cancellation)
         try requireMixed(loaded.binding, cancellation); try self.current(current.snapshot)
         return .init(binding: loaded.binding, snapshot: current.snapshot, fingerprint: try Store.mixedFingerprint(record),
             envelopeJSON: envelope, resultJSON: try Self.json(result), candidates: candidates, stages: adds.map(\.requestId))
     }
-    func verifyMixedSavePublished(_ record: Store.MixedRecord, envelopeJSON: String,
+    func verifyMixedSavePublished(_ record: Store.MixedRecord, envelopeJSON: String, selection: MixedSaveSelection = .legacy,
                                   cancellation: NativeAttachmentCancellation) throws {
         jobs.drain(); try requireOwner(); try cancellation.check()
-        _ = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI)
+        _ = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: selection)
         for entry in record.operations { _ = try mixedPrepared(entry) }
         let envelope = try Self.object(envelopeJSON)
-        guard let prepared = envelope["prepared"] as? [String: Any], let decision = prepared["decision"] as? [String: Any],
-              let effect = (decision["kind"] as? String == "changed" ? (decision["prepared"] as? [String: Any])?["effect"] : decision["effect"]) as? [String: Any],
-              let task = effect["task"] as? [String: Any], let after = task["after"] as? [String: Any],
-              let attachments = after["attachments"] as? [[String: Any]] else { throw Self.failure }
+        guard let prepared = envelope["prepared"] as? [String: Any], Self.integer(prepared["version"]) == Int64(selection.envelopeVersion),
+              let decision = prepared["decision"] as? [String: Any] else { throw Self.failure }
+        let afterTasks: [[String: Any]]
+        if selection == .complete {
+            guard let request = envelope["request"] as? [String: Any], let save = request["saveRequest"] as? [String: Any],
+                  let id = save["id"] as? String, let proof = decision["prepared"] as? [String: Any] else { throw Self.failure }
+            switch decision["kind"] as? String {
+            case "changed":
+                guard let effect = proof["effect"] as? [String: Any], let rows = effect["tasks"] as? [[String: Any]] else { throw Self.failure }
+                afterTasks = try rows.map { row in
+                    guard let after = row["after"] as? [String: Any] else { throw Self.failure }
+                    return after
+                }
+                guard afterTasks.filter({ ($0["id"] as? String).map { Self.equal($0, id) } == true }).count == 1 else { throw Self.failure }
+            case "noop":
+                guard let witness = proof["witness"] as? [String: Any], let source = witness["source"] as? [String: Any],
+                      (source["id"] as? String).map({ Self.equal($0, id) }) == true else { throw Self.failure }
+                afterTasks = [source]
+            default: throw Self.failure
+            }
+        } else {
+            guard let effect = (decision["kind"] as? String == "changed" ? (decision["prepared"] as? [String: Any])?["effect"] : decision["effect"]) as? [String: Any],
+                  let task = effect["task"] as? [String: Any], let after = task["after"] as? [String: Any],
+                  after["attachments"] is [[String: Any]] else { throw Self.failure }
+            afterTasks = [after]
+        }
+        // A generated recurring child can retain a file even if the source no
+        // longer does. Prove every owned Add referenced by the complete effect.
+        let attachments = try afterTasks.flatMap { task -> [[String: Any]] in
+            guard task["attachments"] == nil || task["attachments"] is [[String: Any]] else { throw Self.failure }
+            return task["attachments"] as? [[String: Any]] ?? []
+        }
         for op in Self.mixedSaveAdds(record) where attachments.contains(where: {
-            ($0["id"] as? String).map { Self.equal($0, op.requestId) } == true
+            // Recurrence clones attachment IDs while sharing the exact file
+            // URI. Complete effects must prove those child references too.
+            (selection == .complete || ($0["id"] as? String).map { Self.equal($0, op.requestId) } == true)
                 && ($0["uri"] as? String).map { Self.equal($0, op.targetURI) } == true && $0["kind"] as? String == "file"
                 && ($0["deletedAt"] == nil || $0["deletedAt"] is NSNull)
         }) {

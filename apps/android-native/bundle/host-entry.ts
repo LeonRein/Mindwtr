@@ -1077,6 +1077,17 @@ const settledAttachmentSaveState = () => {
     try { return settledAttachmentDiscardState(); }
     catch { throw attachmentSaveNotReady(); }
 };
+type AttachmentFileEditSaveEnvelope = Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0]
+    | Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0];
+const validateAttachmentFileEditSave = (input: AttachmentFileEditSaveEnvelope) => {
+    if (input?.request?.version === 2 && input.prepared?.version === 2) {
+        return contract.validatePreparedOwnedEditorCompleteTaskDraftSave(input as Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0]);
+    }
+    if (input?.request?.version === 1 && input.prepared?.version === 1) {
+        return contract.validatePreparedOwnedEditorFileEditTaskDraftSave(input as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0]);
+    }
+    throw new Error('INVALID_INPUT');
+};
 type AttachmentSavePlan = Readonly<{
     envelopeJSON: string;
     taskID: string;
@@ -1103,11 +1114,17 @@ const retireAttachmentFileEditSave = (json: string, referencedCallback: () => st
         index = input.candidateIndex as number;
         if (attachmentSavePlan?.envelopeJSON === input.envelopeJSON) plan = attachmentSavePlan;
         else {
-            const envelope = attachmentDraftJson(input.envelopeJSON) as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
-            const checked = contract.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope);
+            const envelope = attachmentDraftJson(input.envelopeJSON) as AttachmentFileEditSaveEnvelope;
+            const checked = validateAttachmentFileEditSave(envelope);
             if (!checked.ok || index >= checked.value.settlementPlan.length) throw attachmentSaveInvalid();
-            const decision = envelope.prepared.decision;
-            const afterTask = decision.kind === 'changed' ? decision.prepared.effect.task.after : decision.effect.task.after;
+            const complete = envelope.request.version === 2
+                ? envelope as Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0] : null;
+            const legacy = envelope as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
+            const afterTask = complete ? complete.prepared.decision.kind === 'changed'
+                ? complete.prepared.decision.prepared.effect.tasks.find((row) => row.after.id === complete.request.saveRequest.id)?.after
+                : complete.prepared.decision.prepared.witness.source
+                : legacy.prepared.decision.kind === 'changed' ? legacy.prepared.decision.prepared.effect.task.after : legacy.prepared.decision.effect.task.after;
+            if (!afterTask) throw attachmentSaveInvalid();
             plan = Object.freeze({ envelopeJSON: input.envelopeJSON, taskID: envelope.request.saveRequest.id,
                 afterRevision: taskRevisionOf(afterTask),
                 settlementPlan: Object.freeze(checked.value.settlementPlan.map((value) => Object.freeze({ ...value,
@@ -2850,13 +2867,32 @@ globalThis.MindwtrHost = {
         return submit(async () => unwrap(await contract.commitPreparedTaskChecklistWrite(editorJson(json) as Parameters<typeof contract.commitPreparedTaskChecklistWrite>[0])));
     },
     taskCancellationUndoPrepare(json: string): string {
-        return submit(async () => { requireSaved(); return unwrap(await contract.prepareTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.prepareTaskCancellationUndo>[0])); });
+        return submit(async () => {
+            requireSaved();
+            if (globalThis.__mindwtrHostPlatform === 'ios') {
+                const input = attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorCompleteTaskCancellationUndo>[0];
+                if (input?.cancel?.request?.version === 2) return unwrap(await contract.prepareOwnedEditorCompleteTaskCancellationUndo(input));
+            }
+            return unwrap(await contract.prepareTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.prepareTaskCancellationUndo>[0]));
+        });
     },
     taskCancellationUndoValidate(json: string): string {
-        return submit(async () => unwrap(contract.validatePreparedTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.validatePreparedTaskCancellationUndo>[0])));
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform === 'ios') {
+                const input = attachmentDraftJson(json) as Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskCancellationUndo>[0];
+                if (input?.prepared?.version === 2 && input.prepared.kind === 'undo') return unwrap(contract.validatePreparedOwnedEditorCompleteTaskCancellationUndo(input));
+            }
+            return unwrap(contract.validatePreparedTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.validatePreparedTaskCancellationUndo>[0]));
+        });
     },
     taskCancellationUndoCommit(json: string): string {
-        return submit(async () => unwrap(await contract.commitPreparedTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.commitPreparedTaskCancellationUndo>[0])));
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform === 'ios') {
+                const input = attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorCompleteTaskCancellationUndo>[0];
+                if (input?.prepared?.version === 2 && input.prepared.kind === 'undo') return unwrap(await contract.commitPreparedOwnedEditorCompleteTaskCancellationUndo(input));
+            }
+            return unwrap(await contract.commitPreparedTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.commitPreparedTaskCancellationUndo>[0]));
+        });
     },
     /** The capture popup (RN's quick capture sheet): an empty draft with the starting options. */
     captureOpen(): string {
@@ -3303,19 +3339,26 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             requireOwnedAttachmentSave();
             requireSaved();
-            return unwrap(await contract.prepareOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorFileEditTaskDraftSave>[0]));
+            const input = attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorFileEditTaskDraftSave>[0]
+                | Parameters<typeof contract.prepareOwnedEditorCompleteTaskDraftSave>[0];
+            if (input?.version === 2) return unwrap(await contract.prepareOwnedEditorCompleteTaskDraftSave(input));
+            if (input?.version === 1) return unwrap(await contract.prepareOwnedEditorFileEditTaskDraftSave(input));
+            throw new Error('INVALID_INPUT');
         });
     },
     attachmentFileEditSaveValidate(json: string): string {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
-            return unwrap(contract.validatePreparedOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0]));
+            return unwrap(validateAttachmentFileEditSave(attachmentDraftJson(json) as AttachmentFileEditSaveEnvelope));
         });
     },
     attachmentFileEditSaveCommit(json: string): string {
         return submit(async () => {
             requireOwnedAttachmentSave();
-            return unwrap(await contract.commitPreparedOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorFileEditTaskDraftSave>[0]));
+            const input = attachmentDraftJson(json) as AttachmentFileEditSaveEnvelope;
+            if (input?.request?.version === 2 && input.prepared?.version === 2) return unwrap(await contract.commitPreparedOwnedEditorCompleteTaskDraftSave(input as Parameters<typeof contract.commitPreparedOwnedEditorCompleteTaskDraftSave>[0]));
+            if (input?.request?.version === 1 && input.prepared?.version === 1) return unwrap(await contract.commitPreparedOwnedEditorFileEditTaskDraftSave(input as Parameters<typeof contract.commitPreparedOwnedEditorFileEditTaskDraftSave>[0]));
+            throw new Error('INVALID_INPUT');
         });
     },
     /** Private synchronous Save handoff; no native retirement authority is supplied by JSON. */
@@ -3333,14 +3376,17 @@ globalThis.MindwtrHost = {
             const mixedDiscard = operation === 'discard-mixed' && outcome === 'confirmed';
             const mixedAdd = operation === 'add-mixed' && ['confirmed', 'replayed'].includes(outcome);
             const providerAdd = operation === 'provider-add' && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd
+            const completeSave = operation === 'complete-save' && ['domainSaved', 'settled'].includes(outcome);
+            const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
+                    context: { ...(completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
+                        : providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
                         : mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
                         : mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }
                         : mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
