@@ -132,6 +132,25 @@ public final class CoreHost: @unchecked Sendable {
     public func discardAttachmentDraft(requestJSON: String) async throws -> String {
         try await perform { try $0.discardAttachmentDraft(requestJSON: requestJSON) }
     }
+    func discardAttachmentDraftV3(requestJSON: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.discardAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
+    func finishAttachmentDraftDiscardV3(expectedSession: String, requestId: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.finishAttachmentDraftDiscardV3(expectedSession: expectedSession,
+                requestId: requestId, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func finishAttachmentDraftDiscard(expectedSession: String, requestId: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
@@ -305,6 +324,21 @@ private final class Engine: @unchecked Sendable {
         let fingerprint: String
         let operationIDs: [String]
         let record: NativeAttachmentDraftStore.Record?
+        let mixedOperations: [MixedDiscardOperation]?
+        let mixedBinding: NativeAttachmentDraftStore.VersionedSnapshot?
+        init(version: Int, session: String, requestId: String, fingerprint: String, operationIDs: [String],
+             record: NativeAttachmentDraftStore.Record?, mixedOperations: [MixedDiscardOperation]? = nil,
+             mixedBinding: NativeAttachmentDraftStore.VersionedSnapshot? = nil) {
+            self.version = version; self.session = session; self.requestId = requestId; self.fingerprint = fingerprint
+            self.operationIDs = operationIDs; self.record = record
+            self.mixedOperations = mixedOperations; self.mixedBinding = mixedBinding
+        }
+    }
+    private struct MixedDiscardOperation: Equatable {
+        let kind: String
+        let requestId: String
+        let phase: String
+        var object: [String: String] { ["kind": kind, "requestId": requestId, "phase": phase] }
     }
     private struct OwnedDiscardIdentity: Equatable {
         let device: dev_t
@@ -315,8 +349,16 @@ private final class Engine: @unchecked Sendable {
         let runtime: JSContext
         let recordIdentity: OwnedDiscardIdentity?
         var journalIdentity: OwnedDiscardIdentity?
-        init(generation: UInt64, runtime: JSContext, recordIdentity: OwnedDiscardIdentity?) {
+        let jobs: NativeAttachmentFileJobs?
+        let mixedBinding: NativeAttachmentDraftStore.VersionedSnapshot?
+        var mixedJournal: MixedSaveFileBinding?
+        var mixedAcknowledged: PendingCommand?
+        var mixedValidated: OwnedDiscardJournal?
+        var mixedPlan: [NativeAttachmentDraftStore.Operation]?
+        init(generation: UInt64, runtime: JSContext, recordIdentity: OwnedDiscardIdentity?,
+             jobs: NativeAttachmentFileJobs? = nil, mixedBinding: NativeAttachmentDraftStore.VersionedSnapshot? = nil) {
             self.generation = generation; self.runtime = runtime; self.recordIdentity = recordIdentity
+            self.jobs = jobs; self.mixedBinding = mixedBinding
         }
     }
     /// A leaked JS callback holds only a weak reference to this ephemeral slot.
@@ -2412,8 +2454,11 @@ private final class Engine: @unchecked Sendable {
               try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes,
               command.argumentsJSON.utf8.count <= Self.ownedSaveMaximumBytes,
               let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
-              let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
-              Set(wrapper.keys) == Set(["version", "sessionID", "requestId", "recordSHA256", "operationIDs"]),
+              let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any] else { throw Self.ownedDiscardFailure }
+        if Self.isInteger(wrapper["version"], equalTo: 5) {
+            return try ownedMixedDiscardJournal(command, wrapper: wrapper, checkingNative: checkingNative)
+        }
+        guard Set(wrapper.keys) == Set(["version", "sessionID", "requestId", "recordSHA256", "operationIDs"]),
               Self.isInteger(wrapper["version"], equalTo: 1) || Self.isInteger(wrapper["version"], equalTo: 2)
                   || Self.isInteger(wrapper["version"], equalTo: 3) || Self.isInteger(wrapper["version"], equalTo: 4),
               let session = Self.ownedDiscardUUID(wrapper["sessionID"]), let id = Self.ownedDiscardUUID(wrapper["requestId"]),
@@ -2441,6 +2486,78 @@ private final class Engine: @unchecked Sendable {
             }
         }
         return OwnedDiscardJournal(version: version, session: session, requestId: id, fingerprint: fingerprint, operationIDs: ids, record: record)
+    }
+
+    private static func mixedDiscardOperations(_ record: NativeAttachmentDraftStore.MixedRecord) -> [MixedDiscardOperation] {
+        record.operations.map { entry in
+            switch entry {
+            case .add(let op): return .init(kind: "add", requestId: op.requestId, phase: op.phase.rawValue)
+            case .remove(let op): return .init(kind: "remove", requestId: op.requestId, phase: op.phase.rawValue)
+            }
+        }
+    }
+    private func ownedMixedDiscardJournal(_ command: PendingCommand, wrapper: [String: Any],
+                                          checkingNative: Bool) throws -> OwnedDiscardJournal {
+        guard Set(wrapper.keys) == Set(["version", "historyVersion", "sessionID", "requestId", "recordSHA256", "operations"]),
+              Self.isInteger(wrapper["historyVersion"], equalTo: 3),
+              let session = Self.ownedDiscardUUID(wrapper["sessionID"]), let id = Self.ownedDiscardUUID(wrapper["requestId"]),
+              let fingerprint = wrapper["recordSHA256"] as? String, fingerprint.utf8.count == 64,
+              fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              let raw = wrapper["operations"] as? [[String: Any]], raw.count <= 128 else { throw Self.ownedDiscardFailure }
+        var used = Set([id]), operations: [MixedDiscardOperation] = []
+        for (index, entry) in raw.enumerated() {
+            guard Set(entry.keys) == Set(["kind", "requestId", "phase"]),
+                  let kind = entry["kind"] as? String, ["add", "remove"].contains(kind),
+                  let requestId = Self.ownedDiscardUUID(entry["requestId"]), used.insert(requestId).inserted,
+                  let phase = entry["phase"] as? String,
+                  (kind == "add" ? NativeAttachmentDraftStore.Phase(rawValue: phase) != nil
+                    : NativeAttachmentDraftStore.RemovePhase(rawValue: phase) != nil),
+                  index == raw.count - 1 || phase == "checkpointed" else { throw Self.ownedDiscardFailure }
+            operations.append(.init(kind: kind, requestId: requestId, phase: phase))
+        }
+        let captured = OwnedDiscardJournal(version: 5, session: session, requestId: id, fingerprint: fingerprint,
+            operationIDs: operations.map(\.requestId), record: nil, mixedOperations: operations)
+        if let terminal = command.terminal {
+            guard case .success(let value) = terminal else { throw Self.ownedDiscardFailure }
+            try validateMixedDiscardResult(value, captured: captured)
+        }
+        guard checkingNative else { return captured }
+        guard try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == nil else { throw Self.ownedDiscardFailure }
+        let binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned()
+        if let binding {
+            guard case .mixed(let record) = binding.record,
+                  Self.ownedEqual(try NativeAttachmentDraftStore.ownedMixedDiscardFingerprint(record), fingerprint),
+                  Self.ownedEqual(record.session.sessionID, session),
+                  record.discard.map({ Self.ownedEqual($0.requestId, id) }) == true,
+                  Self.mixedDiscardOperations(record) == operations else { throw Self.ownedDiscardFailure }
+            _ = try NativeAttachmentDraftCoordinator.mixedDiscardAdds(record)
+        } else { guard case .success = command.terminal else { throw Self.ownedDiscardFailure } }
+        return .init(version: 5, session: session, requestId: id, fingerprint: fingerprint, operationIDs: captured.operationIDs,
+            record: nil, mixedOperations: operations, mixedBinding: binding)
+    }
+    private func validateMixedDiscardResult(_ value: String, captured: OwnedDiscardJournal) throws {
+        guard value.utf8.count <= 64 * 1024, let expected = captured.mixedOperations,
+              let result = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
+              Set(result.keys) == Set(["version", "historyVersion", "status", "sessionID", "requestId", "operations"]),
+              Self.isInteger(result["version"], equalTo: 5), Self.isInteger(result["historyVersion"], equalTo: 3),
+              result["status"] as? String == "discarded",
+              let session = result["sessionID"] as? String, Self.ownedEqual(session, captured.session),
+              let id = result["requestId"] as? String, Self.ownedEqual(id, captured.requestId),
+              let operations = result["operations"] as? [[String: Any]], operations.count == expected.count else { throw Self.ownedDiscardFailure }
+        for (actual, op) in zip(operations, expected) {
+            guard actual["kind"] as? String == op.kind, actual["requestId"] as? String == op.requestId else { throw Self.ownedDiscardFailure }
+            if op.kind == "remove" {
+                guard Set(actual.keys) == Set(["kind", "requestId", "disposition"]),
+                      actual["disposition"] as? String == "metadataOnly" else { throw Self.ownedDiscardFailure }
+            } else {
+                let unpublished = ["intent", "stagePrepared", "stageFilled"].contains(op.phase)
+                guard Set(actual.keys) == Set(["kind", "requestId", "target", "stage"]),
+                      let target = actual["target"] as? String,
+                      (unpublished ? ["untouched"] : ["removed", "absent", "referenced"]).contains(target),
+                      let stage = actual["stage"] as? String,
+                      (op.phase == "intent" ? ["unclaimed"] : ["removed", "missing"]).contains(stage) else { throw Self.ownedDiscardFailure }
+            }
+        }
     }
     private func validateOwnedDiscardResult(_ value: String, version: Int, session: String, requestId: String, operationIDs: [String]) throws {
         guard value.utf8.count <= 64 * 1024,
@@ -2484,6 +2601,30 @@ private final class Engine: @unchecked Sendable {
     }
     private func ownedDiscardTurn(_ command: PendingCommand) throws -> OwnedDiscardTurn {
         guard started, !closed, lockFD >= 0, let context else { throw Self.ownedDiscardFailure }
+        if try ownedDiscardJournal(command, checkingNative: false).version == 5 {
+            let captured = try ownedDiscardJournal(command)
+            guard let jobs = attachmentJobs else { throw Self.ownedDiscardFailure }
+            let turn = OwnedDiscardTurn(generation: attachmentGeneration, runtime: context,
+                recordIdentity: nil, jobs: jobs, mixedBinding: captured.mixedBinding)
+            turn.mixedValidated = captured
+            turn.mixedJournal = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes)
+            if let journal = turn.mixedJournal {
+                let actual = try decodeOwnedDiscardJournal(journal.bytes, checkingNative: true)
+                var before = actual, after = command; before.terminal = nil; after.terminal = nil
+                guard try ownedEncoded(before) == ownedEncoded(after) else { throw Self.ownedDiscardFailure }
+                if actual.terminal != nil {
+                    guard try ownedEncoded(actual) == ownedEncoded(command) else { throw Self.ownedDiscardFailure }
+                }
+                turn.mixedAcknowledged = actual
+            } else if case .success = command.terminal {
+                // A lost journal-clear acknowledgment may leave only the exact
+                // warm validated terminal. Re-persist it before release/clear;
+                // this grants no nonterminal or attachment-job permission.
+                guard let current = pending, try ownedEncoded(current) == ownedEncoded(command) else { throw Self.ownedDiscardFailure }
+                turn.mixedAcknowledged = command
+            }
+            return turn
+        }
         let identity = try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url)
         let captured = try ownedDiscardJournal(command)
         guard (captured.record == nil) == (identity == nil),
@@ -2493,6 +2634,10 @@ private final class Engine: @unchecked Sendable {
     private func requireOwnedDiscardAuthority(_ command: PendingCommand, turn: OwnedDiscardTurn,
                                              cancellation: NativeAttachmentCancellation,
                                              terminalPromotion: Bool = false, sidecarAbsent: Bool = false) throws -> OwnedDiscardJournal {
+        if turn.mixedValidated != nil {
+            return try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation,
+                promotion: terminalPromotion, sidecarAbsent: sidecarAbsent)
+        }
         dispatchPrecondition(condition: .onQueue(queue))
         try cancellation.check()
         guard started, !closed, lockFD >= 0, attachmentGeneration == turn.generation, context === turn.runtime,
@@ -2509,6 +2654,12 @@ private final class Engine: @unchecked Sendable {
         return captured
     }
     private func ownedDiscardResult(_ captured: OwnedDiscardJournal, operations: [[String: String]]) throws -> String {
+        if captured.version == 5 {
+            let value = try Self.ownedJSON(["version": 5, "historyVersion": 3, "status": "discarded",
+                "sessionID": captured.session, "requestId": captured.requestId, "operations": operations] as [String: Any])
+            try validateMixedDiscardResult(value, captured: captured)
+            return value
+        }
         let value = try Self.ownedJSON(["version": captured.version, "status": captured.version == 3 ? "discarded" : "released", "sessionID": captured.session,
             "requestId": captured.requestId, "operations": operations] as [String: Any])
         try validateOwnedDiscardResult(value, version: captured.version, session: captured.session, requestId: captured.requestId, operationIDs: captured.operationIDs)
@@ -2516,6 +2667,19 @@ private final class Engine: @unchecked Sendable {
     }
     private func preflightOwnedDiscard(_ command: PendingCommand) throws {
         let captured = try ownedDiscardJournal(command, checkingNative: false)
+        if let mixed = captured.mixedOperations {
+            let reserved = try ownedDiscardResult(captured, operations: mixed.map { op in
+                if op.kind == "remove" { return ["kind": "remove", "requestId": op.requestId, "disposition": "metadataOnly"] }
+                return ["kind": "add", "requestId": op.requestId,
+                    "target": ["intent", "stagePrepared", "stageFilled"].contains(op.phase) ? "untouched" : "referenced",
+                    "stage": op.phase == "intent" ? "unclaimed" : "removed"]
+            })
+            var terminal = command; terminal.terminal = .success(reserved)
+            for candidate in [command, terminal] {
+                guard try ownedEncoded(candidate).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedDiscardFailure }
+            }
+            return
+        }
         let reserved = try ownedDiscardResult(captured, operations: captured.operationIDs.enumerated().map { index, id in
             ["requestId": id, "target": captured.version >= 2 && index == captured.operationIDs.count - 1 ? "untouched" : "referenced",
                 "stage": captured.version == 3 && index == captured.operationIDs.count - 1 ? "unclaimed" : "removed"]
@@ -2540,16 +2704,235 @@ private final class Engine: @unchecked Sendable {
         try cancellation.check()
         guard started, !closed, !recoveryActivationPending, lockFD >= 0, attachmentGeneration == turn.generation,
               context === turn.runtime, pending == nil, try ownedJournalIsAbsent(), try editorDrafts.read() == nil else {
-            throw Self.ownedDiscardFailure
+              throw Self.ownedDiscardFailure
+        }
+        if let jobs = turn.jobs {
+            guard attachmentJobs === jobs, try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == nil else { throw Self.ownedDiscardFailure }
         }
     }
     private func requireUnjournaledDiscard(_ command: PendingCommand, turn: OwnedDiscardTurn,
                                           cancellation: NativeAttachmentCancellation) throws {
         try requireUnjournaledDiscardOwner(turn, cancellation: cancellation)
+        if turn.mixedValidated != nil {
+            guard let binding = turn.mixedBinding,
+                  let actual = try mixedSaveFileBinding(NativeAttachmentDraftStore(databaseURL: databaseURL).url, maximumBytes: Self.ownedSaveMaximumBytes),
+                  actual.bytes == binding.bytes, UInt64(actual.identity.device) == binding.device,
+                  UInt64(actual.identity.inode) == binding.inode else { throw Self.ownedDiscardFailure }
+            return
+        }
         _ = try ownedDiscardJournal(command)
         guard try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == turn.recordIdentity else {
             throw Self.ownedDiscardFailure
         }
+    }
+
+    private func ownedMixedDiscardCommand(_ record: NativeAttachmentDraftStore.MixedRecord) throws -> PendingCommand {
+        guard let discard = record.discard else { throw Self.ownedDiscardFailure }
+        let wrapper = try Self.ownedJSON(["version": 5, "historyVersion": 3, "sessionID": record.session.sessionID,
+            "requestId": discard.requestId, "recordSHA256": NativeAttachmentDraftStore.ownedMixedDiscardFingerprint(record),
+            "operations": Self.mixedDiscardOperations(record).map(\.object)] as [String: Any])
+        return PendingCommand(version: 2, method: Self.ownedDiscardMethod, argumentsJSON: try Self.ownedJSON([wrapper]))
+    }
+
+    func discardAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        do {
+            guard started, !closed, !recoveryActivationPending, pending == nil, lockFD >= 0,
+                  try ownedJournalIsAbsent(), let runtime = context, let jobs = attachmentJobs,
+                  var binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(),
+                  case .mixed(let record) = binding.record else { throw Self.ownedDiscardFailure }
+            let store = NativeAttachmentDraftStore(databaseURL: databaseURL)
+            var editorBinding = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+            let generation = attachmentGeneration
+            func requireDecisionOwner() throws {
+                try cancellation.check()
+                guard started, !closed, !recoveryActivationPending, pending == nil, lockFD >= 0,
+                      context === runtime, attachmentGeneration == generation, attachmentJobs === jobs,
+                      try ownedJournalIsAbsent(),
+                      try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == editorBinding,
+                      let actual = try mixedSaveFileBinding(store.url, maximumBytes: Self.ownedSaveMaximumBytes),
+                      actual.bytes == binding.bytes, UInt64(actual.identity.device) == binding.device,
+                      UInt64(actual.identity.inode) == binding.inode else { throw Self.ownedDiscardFailure }
+            }
+            let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs,
+                requireOwner: { try requireDecisionOwner() }) { [unowned self] method, args in try self.invoke(method, arguments: args) }
+            #if DEBUG
+            coordinator.hooks = attachmentDraftHooks
+            #endif
+            coordinator.drainOwnedSaveJobs(); try requireDecisionOwner()
+            let decision = try coordinator.prepareMixedDiscardDecision(requestJSON, record: record)
+            if let current = try editorDrafts.read() {
+                guard current.attempt == nil, Self.ownedEqual(current.snapshot, record.session.checkpoint) else { throw Self.ownedDiscardFailure }
+            } else { guard record.discard != nil else { throw Self.ownedDiscardFailure } }
+            _ = try coordinator.prepareMixedDiscardCandidates(record, binding: binding, cancellation: cancellation)
+            try requireDecisionOwner()
+            // Fresh capacity is reserved before either private intent or editor
+            // detachment. Retained decisions reserve only their actual owed form.
+            if record.discard == nil { try store.preflightMixed(decision.decided) }
+            try store.preflightMixed(decision.detached)
+            try preflightOwnedDiscard(ownedMixedDiscardCommand(decision.detached))
+            if record.discard?.phase != .detached {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDiscardDecision)
+                #endif
+                try requireDecisionOwner()
+                binding = try store.writeMixedAcknowledged(decision.decided)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDiscardDecision)
+                #endif
+                try requireDecisionOwner()
+            }
+            if record.discard?.phase != .detached {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDetach)
+                #endif
+                try requireDecisionOwner()
+                if editorBinding == nil {
+                    // Only a retained decision permits missing; acknowledge its
+                    // parent durability again before promoting to detached.
+                    try DurableFile.remove(editorDrafts.url)
+                } else { try editorDrafts.discardMatching(expected: decision.decided.session.checkpoint) }
+                guard try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == nil else { throw Self.ownedDiscardFailure }
+                editorBinding = nil
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDetach)
+                #endif
+                try requireDecisionOwner()
+            } else { guard editorBinding == nil else { throw Self.ownedDiscardFailure } }
+            binding = try store.writeMixedAcknowledged(decision.detached)
+            try requireDecisionOwner()
+            return decision.replyJSON
+        } catch { throw Self.ownedDiscardFailure }
+    }
+
+    private func requireMixedDiscardEvidence(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                             cancellation: NativeAttachmentCancellation) throws -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
+        try cancellation.check()
+        guard started, !closed, lockFD >= 0, context === turn.runtime, attachmentGeneration == turn.generation,
+              let jobs = turn.jobs, attachmentJobs === jobs, let current = pending,
+              try ownedEncoded(current) == ownedEncoded(command),
+              try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == turn.mixedJournal,
+              try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == nil else { throw Self.ownedDiscardFailure }
+        if let actual = try mixedSaveFileBinding(NativeAttachmentDraftStore(databaseURL: databaseURL).url, maximumBytes: Self.ownedSaveMaximumBytes) {
+            guard let binding = turn.mixedBinding, actual.bytes == binding.bytes,
+                  UInt64(actual.identity.device) == binding.device, UInt64(actual.identity.inode) == binding.inode else { throw Self.ownedDiscardFailure }
+            return true
+        }
+        guard case .success = turn.mixedAcknowledged?.terminal else { throw Self.ownedDiscardFailure }
+        return false
+    }
+    private func requireMixedDiscardAuthority(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                              cancellation: NativeAttachmentCancellation, promotion: Bool = false,
+                                              sidecarAbsent: Bool = false) throws -> OwnedDiscardJournal {
+        guard let captured = turn.mixedValidated, let acknowledged = turn.mixedAcknowledged,
+              turn.mixedJournal != nil else { throw Self.ownedDiscardFailure }
+        var before = acknowledged, after = command; before.terminal = nil; after.terminal = nil
+        guard try ownedEncoded(before) == ownedEncoded(after) else { throw Self.ownedDiscardFailure }
+        if promotion && acknowledged.terminal == nil {
+            guard case .success(let value) = command.terminal else { throw Self.ownedDiscardFailure }
+            try validateMixedDiscardResult(value, captured: captured)
+        } else { guard try ownedEncoded(acknowledged) == ownedEncoded(command) else { throw Self.ownedDiscardFailure } }
+        let present = try requireMixedDiscardEvidence(command, turn: turn, cancellation: cancellation)
+        if sidecarAbsent { guard !present else { throw Self.ownedDiscardFailure } }
+        return captured
+    }
+    private func persistMixedDiscard(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                     cancellation: NativeAttachmentCancellation) throws {
+        _ = try requireMixedDiscardEvidence(command, turn: turn, cancellation: cancellation)
+        try persist(command, mixedGuard: { [unowned self] in
+            _ = try self.requireMixedDiscardEvidence(command, turn: turn, cancellation: cancellation)
+        })
+        guard let written = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes),
+              written.bytes == (try ownedEncoded(command)) else { throw Self.ownedDiscardFailure }
+        turn.mixedJournal = written; turn.mixedAcknowledged = command
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+    }
+    private func mixedDiscardCoordinator(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                          cancellation: NativeAttachmentCancellation,
+                                          unjournaled: Bool = false) throws -> NativeAttachmentDraftCoordinator {
+        guard let jobs = turn.jobs else { throw Self.ownedDiscardFailure }
+        let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs, requireOwner: { [unowned self] in
+            if unjournaled { try self.requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation) }
+            else { _ = try self.requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation) }
+        }) { [unowned self] method, args in try self.invoke(method, arguments: args) }
+        #if DEBUG
+        coordinator.hooks = attachmentDraftHooks
+        #endif
+        return coordinator
+    }
+
+    func finishAttachmentDraftDiscardV3(expectedSession: String, requestId: String,
+                                        cancellation: NativeAttachmentCancellation) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        do {
+            guard started, !closed, !recoveryActivationPending, pending == nil,
+                  Self.ownedDiscardUUID(expectedSession) != nil, Self.ownedDiscardUUID(requestId) != nil,
+                  let binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(),
+                  case .mixed(let record) = binding.record, Self.ownedEqual(record.session.sessionID, expectedSession),
+                  record.discard.map({ Self.ownedEqual($0.requestId, requestId) }) == true else { throw Self.ownedDiscardFailure }
+            var command = try ownedMixedDiscardCommand(record)
+            var turn = try ownedDiscardTurn(command)
+            var coordinator = try mixedDiscardCoordinator(command, turn: turn, cancellation: cancellation, unjournaled: true)
+            coordinator.drainOwnedSaveJobs(); try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+            turn.mixedPlan = try coordinator.prepareMixedDiscardCandidates(record, binding: binding, cancellation: cancellation)
+            try preflightOwnedDiscard(command)
+            if let last = record.operations.last, case .add(let op) = last, op.phase == .stageFilled {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDiscardFilledObservation)
+                #endif
+                try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                let observed: Bool
+                do { try coordinator.observeOwnedDiscardFilledStage(op, cancellation: cancellation); observed = true }
+                catch { try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation); observed = false }
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDiscardFilledObservation)
+                #endif
+                try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                if !observed {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardPublicationReproof)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    let proof = try coordinator.reproveOwnedDiscardPublication(op, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardPublicationReproof)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    let promoted = try coordinator.promotedMixedDiscard(record, proof: proof)
+                    let store = NativeAttachmentDraftStore(databaseURL: databaseURL)
+                    try store.preflightMixed(promoted)
+                    let promotedCommand = try ownedMixedDiscardCommand(promoted)
+                    try preflightOwnedDiscard(promotedCommand)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardPublicationPromotion)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    let next = try store.writeMixedAcknowledged(promoted)
+                    try requireUnjournaledDiscardOwner(turn, cancellation: cancellation)
+                    command = promotedCommand
+                    turn = try ownedDiscardTurn(command)
+                    guard let rebound = turn.mixedBinding, rebound.matches(next) else { throw Self.ownedDiscardFailure }
+                    turn.mixedPlan = try NativeAttachmentDraftCoordinator.mixedDiscardAdds(promoted)
+                    coordinator = try mixedDiscardCoordinator(command, turn: turn, cancellation: cancellation, unjournaled: true)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardPublicationPromotion)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                }
+            }
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.beforeDiscardFinishJournal)
+            #endif
+            try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+            pending = command
+            try persistMixedDiscard(command, turn: turn, cancellation: cancellation)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterDiscardFinishJournal)
+            #endif
+            _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            return try executeMixedDiscard(command, turn: turn, cancellation: cancellation).value()
+        } catch { throw Self.ownedDiscardFailure }
     }
 
     func finishAttachmentDraftDiscard(expectedSession: String, requestId: String,
@@ -2683,6 +3066,11 @@ private final class Engine: @unchecked Sendable {
 
     private func executeOwnedDiscard(_ command: PendingCommand, cancellation: NativeAttachmentCancellation,
                                      turn supplied: OwnedDiscardTurn? = nil) throws -> TerminalResult {
+        if try ownedDiscardJournal(command, checkingNative: false).version == 5 {
+            let turn = try supplied ?? ownedDiscardTurn(command)
+            if supplied == nil { try persistMixedDiscard(command, turn: turn, cancellation: cancellation) }
+            return try executeMixedDiscard(command, turn: turn, cancellation: cancellation)
+        }
         do {
             let turn = try supplied ?? ownedDiscardTurn(command)
             // Warm unknown writes are owed; identity guards forbid overwriting
@@ -2741,6 +3129,105 @@ private final class Engine: @unchecked Sendable {
             pending = finished
             return try finishOwnedDiscardTerminal(finished, turn: turn, cancellation: cancellation)
         } catch { throw Self.ownedDiscardFailure }
+    }
+
+    private func executeMixedDiscard(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                     cancellation: NativeAttachmentCancellation) throws -> TerminalResult {
+        do {
+            if command.terminal != nil { return try finishMixedDiscardTerminal(command, turn: turn, cancellation: cancellation) }
+            let captured = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            guard let binding = captured.mixedBinding, case .mixed(let record) = binding.record else { throw Self.ownedDiscardFailure }
+            let coordinator = try mixedDiscardCoordinator(command, turn: turn, cancellation: cancellation)
+            if turn.mixedPlan == nil {
+                turn.mixedPlan = try coordinator.prepareMixedDiscardCandidates(record, binding: binding, cancellation: cancellation)
+            }
+            guard let plan = turn.mixedPlan else { throw Self.ownedDiscardFailure }
+            var addIndex = 0, outcomes: [[String: String]] = []
+            for (index, entry) in record.operations.enumerated() {
+                _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                guard case .add(let op) = entry else {
+                    outcomes.append(["kind": "remove", "requestId": entry.requestId, "disposition": "metadataOnly"])
+                    continue
+                }
+                guard addIndex < plan.count, plan[addIndex] == op else { throw Self.ownedDiscardFailure }
+                addIndex += 1
+                let target: String
+                if [.intent, .stagePrepared, .stageFilled].contains(op.phase) { target = "untouched" }
+                else {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardTarget(index))
+                    #endif
+                    _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                    target = try ownedDiscardTargetHandoff(command, turn: turn, op: op, coordinator: coordinator, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardTarget(index))
+                    #endif
+                    _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                }
+                let stage: String
+                if op.phase == .intent { stage = "unclaimed" }
+                else {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardStage(index))
+                    #endif
+                    _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                    stage = try coordinator.retireOwnedDiscardStage(op, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardStage(index))
+                    #endif
+                    _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                }
+                outcomes.append(["kind": "add", "requestId": op.requestId, "target": target, "stage": stage])
+            }
+            guard addIndex == plan.count else { throw Self.ownedDiscardFailure }
+            coordinator.drainOwnedSaveJobs()
+            var finished = command
+            finished.terminal = .success(try ownedDiscardResult(captured, operations: outcomes))
+            pending = finished
+            return try finishMixedDiscardTerminal(finished, turn: turn, cancellation: cancellation)
+        } catch { throw Self.ownedDiscardFailure }
+    }
+    private func finishMixedDiscardTerminal(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                            cancellation: NativeAttachmentCancellation) throws -> TerminalResult {
+        guard let terminal = command.terminal, case .success = terminal else { throw Self.ownedDiscardFailure }
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation, promotion: true)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardTerminal)
+        #endif
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation, promotion: true)
+        try persistMixedDiscard(command, turn: turn, cancellation: cancellation)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardTerminal)
+        #endif
+        let captured = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardRelease)
+        #endif
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseDiscardedMixedMatching(fingerprint: captured.fingerprint)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardRelease)
+        #endif
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation, sidecarAbsent: true)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardJournalClear)
+        try faults?.journalRemove?()
+        #endif
+        _ = try requireMixedDiscardAuthority(command, turn: turn, cancellation: cancellation, sidecarAbsent: true)
+        try DurableFile.remove(journalURL)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardJournalClear)
+        #endif
+        try cancellation.check()
+        guard started, !closed, lockFD >= 0, attachmentGeneration == turn.generation, context === turn.runtime,
+              let jobs = turn.jobs, attachmentJobs === jobs, let current = pending,
+              try ownedEncoded(current) == ownedEncoded(command),
+              try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == nil,
+              try mixedSaveFileBinding(NativeAttachmentDraftStore(databaseURL: databaseURL).url, maximumBytes: Self.ownedSaveMaximumBytes) == nil,
+              try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == nil else { throw Self.ownedDiscardFailure }
+        pending = nil
+        _ = try? invoke("attachmentDraftAcknowledged", arguments: ["discard-mixed", "confirmed"])
+        return terminal
     }
 
     private func finishOwnedDiscardTerminal(_ command: PendingCommand, turn: OwnedDiscardTurn,
@@ -13028,6 +13515,21 @@ private final class Engine: @unchecked Sendable {
             return
         }
         if command.method == Self.ownedSaveMethod || command.method == Self.ownedDiscardMethod {
+            if command.method == Self.ownedDiscardMethod,
+               try ownedDiscardJournal(command, checkingNative: false).version == 5 {
+                guard let mixedGuard else { throw Self.ownedDiscardFailure }
+                let data = try ownedEncoded(command)
+                guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedDiscardFailure }
+                try requireOwnedJournalWriteIdentity(command)
+                try mixedGuard()
+                #if DEBUG
+                try faults?.journalWrite?()
+                #endif
+                try mixedGuard()
+                try requireOwnedJournalWriteIdentity(command)
+                try DurableFile.write(data, to: journalURL, privateDraft: true)
+                return
+            }
             let data = try JSONEncoder().encode(command)
             guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
             if command.method == Self.ownedDiscardMethod { _ = try ownedDiscardJournal(command, checkingNative: false) }

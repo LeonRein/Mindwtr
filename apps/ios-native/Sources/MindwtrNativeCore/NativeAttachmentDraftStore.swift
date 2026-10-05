@@ -996,6 +996,17 @@ struct NativeAttachmentDraftStore {
         catch { throw NativeAttachmentDraftStoreError.io }
     }
 
+    /// The mixed Discard owner refreshes its binding only after confirming the
+    /// exact bytes from this acknowledged write, never a replacement decode.
+    func writeMixedAcknowledged(_ record: MixedRecord) throws -> VersionedSnapshot {
+        let data = try encodedForWrite(record)
+        do { try DurableFile.write(data, to: url, privateDraft: true) }
+        catch { throw NativeAttachmentDraftStoreError.io }
+        guard let binding = try readVersioned(), binding.bytes == data,
+              case .mixed = binding.record else { throw NativeAttachmentDraftStoreError.corrupt }
+        return binding
+    }
+
     /// Complete private evidence binding, not Save, release or file authority.
     static func mixedFingerprint(_ record: MixedRecord) throws -> String {
         try validate(record)
@@ -1047,6 +1058,20 @@ struct NativeAttachmentDraftStore {
         return try canonicalFingerprint(record)
     }
 
+    static func ownedMixedDiscardFingerprint(_ record: MixedRecord) throws -> String {
+        try validate(record)
+        guard record.session.state == .cleanupPending, record.checkpointAdvance == nil,
+              let discard = record.discard, discard.phase == .detached, let reply = discard.replyJSON else {
+            throw NativeAttachmentDraftStoreError.corrupt
+        }
+        // Reuse the sealed identity/reply validation without adapting any
+        // mixed operation to a legacy history or granting resource authority.
+        _ = try ownedDiscardFingerprint(Record(version: 2, session: record.session, operations: [],
+            discard: .init(requestId: discard.requestId, requestJSON: discard.requestJSON,
+                expected: discard.expected, phase: .detached, replyJSON: reply)))
+        return try canonicalFingerprint(record)
+    }
+
     private static func canonicalFingerprint<T: Encodable>(_ record: T) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -1066,6 +1091,18 @@ struct NativeAttachmentDraftStore {
         }
         // Missing confirms parent durability only under the retained caller
         // decision. Never recreate a missing parent or adopt a different record.
+        do { try DurableFile.remove(url) }
+        catch { throw NativeAttachmentDraftStoreError.io }
+    }
+
+    /// CoreHost supplies the exact durable version5 success terminal. Missing
+    /// confirms parent durability and never authorizes another cleanup job.
+    func releaseDiscardedMixedMatching(fingerprint: String) throws {
+        try Self.require(Self.digest(fingerprint))
+        if let binding = try readVersioned() {
+            guard case .mixed(let record) = binding.record else { throw NativeAttachmentDraftStoreError.corrupt }
+            try Self.require(Self.equal(try Self.ownedMixedDiscardFingerprint(record), fingerprint))
+        }
         do { try DurableFile.remove(url) }
         catch { throw NativeAttachmentDraftStoreError.io }
     }

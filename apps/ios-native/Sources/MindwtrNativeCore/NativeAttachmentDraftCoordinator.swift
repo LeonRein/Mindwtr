@@ -1114,6 +1114,103 @@ final class NativeAttachmentDraftCoordinator {
         return status
     }
 
+    struct MixedDiscardDecision {
+        let decided: Store.MixedRecord
+        let detached: Store.MixedRecord
+        let replyJSON: String
+    }
+    func prepareMixedDiscardDecision(_ raw: String, record: Store.MixedRecord) throws -> MixedDiscardDecision {
+        let request = try Self.request(raw, add: false)
+        _ = try Store.mixedFingerprint(record)
+        guard record.checkpointAdvance == nil, Self.equal(record.session.sessionID, request.session),
+              !record.operations.contains(where: { Self.equal($0.requestId, request.id) }) else { throw Self.failure }
+        if let existing = record.discard {
+            guard Self.equal(existing.requestJSON, request.json), Self.equal(existing.expected, record.session.checkpoint) else { throw Self.failure }
+        } else {
+            guard record.session.state == .active, record.session.checkpoint.generation == request.generation else { throw Self.failure }
+        }
+        let checkpoint = record.session.checkpoint
+        let reply = try Self.json(["version": 1, "status": "cleanupPending", "requestId": request.id,
+            "sessionID": checkpoint.sessionID])
+        let session = Store.Session(sessionID: record.session.sessionID, taskID: record.session.taskID,
+            state: .cleanupPending, checkpoint: checkpoint)
+        let decided = Store.MixedRecord(session: session, operations: record.operations,
+            discard: .init(requestId: request.id, requestJSON: request.json, expected: checkpoint, phase: .decided))
+        let detached = Store.MixedRecord(session: session, operations: record.operations,
+            discard: .init(requestId: request.id, requestJSON: request.json, expected: checkpoint, phase: .detached, replyJSON: reply))
+        if let existing = record.discard, let retainedReply = existing.replyJSON {
+            guard Self.equal(retainedReply, reply) else { throw Self.failure }
+        }
+        return .init(decided: decided, detached: detached, replyJSON: reply)
+    }
+
+    static func mixedDiscardAdds(_ record: Store.MixedRecord) throws -> [Store.Operation] {
+        _ = try Store.mixedFingerprint(record)
+        let adds = mixedSaveAdds(record)
+        for (index, entry) in record.operations.enumerated() {
+            guard case .add(let op) = entry else { continue }
+            if [.published, .resultDurable, .checkpointed].contains(op.phase) {
+                guard op.stage != nil, op.published != nil else { throw failure }
+            } else {
+                guard index == record.operations.count - 1, op.published == nil, op.replyJSON == nil else { throw failure }
+                switch op.phase {
+                case .intent: guard op.stage == nil, op.filled == nil else { throw failure }
+                case .stagePrepared: guard op.stage != nil, op.filled == nil else { throw failure }
+                case .stageFilled: guard op.stage != nil, op.filled != nil else { throw failure }
+                default: throw failure
+                }
+            }
+        }
+        return adds
+    }
+
+    /// Historical projection only. Resource proofs and the current-reference
+    /// callback remain separately bound by the Engine's exact native turn.
+    func prepareMixedDiscardCandidates(_ record: Store.MixedRecord, binding: Store.VersionedSnapshot,
+                                       cancellation: NativeAttachmentCancellation) throws -> [Store.Operation] {
+        jobs.drain(); try requireMixed(binding, cancellation)
+        guard record.checkpointAdvance == nil else { throw Self.failure }
+        let adds = try Self.mixedDiscardAdds(record)
+        for entry in record.operations { _ = try mixedPrepared(entry) }
+        if let discard = record.discard {
+            _ = try prepareMixedDiscardDecision(discard.requestJSON, record: record)
+        }
+        let operations: [[String: Any]] = record.operations.map { entry in
+            switch entry {
+            case .add(let op): return ["kind": "add", "phase": op.phase.rawValue, "preparedJSON": op.preparedJSON]
+            case .remove(let op): return ["kind": "remove", "phase": op.phase.rawValue, "preparedJSON": op.preparedJSON]
+            }
+        }
+        let input: [String: Any] = ["version": 2, "historyVersion": 3, "taskID": record.session.taskID,
+            "managedDirectoryURI": managedURI,
+            "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
+            "checkpointPayloadJSON": record.session.checkpoint.payloadJSON, "operations": operations]
+        let encoded = try Self.json(input)
+        guard encoded.utf8.count <= 8 * 1024 * 1024 else { throw Self.failure }
+        try requireMixed(binding, cancellation)
+        let response = try Self.object(invoke("attachmentDraftDiscardCandidatesV3", [encoded]), limit: 4 * 1024 * 1024)
+        try requireMixed(binding, cancellation)
+        guard Set(response.keys) == Set(["version", "kind", "historyVersion", "taskID", "candidates"]),
+              Self.integer(response["version"]) == 2, Self.integer(response["historyVersion"]) == 3,
+              response["kind"] as? String == "owned-mixed-discard-candidates",
+              let task = response["taskID"] as? String, Self.equal(task, record.session.taskID),
+              let candidates = response["candidates"] as? [[String: Any]], candidates.count == adds.count else { throw Self.failure }
+        for (candidate, op) in zip(candidates, adds) {
+            guard Set(candidate.keys) == Set(["requestId", "targetURI", "reason"]),
+                  let id = candidate["requestId"] as? String, Self.equal(id, op.requestId),
+                  let uri = candidate["targetURI"] as? String, Self.equal(uri, op.targetURI),
+                  candidate["reason"] as? String == "uncommitted-draft" else { throw Self.failure }
+        }
+        return adds
+    }
+
+    func promotedMixedDiscard(_ record: Store.MixedRecord, proof: Store.Published) throws -> Store.MixedRecord {
+        guard let last = record.operations.last, case .add(let op) = last, op.phase == .stageFilled else { throw Self.failure }
+        return Store.MixedRecord(session: record.session,
+            operations: Array(record.operations.dropLast()) + [.add(advancing(op, phase: .published, published: proof, reason: op.reason))],
+            discard: record.discard, checkpointAdvance: record.checkpointAdvance)
+    }
+
     func add(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
         let request = try Self.request(raw, add: true)
         guard var record = try store.read(), record.session.state == .active, record.session.sessionID == request.session,

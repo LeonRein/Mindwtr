@@ -3322,14 +3322,16 @@ globalThis.MindwtrHost = {
             const unstartedDiscard = operation === 'discard-unstarted' && outcome === 'confirmed';
             const removedDraft = operation === 'remove' && ['confirmed', 'replayed'].includes(outcome);
             const mixedSave = operation === 'mixed-save' && ['domainSaved', 'settled'].includes(outcome);
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave
+            const mixedDiscard = operation === 'discard-mixed' && outcome === 'confirmed';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
+                    context: { ...(mixedDiscard ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-discard' }
+                        : mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
                         : removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
                         : operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }
                         : finishedDiscard ? { releaseCheck: 'v1.3.5/ios-owned-discard-finish' }
