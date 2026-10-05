@@ -15,6 +15,9 @@ enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeSaveStage(Int), afterSaveStage(Int), beforeSaveRelease, afterSaveRelease
     case beforeSaveJournalClear, afterSaveJournalClear, beforeSaveThaw, afterSaveThaw
     case beforeDiscardFinishJournal, afterDiscardFinishJournal
+    case beforeDiscardFilledObservation, afterDiscardFilledObservation
+    case beforeDiscardPublicationReproof, afterDiscardPublicationReproof
+    case beforeDiscardPublicationPromotion, afterDiscardPublicationPromotion
     case beforeDiscardTarget(Int), afterDiscardTarget(Int), beforeDiscardStage(Int), afterDiscardStage(Int)
     case beforeDiscardTerminal, afterDiscardTerminal, beforeDiscardRelease, afterDiscardRelease
     case beforeDiscardJournalClear, afterDiscardJournalClear
@@ -400,16 +403,57 @@ final class NativeAttachmentDraftCoordinator {
     /// Version 1 remains the fully published contract. Version 2 grants only
     /// recorded private-stage retirement for one last unpublished operation.
     /// Version 3 gives up an unproven intent without touching its namespace.
+    /// Version 4 binds an explicitly observed filled-stage retirement decision.
     static func ownedDiscardVersion(_ record: NativeAttachmentDraftStore.Record) throws -> Int {
         if record.operations.allSatisfy({ [.published, .resultDurable, .checkpointed].contains($0.phase)
             && $0.stage != nil && $0.published != nil }) { return 1 }
         guard let last = record.operations.last,
-              last.filled == nil, last.published == nil, last.replyJSON == nil,
+              last.published == nil, last.replyJSON == nil,
               record.operations.dropLast().allSatisfy({ $0.phase == .checkpointed
                   && $0.stage != nil && $0.published != nil }) else { throw Self.failure }
-        if last.phase == .stagePrepared && last.stage != nil { return 2 }
-        if last.phase == .intent && last.stage == nil { return 3 }
+        if last.phase == .stagePrepared && last.stage != nil && last.filled == nil { return 2 }
+        if last.phase == .intent && last.stage == nil && last.filled == nil { return 3 }
+        if last.phase == .stageFilled && last.stage != nil && last.filled != nil { return 4 }
         throw Self.failure
+    }
+
+    /// Only fresh unjournaled admission observes. A persisted v4 decision must
+    /// remain retryable after its owned stage has already been unlinked.
+    func observeOwnedDiscardFilledStage(_ op: NativeAttachmentDraftStore.Operation,
+                                       cancellation: NativeAttachmentCancellation) throws {
+        guard let reserved = op.stage, let expected = op.filled else { throw Self.failure }
+        defer { jobs.drain() }
+        let value = try file(.observeFilledStage(stage: stage(reserved), sha256: expected.sha256, size: expected.size), cancellation: cancellation)
+        guard Set(value.keys) == Set(["sha256", "size", "identity"]),
+              let digest = value["sha256"] as? String, Self.equal(digest, expected.sha256),
+              Self.integer(value["size"]) == expected.size,
+              let identity = value["identity"] as? String, Self.equal(identity, reserved.identity) else { throw Self.failure }
+    }
+
+    func reproveOwnedDiscardPublication(_ op: NativeAttachmentDraftStore.Operation,
+                                       cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentDraftStore.Published {
+        guard let reserved = op.stage, let expected = op.filled else { throw Self.failure }
+        defer { jobs.drain() }
+        let value = try file(.verifyPublication(targetURI: op.targetURI, stage: stage(reserved),
+            sha256: expected.sha256, size: expected.size), cancellation: cancellation)
+        guard Set(value.keys) == Set(["sha256", "size", "identity", "directoryIdentity"]),
+              let digest = value["sha256"] as? String, Self.equal(digest, expected.sha256),
+              Self.integer(value["size"]) == expected.size,
+              let identity = value["identity"] as? String, Self.equal(identity, reserved.identity),
+              let directory = value["directoryIdentity"] as? String, Self.equal(directory, reserved.directoryIdentity) else { throw Self.failure }
+        return .init(sha256: digest, size: expected.size, identity: identity, directoryIdentity: directory)
+    }
+
+    /// The Engine guards the unjournaled exact record immediately before this
+    /// acknowledged write and rebinds its new hash/inode immediately afterward.
+    func promoteOwnedDiscardPublication(_ record: NativeAttachmentDraftStore.Record,
+                                       proof: NativeAttachmentDraftStore.Published) throws -> NativeAttachmentDraftStore.Record {
+        guard let op = record.operations.last, op.phase == .stageFilled else { throw Self.failure }
+        let promoted = replacing(record, advancing(op, phase: .published, published: proof, reason: op.reason))
+        try store.preflight(promoted)
+        try requireRecord(record)
+        try store.write(promoted)
+        return promoted
     }
 
     /// Pure domain candidacy only. The Engine separately binds the detached

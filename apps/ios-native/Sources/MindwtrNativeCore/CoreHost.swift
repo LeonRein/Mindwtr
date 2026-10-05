@@ -1667,13 +1667,14 @@ private final class Engine: @unchecked Sendable {
               let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
               Set(wrapper.keys) == Set(["version", "sessionID", "requestId", "recordSHA256", "operationIDs"]),
               Self.isInteger(wrapper["version"], equalTo: 1) || Self.isInteger(wrapper["version"], equalTo: 2)
-                  || Self.isInteger(wrapper["version"], equalTo: 3),
+                  || Self.isInteger(wrapper["version"], equalTo: 3) || Self.isInteger(wrapper["version"], equalTo: 4),
               let session = Self.ownedDiscardUUID(wrapper["sessionID"]), let id = Self.ownedDiscardUUID(wrapper["requestId"]),
               let fingerprint = wrapper["recordSHA256"] as? String, fingerprint.utf8.count == 64,
               fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               let ids = wrapper["operationIDs"] as? [String], ids.count <= 128, Set(ids).count == ids.count,
               ids.allSatisfy({ Self.ownedDiscardUUID($0) != nil && $0 != id }) else { throw Self.ownedDiscardFailure }
-        let version = Self.isInteger(wrapper["version"], equalTo: 1) ? 1 : Self.isInteger(wrapper["version"], equalTo: 2) ? 2 : 3
+        let version = Self.isInteger(wrapper["version"], equalTo: 1) ? 1 : Self.isInteger(wrapper["version"], equalTo: 2) ? 2
+            : Self.isInteger(wrapper["version"], equalTo: 3) ? 3 : 4
         guard version == 1 || !ids.isEmpty else { throw Self.ownedDiscardFailure }
         if let terminal = command.terminal {
             guard case .success(let value) = terminal else { throw Self.ownedDiscardFailure }
@@ -1777,42 +1778,112 @@ private final class Engine: @unchecked Sendable {
         }
     }
 
+    private func ownedDiscardCommand(_ record: NativeAttachmentDraftStore.Record) throws -> PendingCommand {
+        guard let discard = record.discard else { throw Self.ownedDiscardFailure }
+        let wrapper = try Self.ownedJSON(["version": NativeAttachmentDraftCoordinator.ownedDiscardVersion(record),
+            "sessionID": record.session.sessionID, "requestId": discard.requestId,
+            "recordSHA256": NativeAttachmentDraftStore.ownedDiscardFingerprint(record),
+            "operationIDs": record.operations.map(\.requestId)] as [String: Any])
+        return PendingCommand(version: 2, method: Self.ownedDiscardMethod,
+            argumentsJSON: String(decoding: try JSONEncoder().encode([wrapper]), as: UTF8.self))
+    }
+    private func requireUnjournaledDiscardOwner(_ turn: OwnedDiscardTurn, cancellation: NativeAttachmentCancellation) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        try cancellation.check()
+        guard started, !closed, !recoveryActivationPending, lockFD >= 0, attachmentGeneration == turn.generation,
+              context === turn.runtime, pending == nil, try ownedJournalIsAbsent(), try editorDrafts.read() == nil else {
+            throw Self.ownedDiscardFailure
+        }
+    }
+    private func requireUnjournaledDiscard(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                          cancellation: NativeAttachmentCancellation) throws {
+        try requireUnjournaledDiscardOwner(turn, cancellation: cancellation)
+        _ = try ownedDiscardJournal(command)
+        guard try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == turn.recordIdentity else {
+            throw Self.ownedDiscardFailure
+        }
+    }
+
     func finishAttachmentDraftDiscard(expectedSession: String, requestId: String,
                                       cancellation: NativeAttachmentCancellation) throws -> String {
         dispatchPrecondition(condition: .onQueue(queue))
         do {
             guard started, !closed, !recoveryActivationPending, pending == nil,
                   Self.ownedDiscardUUID(expectedSession) != nil, Self.ownedDiscardUUID(requestId) != nil,
-                  let record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
+                  var record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
                   Self.ownedEqual(record.session.sessionID, expectedSession),
                   record.discard.map({ Self.ownedEqual($0.requestId, requestId) }) == true else { throw Self.ownedDiscardFailure }
-            let fingerprint = try NativeAttachmentDraftStore.ownedDiscardFingerprint(record)
             let version = try NativeAttachmentDraftCoordinator.ownedDiscardVersion(record)
-            let wrapper = try Self.ownedJSON(["version": version, "sessionID": expectedSession, "requestId": requestId,
-                "recordSHA256": fingerprint, "operationIDs": record.operations.map(\.requestId)] as [String: Any])
-            let command = PendingCommand(version: 2, method: Self.ownedDiscardMethod,
-                argumentsJSON: String(decoding: try JSONEncoder().encode([wrapper]), as: UTF8.self))
-            let turn = try ownedDiscardTurn(command)
+            var command = try ownedDiscardCommand(record)
+            var turn = try ownedDiscardTurn(command)
             let coordinator = try ownedSaveCoordinatorForWork()
-            if version == 3 {
-                // Both historical formats must drain before giving up an intent.
+            if version == 3 || version == 4 {
+                // Both historical formats must drain before intent abandonment
+                // or fresh filled-stage classification.
                 // The fresh strict record and inode must still be this decision.
                 coordinator.drainOwnedSaveJobs()
-                _ = try ownedDiscardJournal(command)
-                guard try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == turn.recordIdentity else {
-                    throw Self.ownedDiscardFailure
-                }
+                try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
             }
             _ = try coordinator.prepareOwnedDiscardCandidates(record)
             try preflightOwnedDiscard(command)
+            if version == 4 {
+                guard let op = record.operations.last else { throw Self.ownedDiscardFailure }
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDiscardFilledObservation)
+                #endif
+                try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                let observed: Bool
+                do { try coordinator.observeOwnedDiscardFilledStage(op, cancellation: cancellation); observed = true }
+                catch {
+                    // An observer error grants no permission. Only a separate
+                    // positive publication proof can select the other branch.
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    observed = false
+                }
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDiscardFilledObservation)
+                #endif
+                try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                if !observed {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardPublicationReproof)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    let proof = try coordinator.reproveOwnedDiscardPublication(op, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardPublicationReproof)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeDiscardPublicationPromotion)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    let promoted = try coordinator.promoteOwnedDiscardPublication(record, proof: proof)
+                    try requireUnjournaledDiscardOwner(turn, cancellation: cancellation)
+                    guard let actual = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
+                          Self.ownedEqual(try NativeAttachmentDraftStore.ownedDiscardFingerprint(actual),
+                                          try NativeAttachmentDraftStore.ownedDiscardFingerprint(promoted)) else { throw Self.ownedDiscardFailure }
+                    record = actual
+                    command = try ownedDiscardCommand(record)
+                    turn = try ownedDiscardTurn(command)
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    NSLog("Native iOS attachment publication recovered releaseCheck=v1.3.5/ios-discard-publication-reproof outcome=recorded")
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterDiscardPublicationPromotion)
+                    #endif
+                    try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
+                    try preflightOwnedDiscard(command)
+                }
+            }
             try cancellation.check()
             #if DEBUG
             try attachmentDraftHooks?.boundary?(.beforeDiscardFinishJournal)
             #endif
-            guard pending == nil, try ownedJournalIsAbsent(),
-                  try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == turn.recordIdentity else { throw Self.ownedDiscardFailure }
-            _ = try ownedDiscardJournal(command)
+            try requireUnjournaledDiscard(command, turn: turn, cancellation: cancellation)
             pending = command
+            // A visible earlier promotion is not an acknowledgment by itself.
+            // This sibling journal's successful parent fsync orders that rename
+            // before cleanup; an uncertain journal write starts no retirement.
             try persist(command)
             turn.journalIdentity = try ownedDiscardIdentity(journalURL)
             #if DEBUG
