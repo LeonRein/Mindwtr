@@ -16,6 +16,7 @@ class CoreJobTest {
     private var syncFailure: Throwable? = null
     private var syncWanted = true
     private var appActive = false
+    private var nextStored = true
 
     private val calls = object : CoreJob.Calls {
         override fun recover(): Boolean {
@@ -44,7 +45,7 @@ class CoreJobTest {
         boot = { events += "boot"; bootFailure?.let { throw it }; calls },
         post = { events += "post ${it.getString("title")}" },
         refreshWidgets = { events += "widgets" },
-        syncAgain = { events += "again" },
+        syncAgain = { events += "again"; nextStored },
         log = { message, fields -> lines += "$message ${fields.optString("job")} ${fields.optString("outcome")} ${fields.optString("error")}".trim() })
 
     private val lines = mutableListOf<String>()
@@ -91,6 +92,13 @@ class CoreJobTest {
         syncFailure = IllegalStateException("Core backgroundSync timed out")
         assertEquals(CoreJob.Outcome.Retry, run(CoreJob.SYNC))
         assertEquals(listOf("boot", "recover", "drain", "sync scheduled"), events)
+    }
+
+    // Review S4a 3: a next run WorkManager did not store would end the chain; the job retries instead of reporting success.
+    @Test fun aSyncJobWhoseNextRunIsNotStoredRetries() {
+        nextStored = false
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "sync scheduled", "again"), events)
     }
 
     @Test fun aSyncJobWaitsForRecoveryAndTheDrain() {

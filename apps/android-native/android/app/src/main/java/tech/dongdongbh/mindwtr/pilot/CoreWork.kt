@@ -41,13 +41,17 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
         /**
          * The scheduled background sync (CoreJob.SYNC), as RN's expo-background-task schedules its worker: one job 15 minutes
          * (core's MOBILE_BACKGROUND_SYNC_MINIMUM_INTERVAL_MINUTES) after the last ended, only with a network, that queues its own
-         * next run when it ends. A one-time chain, not a periodic request: WorkManager holds a periodic run back until its period
-         * is due, so `cmd jobscheduler run -f` could not run it on the device check.
+         * next run when it ends. A one-time chain, not a periodic request, for two reasons: it is RN's own mechanism (Expo's worker
+         * on Android 8+, which RN has shipped since its background sync), and WorkManager holds a periodic run back until its
+         * period is due, so `cmd jobscheduler run -f` could not run it on the device check. A run whose next run WorkManager did not
+         * store retries (CoreJob), and every foreground reconcile queues one when none is (KEEP), so the chain cannot end unseen.
          */
         const val SYNC_WORK = "mindwtr-core-background-sync"
         const val SYNC_INTERVAL_MINUTES = 15L
         /** RN's background sync worker (expo-background-task's BackgroundTaskScheduler WORKER_IDENTIFIER), in the same WorkManager. */
         const val RN_SYNC_WORK = "EXPO_BACKGROUND_WORKER"
+        /** How long a job waits for WorkManager to store the work it queues; past it, the job retries. */
+        private const val STORE_WAIT_SECONDS = 10L
 
         /**
          * Queues job [job] with [input] to run now, expedited where Android runs expedited work without a foreground notification
@@ -166,8 +170,9 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
             // What the job stored reaches the home-screen widgets before the job ends.
             refreshWidgets = { runCatching { booted?.refreshWidgets() }.onFailure { Log.w(CoreHost.TAG, "Native Android widget refresh failed", it) } },
             log = log,
-            // Not once WorkManager stopped this run (sync turned off cancels the chain).
-            syncAgain = { if (!isStopped) runCatching { syncAgain(app).result.get() }.onFailure { Log.w(CoreHost.TAG, "Native Android sync job not queued again", it) } })
+            // Not once WorkManager stopped this run (sync turned off cancels the chain). Stored, or this run retries.
+            syncAgain = { isStopped || runCatching { syncAgain(app).result.get(STORE_WAIT_SECONDS, TimeUnit.SECONDS) }
+                .onFailure { Log.w(CoreHost.TAG, "Native Android sync job not queued again", it) }.isSuccess })
         return when (outcome) {
             CoreJob.Outcome.Success -> Result.success()
             CoreJob.Outcome.Retry -> Result.retry()

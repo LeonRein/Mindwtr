@@ -1536,7 +1536,7 @@ assert.match(source('CoreWork.kt'), /fun retryDrain\(context: Context\) = enqueu
     assert.match(coreWork, /if \(on\) work\.enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.KEEP, syncRequest\(\)\) else work\.cancelUniqueWork\(SYNC_WORK\)/);
     assert.match(coreWork, /enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.APPEND_OR_REPLACE, syncRequest\(\)\)/);
     assert.equal(coreWork.match(/enqueueUniqueWork\(SYNC_WORK/g).length, 2, 'the sync job is queued only by core\'s decision and by its own run');
-    assert.match(coreWork, /syncAgain = \{ if \(!isStopped\) runCatching \{ syncAgain\(app\)/, 'a cancelled run queues no next one');
+    assert.match(coreWork, /syncAgain = \{ isStopped \|\| runCatching \{ syncAgain\(app\)\.result\.get\(STORE_WAIT_SECONDS, TimeUnit\.SECONDS\) \}/, 'a cancelled run queues no next one; a next run not stored retries this one (review S4a 3)');
     assert.match(source('MindwtrApplication.kt'), /runCatching \{ CoreWork\.cancelRnSync\(this\) \}/);
     assert.match(hostEntry, /scheduleBackgroundSync: \(on\) => \{ const bridge = native\(\); if \(bridge\.bgSyncSchedule\) checked\(bridge\.bgSyncSchedule\(on\)\); \},/);
     const tested = spawnSync('bun', ['test', 'apps/android-native/bundle/host-sync.test.ts'], { cwd: resolve(app, '../..'), encoding: 'utf8' });

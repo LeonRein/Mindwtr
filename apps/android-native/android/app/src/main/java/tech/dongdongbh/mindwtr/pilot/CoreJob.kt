@@ -66,11 +66,12 @@ internal object CoreJob {
      * A capture job (INGEST) then sends what the drains stored and waits for that sync: a failed upload is core's recorded failure,
      * which the sync job retries, so the job still succeeds (the capture is stored). The sync job (SYNC) runs core's scheduled run,
      * none while the app is in front (as RN's Expo worker), then [syncAgain] queues its next run unless core says sync is no longer
-     * wanted; a run that failed outright retries in place, so the chain never breaks.
+     * wanted; a run that failed outright, or a next run WorkManager did not store ([syncAgain] false), retries in place, so the
+     * chain never breaks.
      * [log] gets one line per run, its fields apart (the job, its outcome, a failure's code: never a task's words).
      */
     fun run(name: String?, input: Map<String, String?>, boot: () -> Calls, post: (JSONObject) -> Unit, refreshWidgets: () -> Unit,
-            log: (String, JSONObject) -> Unit, syncAgain: () -> Unit = {}): Outcome {
+            log: (String, JSONObject) -> Unit, syncAgain: () -> Boolean = { true }): Outcome {
         val line = JSONObject().put("job", name ?: JSONObject.NULL)
         if (name !in JOBS) {
             log(LINE, line.put("outcome", "unknown"))
@@ -91,8 +92,7 @@ internal object CoreJob {
                         line.put("skipped", "foreground")
                         true
                     } else host.backgroundSync("scheduled").optBoolean("schedule")
-                    if (again) syncAgain()
-                    Outcome.Success
+                    if (again && !syncAgain()) Outcome.Retry else Outcome.Success
                 }
                 REMINDERS -> {
                     host.reminders(input["mode"] ?: "cycle", input["key"].orEmpty())
