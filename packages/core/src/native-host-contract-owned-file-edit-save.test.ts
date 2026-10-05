@@ -196,6 +196,46 @@ describe('unbound mixed ordinary owned file-edit Save', () => {
             expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled();
         });
 
+    it('saves ordinary link gaps around real file operations with file-only settlement and cold replay', async () => {
+        const base = [file, link];
+        await env.adapter.saveData(seed({ attachments: base })); env.writes.mockClear();
+        const input = await request(base, ['baseline-file'], { title: 'Edited' });
+        const addedLink: Attachment = { id: '99999999-1111-4111-8111-111111111111', kind: 'link', title: 'New link',
+            uri: 'https://example.test/new', createdAt: AT, updatedAt: AT };
+        const opening = JSON.parse(input.ownedDraft.initialPayloadJSON);
+        const initial = JSON.stringify({ ...opening, attachments: [...base, addedLink] });
+        const lineage = { ...input.ownedDraft, initialPayloadJSON: initial, beforePayloadJSON: initial, priorOperations: [] };
+        const first = await prepareNativeAttachmentDraftAddV3({ ...lineage, requestId: ID,
+            picked: { uri: 'file:///cache/report.pdf', name: 'Report.pdf', mimeType: null, size: 3 }, measuredSize: 3 },
+        { assertEditable: () => {}, t: (key) => key });
+        if (first.kind !== 'prepared') throw new Error('Fixture Add refused');
+        const after = JSON.parse(first.afterPayloadJSON), nextRows: Attachment[] = after.attachments;
+        nextRows[1] = { ...link, title: 'Edited link', uri: 'https://example.test/edited' };
+        const before = JSON.stringify({ ...after, attachments: nextRows });
+        const removed = prepareNativeAttachmentDraftRemoveV3({ ...lineage, beforePayloadJSON: before,
+            priorOperations: [{ kind: 'add', operation: first }], requestId: '22222222-1111-4111-8111-111111111111',
+            attachmentId: first.requestId }, { assertEditable: () => {}, t: (key) => key });
+        const last = JSON.parse(removed.afterPayloadJSON);
+        const current = JSON.stringify({ ...last, attachments: last.attachments.map((row: Attachment) => row.id === addedLink.id
+            ? { ...row, deletedAt: AT, updatedAt: AT } : row) });
+        input.ownedDraft = { ...lineage, beforePayloadJSON: current,
+            priorOperations: [{ kind: 'add', operation: first }, { kind: 'remove', operation: removed }] };
+        input.checkpoint = { ...input.checkpoint, generation: 5, payloadJSON: current };
+        input.saveRequest.attachments.value = JSON.parse(current).attachments;
+        const envelope = await plan(input), checked = env.host.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope);
+        if (!checked.ok) throw new Error('Fixture validation refused');
+        expect(checked.value.settlementPlan).toEqual([{ attachment: { ...first.attachment, deletedAt: AT, updatedAt: AT },
+            reason: 'uncommitted-draft' }]);
+        expect(effect(envelope).task.after).toMatchObject({ title: 'Edited' });
+        expect(effect(envelope).task.after.attachments?.filter((row) => row.kind === 'link'))
+            .toEqual([nextRows[1], { ...addedLink, deletedAt: AT, updatedAt: AT }]);
+        expect(await env.host.commitPreparedOwnedEditorFileEditTaskDraftSave(envelope)).toEqual({ ok: true, value: checked.value.result });
+        const saved = rows(); env = await open(path);
+        expect(env.host.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope)).toEqual(checked);
+        expect(await env.host.commitPreparedOwnedEditorFileEditTaskDraftSave(envelope)).toEqual({ ok: true, value: checked.value.result });
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled();
+    });
+
     it.each(['metadata', 'tombstone', 'missing', 'unrelated', 'content'])('matches actual RN merge for stored %s', async (mode) => {
         const input = await request(undefined, ['baseline-file']);
         const base = task().attachments!;
@@ -338,7 +378,10 @@ describe('unbound mixed ordinary owned file-edit Save', () => {
         }
         if (mode === 'half') input.saveRequest.attachments.value = input.saveRequest.attachments.base;
         if (mode === 'history') input.ownedDraft.priorOperations = [];
-        if (mode === 'lifecycle') Object.assign(input.saveRequest.base, { status: 'next' }), Object.assign(input.saveRequest.patch, { status: 'done' });
+        if (mode === 'lifecycle') {
+            Object.assign(input.saveRequest.base, { status: 'next' });
+            Object.assign(input.saveRequest.patch, { status: 'done' });
+        }
         if (mode === 'checklist') Object.assign(input.saveRequest, { checklist: [] });
         if (mode === 'extra') Object.assign(input, { ownsFiles: true });
         reject(await env.host.prepareOwnedEditorFileEditTaskDraftSave(input)); expect(env.writes).not.toHaveBeenCalled();

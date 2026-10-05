@@ -3972,6 +3972,17 @@ const poll = async (state, id) => {
     assert.equal((await poll(local, local.MindwtrHost.boot())).ok, true);
     await check(async () => assert.deepEqual(await call(local, 'attachmentDraftBeginV3', begin),
         { ok: true, value: { version: 3, taskID: 'task257', payloadJSON: opening } }));
+    await check(async () => {
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-attachment-link-lineage', outcome: 'validated' });
+        const beforeLog = local.logText;
+        assert.equal((await call(local, 'attachmentDraftBeginV3', { ...begin, payloadJSON: '{}' })).ok, false);
+        assert.equal(local.logText, beforeLog);
+        local.logFailure = 'private log failure';
+        assert.equal((await call(local, 'attachmentDraftBeginV3', begin)).ok, true);
+        assert.equal(local.logText, beforeLog);
+        local.logFailure = null;
+    });
     const removedReply = await call(local, 'attachmentDraftRemovePrepareV3', removeInput);
     assert.equal(removedReply.ok, true);
     const removed = removedReply.value;

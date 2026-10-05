@@ -210,6 +210,39 @@ final class AttachmentMixedAddHostTests: XCTestCase {
         XCTAssertFalse(removedPrepared.isEmpty); XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
     }
 
+    func testLinkEditsBeforeAndBetweenRealFileOperationsSurviveColdSave() async throws {
+        let host = try await seed(), originalDomain = try domain()
+        let linkID = UUID().uuidString.lowercased()
+        var link: [String: Any] = ["id": linkID, "kind": "link", "title": "Link",
+            "uri": "https://example.test/first", "createdAt": at, "updatedAt": at]
+        func checkpointLink() async throws {
+            let before = try latest(); var value = try object(before.payloadJSON)
+            var rows = try XCTUnwrap(value["attachments"] as? [[String: Any]])
+            rows.removeAll { $0["id"] as? String == linkID }; rows.append(link)
+            value["attachments"] = rows
+            try await host.checkpointEditorDraft(EditorDraftSnapshot(sessionID: before.sessionID,
+                taskID: before.taskID, generation: before.generation + 1, payloadJSON: try json(value)))
+        }
+        try await checkpointLink()
+        let removed = try await added(host)
+        link["title"] = "Edited link"; link["uri"] = "https://example.test/edited"
+        try await checkpointLink(); try await remove(host, id: removed.requestId)
+        let live = try await added(host)
+        link["deletedAt"] = at; try await checkpointLink()
+        XCTAssertEqual(try domain(), originalDomain)
+        let before = try latest(), request = try saveRequest()
+        await host.close(); let cold = core(); _ = try await cold.start()
+        _ = try await cold.saveAttachmentDraftMixed(saveRequestJSON: request,
+            expectedSession: before.sessionID, expectedGeneration: before.generation)
+        let task = try XCTUnwrap((NativeJSON.jsonObject(with: Data(sql("SELECT attachments FROM tasks WHERE id=?", [taskID]).utf8)) as? [[String: Any]])?.first)
+        let rows = try XCTUnwrap(NativeJSON.jsonObject(with: Data(XCTUnwrap(task["attachments"] as? String).utf8)) as? [[String: Any]])
+        XCTAssertEqual(try json(XCTUnwrap(rows.first { $0["id"] as? String == linkID })), try json(link))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try target(removed).path))
+        XCTAssertEqual(try Data(contentsOf: target(live)), try Data(contentsOf: source()))
+        XCTAssertEqual(try Data(contentsOf: baselineTarget()), Data("baseline sentinel / 文".utf8))
+        XCTAssertNil(try store.readMixed()); XCTAssertNil(try editor.read())
+    }
+
     func testColdRecoveryAtAllSixPhasesAndLostCheckpointMarkerAcknowledgments() async throws {
         let points: [AttachmentDraftBoundary] = [.afterIntent, .afterStageProof, .beforeFilled, .afterFilled,
             .beforePublication, .afterPublication, .afterPublicationProof, .beforeResult, .afterResult,

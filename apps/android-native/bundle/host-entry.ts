@@ -3233,7 +3233,15 @@ globalThis.MindwtrHost = {
         return submit(async () => prepareNativeAttachmentDraftAddV2(attachmentDraftJson(json), attachmentDraftDependencies));
     },
     attachmentDraftBeginV3(json: string): string {
-        return submit(async () => validateNativeAttachmentDraftBeginV3(attachmentDraftJson(json), attachmentDraftDependencies));
+        return submit(async () => {
+            const result = validateNativeAttachmentDraftBeginV3(attachmentDraftJson(json), attachmentDraftDependencies);
+            try {
+                await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
+                    message: 'Native iOS link-compatible attachment lineage validated',
+                    context: { releaseCheck: 'v1.3.5/ios-attachment-link-lineage', outcome: 'validated' } }, { force: true });
+            } catch { /* Diagnostics do not change validation or grant native ownership. */ }
+            return result;
+        });
     },
     attachmentDraftValidateLineageV3(json: string): string {
         return submit(async () => {

@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3,
-    readNativeAttachmentDraftRemoveFrozen, validateNativeAttachmentDraftLineageV3,
-    validateNativeAttachmentDraftLineageV2, prepareNativeAttachmentDraftAddV2,
+    readNativeAttachmentDraftFrozen, readNativeAttachmentDraftRemoveFrozen, validateNativeAttachmentDraftLineageV3,
+    validateNativeAttachmentDraftBegin, validateNativeAttachmentDraftBeginV2, validateNativeAttachmentDraftBeginV3,
+    validateNativeAttachmentDraftLineage, validateNativeAttachmentDraftLineageV2, prepareNativeAttachmentDraftAddV2,
     type NativeAttachmentDraftLineageInputV3, type NativeAttachmentDraftOperationV3,
     type NativeAttachmentDraftPrepared, type NativeAttachmentDraftRemovePrepared } from './native-attachment-draft';
 import { softDeleteAttachment } from './attachment-editor-model';
+import { prepareNativeAttachmentDraftDiscardCandidatesV3 } from './native-attachment-draft-discard';
 import * as upload from './attachment-validation';
 import type { Attachment } from './types';
 
@@ -34,6 +36,7 @@ const remove = (value = input(), attachmentId = baseline.id, requestId = id(2)) 
     prepareNativeAttachmentDraftRemoveV3({ ...value, requestId, attachmentId }, ports());
 const taggedAdd = (operation: NativeAttachmentDraftPrepared): NativeAttachmentDraftOperationV3 => ({ kind: 'add', operation });
 const taggedRemove = (operation: NativeAttachmentDraftRemovePrepared): NativeAttachmentDraftOperationV3 => ({ kind: 'remove', operation });
+const newLink = (n: number): Attachment => ({ ...link, id: id(n), title: `Link ${n}`, uri: `https://example.test/${n}` });
 
 describe('sealed v3 mixed attachment draft history', () => {
     afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -62,6 +65,138 @@ describe('sealed v3 mixed attachment draft history', () => {
         expect(after.attachments[1]).toEqual(link);
         expect(after.attachments[2]).toEqual({ ...first.attachment, deletedAt: r1.removedAt, updatedAt: r1.removedAt });
         expect(after.attachments[3]).toEqual(second.attachment);
+    });
+
+    it.each(['add', 'edit', 'remove'])('admits existing link %s before V3 Begin without changing old Begin grammar', (mode) => {
+        let rows = [baseline, link];
+        if (mode === 'add') rows = [...rows, newLink(100)];
+        if (mode === 'edit') rows[1] = { ...link, title: 'Edited link', uri: 'https://example.test/edited' };
+        if (mode === 'remove') rows = softDeleteAttachment(rows, link.id, AT);
+        const payloadJSON = ` \n${edit(opening(), { attachments: rows })}\n`, deps = ports();
+        expect(validateNativeAttachmentDraftBeginV3({ taskID: 'task', payloadJSON }, deps))
+            .toEqual({ version: 3, taskID: 'task', payloadJSON });
+        expect(validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: payloadJSON, beforePayloadJSON: payloadJSON })))
+            .toEqual({ version: 3, taskID: 'task', payloadJSON });
+        expect(validateNativeAttachmentDraftBegin({ taskID: 'task', payloadJSON }, ports()).version).toBe(1);
+        expect(() => validateNativeAttachmentDraftBeginV2({ taskID: 'task', payloadJSON }, ports())).toThrow('INVALID_INPUT');
+    });
+
+    it('retains link gaps around real Add/Remove preparation and Discard plans only the Add', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(AT);
+        const dead = { ...baseline, id: 'tombstone', uri: ROOT + 'dead.pdf', deletedAt: AT };
+        const initial = edit(opening([baseline, dead, link]), { attachments: [newLink(100), baseline, dead, link] });
+        const first = await add(input({ initialPayloadJSON: initial, beforePayloadJSON: initial }));
+        const rows = softDeleteAttachment(JSON.parse(first.afterPayloadJSON).attachments, id(100), AT);
+        rows[3] = { ...link, title: 'Edited link', uri: 'https://example.test/edited' };
+        const before = ` \n${edit(first.afterPayloadJSON, { attachments: [rows[3], rows[1], rows[0], rows[2], rows[4], newLink(101)],
+            raw: { notes: 'Ordinary input @literal', opaque: ['保留', null] } })}\n`;
+        const r = remove(input({ initialPayloadJSON: initial, beforePayloadJSON: before, priorOperations: [taggedAdd(first)] }), first.requestId);
+        const latest = ` \n${edit(r.afterPayloadJSON, { attachments: softDeleteAttachment(JSON.parse(r.afterPayloadJSON).attachments, id(101), AT),
+            raw: { notes: 'Last ordinary input', opaque: ['保留', null] } })}\n`;
+        const history = [taggedAdd(first), taggedRemove(r)], frozen = JSON.stringify(history);
+        expect(validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: initial, beforePayloadJSON: latest, priorOperations: history })))
+            .toEqual({ version: 3, taskID: 'task', payloadJSON: latest });
+        expect(first.beforePayloadJSON).toBe(initial); expect(r.beforePayloadJSON).toBe(before);
+        expect(JSON.parse(latest).attachmentsBase).toEqual([baseline, dead, link]);
+        expect(JSON.parse(latest).attachments.filter((row: Attachment) => row.kind === 'file'))
+            .toEqual(JSON.parse(r.afterPayloadJSON).attachments.filter((row: Attachment) => row.kind === 'file'));
+        expect(prepareNativeAttachmentDraftDiscardCandidatesV3({ version: 2, historyVersion: 3, taskID: 'task',
+            managedDirectoryURI: ROOT, initialPayloadJSON: initial, checkpointPayloadJSON: latest,
+            operations: history.map((entry) => ({ kind: entry.kind, phase: 'checkpointed', preparedJSON: JSON.stringify(entry.operation) })) }).candidates)
+            .toEqual([{ requestId: first.requestId, targetURI: first.targetURI, reason: 'uncommitted-draft' }]);
+        expect(JSON.stringify(history)).toBe(frozen);
+    });
+
+    it.each(['id', 'kind', 'title', 'uri', 'mimeType', 'size', 'createdAt', 'updatedAt', 'cloudKey', 'fileHash',
+        'contentRev', 'contentMtimeMs', 'contentSize', 'pendingContentUpload', 'localStatus', 'deletedAt',
+        'dropMetadata', 'omit', 'extraFile', 'reorderFiles', 'undelete'])(
+        'refuses file %s drift at opening, between operations, and current checkpoint', async (mode) => {
+            const dead = { ...baseline, id: 'tombstone', uri: ROOT + 'dead.pdf', deletedAt: AT };
+            const initial = opening([baseline, dead, link]);
+            const first = await add(input({ initialPayloadJSON: initial, beforePayloadJSON: initial }));
+            const r = remove(input({ initialPayloadJSON: initial, beforePayloadJSON: first.afterPayloadJSON,
+                priorOperations: [taggedAdd(first)] }), first.requestId);
+            const changed = (encoded: string): string => {
+                const rows: Attachment[] = copy(JSON.parse(encoded).attachments);
+                if (mode === 'dropMetadata') delete rows[0].cloudKey;
+                else if (mode === 'omit') rows.shift();
+                else if (mode === 'extraFile') rows.push({ ...baseline, id: 'foreign-file' });
+                else if (mode === 'reorderFiles') [rows[0], rows[1]] = [rows[1], rows[0]];
+                else if (mode === 'undelete') delete rows[1].deletedAt;
+                else Object.assign(rows[0], { [mode]: mode === 'kind' ? 'link'
+                    : mode === 'pendingContentUpload' ? false : mode === 'localStatus' ? 'available'
+                        : ['size', 'contentRev', 'contentMtimeMs', 'contentSize'].includes(mode) ? 9
+                            : ['createdAt', 'updatedAt', 'deletedAt'].includes(mode) ? '2026-10-06T00:00:00.000Z' : 'changed' });
+                return edit(encoded, { attachments: rows });
+            };
+            const openingGap = changed(initial), deps = ports();
+            expect(() => validateNativeAttachmentDraftBeginV3({ taskID: 'task', payloadJSON: openingGap }, deps)).toThrow('INVALID_INPUT');
+            expect(() => validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: openingGap, beforePayloadJSON: openingGap })))
+                .toThrow('INVALID_INPUT');
+            const before = changed(r.beforePayloadJSON), gapRemove = { ...r, beforePayloadJSON: before,
+                afterPayloadJSON: edit(before, { attachments: softDeleteAttachment(JSON.parse(before).attachments, r.attachmentId, r.removedAt) }) };
+            expect(readNativeAttachmentDraftRemoveFrozen(gapRemove)).toEqual(gapRemove);
+            expect(() => validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: initial,
+                beforePayloadJSON: gapRemove.afterPayloadJSON, priorOperations: [taggedAdd(first), taggedRemove(gapRemove)] }))).toThrow('INVALID_INPUT');
+            expect(() => validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: initial,
+                beforePayloadJSON: changed(r.afterPayloadJSON), priorOperations: [taggedAdd(first), taggedRemove(r)] }))).toThrow('INVALID_INPUT');
+            expect(deps.assertEditable).not.toHaveBeenCalled();
+        });
+
+    it.each(['url', 'id', 'createdAt', 'updatedAt', 'deletedAt', 'metadata', 'kind', 'duplicate', 'omit', 'changedKind'])(
+        'refuses malformed link %s at opening and current gap before fresh file policy', async (mode) => {
+            const first = await add(), rows = (encoded: string): Attachment[] => {
+                const value: Attachment[] = copy(JSON.parse(encoded).attachments), added = newLink(100);
+                if (mode === 'url') added.uri = 'https://';
+                if (mode === 'id') added.id = 'noncanonical-link';
+                if (mode === 'createdAt' || mode === 'updatedAt' || mode === 'deletedAt') added[mode] = '2026-10-05';
+                if (mode === 'metadata') added.cloudKey = 'forged';
+                if (mode === 'kind') added.kind = 'file';
+                if (mode === 'duplicate') added.id = link.id;
+                if (mode === 'omit') value.splice(1, 1);
+                if (mode === 'changedKind') value[1] = { ...link, kind: 'file' };
+                return [...value, added];
+            };
+            const initial = edit(opening(), { attachments: rows(opening()) }), deps = ports();
+            expect(() => validateNativeAttachmentDraftBeginV3({ taskID: 'task', payloadJSON: initial }, deps)).toThrow('INVALID_INPUT');
+            const current = input({ beforePayloadJSON: edit(first.afterPayloadJSON, { attachments: rows(first.afterPayloadJSON) }),
+                priorOperations: [taggedAdd(first)] });
+            expect(() => validateNativeAttachmentDraftLineageV3(current)).toThrow('INVALID_INPUT');
+            const policy = vi.spyOn(upload, 'validateAttachmentForUpload');
+            await expect(prepareNativeAttachmentDraftAddV3({ ...current, requestId: id(3), picked, measuredSize: 3 }, deps)).rejects.toThrow('INVALID_INPUT');
+            expect(policy).not.toHaveBeenCalled(); expect(deps.assertEditable).not.toHaveBeenCalled();
+        });
+
+    it('refuses an Add UUID already used by an ordinary link before upload policy', async () => {
+        const initial = edit(opening(), { attachments: [baseline, link, newLink(1)] }), policy = vi.spyOn(upload, 'validateAttachmentForUpload');
+        expect(validateNativeAttachmentDraftLineageV3(input({ initialPayloadJSON: initial, beforePayloadJSON: initial })).version).toBe(3);
+        await expect(add(input({ initialPayloadJSON: initial, beforePayloadJSON: initial }))).rejects.toThrow('INVALID_INPUT');
+        expect(policy).not.toHaveBeenCalled();
+    });
+
+    it.each(['add', 'remove'])('rejects a link mutation inside a frozen file %s transform', async (mode) => {
+        const first = await add(), r = remove(input({ beforePayloadJSON: first.afterPayloadJSON, priorOperations: [taggedAdd(first)] }));
+        const operation = copy(mode === 'add' ? first : r);
+        operation.afterPayloadJSON = edit(operation.afterPayloadJSON, {
+            attachments: [...JSON.parse(operation.afterPayloadJSON).attachments, newLink(100)],
+        });
+        if (mode === 'add') expect(() => readNativeAttachmentDraftFrozen(operation)).toThrow('INVALID_INPUT');
+        else expect(() => readNativeAttachmentDraftRemoveFrozen(operation)).toThrow('INVALID_INPUT');
+        const history = mode === 'add' ? [taggedAdd(operation as NativeAttachmentDraftPrepared)]
+            : [taggedAdd(first), taggedRemove(operation as NativeAttachmentDraftRemovePrepared)];
+        expect(() => validateNativeAttachmentDraftLineageV3(input({ beforePayloadJSON: operation.afterPayloadJSON, priorOperations: history })))
+            .toThrow('INVALID_INPUT');
+    });
+
+    it('keeps V1/V2 historical link-gap equality sealed', async () => {
+        const first = await add(), current = edit(first.afterPayloadJSON, { attachments: [...JSON.parse(first.afterPayloadJSON).attachments, newLink(100)] });
+        const second = await add(input({ beforePayloadJSON: current, priorOperations: [taggedAdd(first)] }), id(3));
+        for (const version of [1, 2] as const) {
+            const validate = version === 1 ? validateNativeAttachmentDraftLineage : validateNativeAttachmentDraftLineageV2;
+            const value = { version, taskID: 'task', initialPayloadJSON: opening(), managedDirectoryURI: ROOT };
+            expect(() => validate({ ...value, beforePayloadJSON: current, priorAdditions: [first] })).toThrow('INVALID_INPUT');
+            expect(() => validate({ ...value, beforePayloadJSON: second.afterPayloadJSON, priorAdditions: [first, second] })).toThrow('INVALID_INPUT');
+        }
     });
 
     it('uses RN soft delete for a nonUUID baseline file, retaining every content/cloud/opaque field', () => {

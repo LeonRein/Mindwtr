@@ -331,7 +331,7 @@ export function validateNativeAttachmentDraftBeginV3(input: unknown, deps: Nativ
     const object = input as Record<string, unknown>;
     const taskID = text(object.taskID, 500, true), payloadJSON = text(object.payloadJSON, PAYLOAD_BYTES, true);
     const initial = payloadV3(payloadJSON, taskID);
-    if (!same(initial.object.attachmentsBase, initial.attachments)) invalid();
+    if (!linkOnlyGapV3(initial.object.attachmentsBase, initial.attachments)) invalid();
     deps.assertEditable(taskID);
     return Object.freeze({ version: 3, taskID, payloadJSON });
 }
@@ -441,6 +441,12 @@ const payloadV3 = (encoded: unknown, taskID: string): ReturnType<typeof payload>
     visit(value.object, 0);
     return value;
 };
+// Ordinary links may change at V3 gaps; every file field and its order stay frozen.
+const linkOnlyGapV3 = (base: unknown, value: Attachment[]): boolean => {
+    const half = readNativeTaskLinkHalf({ base, value }, false);
+    return half !== null && same(half.base.filter((item) => item.kind === 'file'),
+        half.value.filter((item) => item.kind === 'file'));
+};
 const removeShape = (value: unknown): NativeAttachmentDraftRemovePrepared => {
     if (!exact(value, REMOVE_FIELDS)) invalid();
     const input = value as Record<string, unknown>;
@@ -495,7 +501,7 @@ const captureLineageV3 = (object: Record<string, unknown>, additionalFields: obj
 };
 const validateLineageV3 = (captured: NativeAttachmentDraftLineageInputV3): Set<string> => {
     const initial = payloadV3(captured.initialPayloadJSON, captured.taskID);
-    if (!same(initial.object.attachmentsBase, initial.attachments)) invalid();
+    if (!linkOnlyGapV3(initial.object.attachmentsBase, initial.attachments)) invalid();
     let previous = initial.attachments;
     const ids = new Set<string>();
     for (const entry of captured.priorOperations) {
@@ -503,7 +509,7 @@ const validateLineageV3 = (captured: NativeAttachmentDraftLineageInputV3): Set<s
         requestIDV3(prior.requestId);
         const before = payloadV3(prior.beforePayloadJSON, captured.taskID);
         if (prior.taskID !== captured.taskID || ids.has(prior.requestId)
-            || !same(before.object.attachmentsBase, initial.object.attachmentsBase) || !same(before.attachments, previous)) invalid();
+            || !same(before.object.attachmentsBase, initial.object.attachmentsBase) || !linkOnlyGapV3(previous, before.attachments)) invalid();
         if (entry.kind === 'add') {
             validateFrozen(entry.operation);
             if (entry.operation.managedDirectoryURI !== captured.managedDirectoryURI) invalid();
@@ -512,7 +518,7 @@ const validateLineageV3 = (captured: NativeAttachmentDraftLineageInputV3): Set<s
         previous = payloadV3(prior.afterPayloadJSON, captured.taskID).attachments;
     }
     const latest = payloadV3(captured.beforePayloadJSON, captured.taskID);
-    if (!same(latest.object.attachmentsBase, initial.object.attachmentsBase) || !same(latest.attachments, previous)) invalid();
+    if (!same(latest.object.attachmentsBase, initial.object.attachmentsBase) || !linkOnlyGapV3(previous, latest.attachments)) invalid();
     return ids;
 };
 
