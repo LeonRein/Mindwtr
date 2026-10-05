@@ -50,6 +50,7 @@ enum NativeAttachmentFileJobsError: LocalizedError {
 enum NativeAttachmentDraftFileRequest: Sendable {
     case ensureManagedDirectory
     case snapshotSource(sourceURI: String)
+    case snapshotBaseline(attachmentID: String, targetURI: String)
     case prepareStage(targetURI: String, operationID: String)
     case fillStage(source: NativeAttachmentFiles.CacheSourceProof, stage: NativeAttachmentFiles.ReservedAttachmentStageProof)
     case observeFilledStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof, sha256: String, size: Int64)
@@ -61,7 +62,7 @@ enum NativeAttachmentDraftFileRequest: Sendable {
     fileprivate var isInstaller: Bool {
         switch self {
         case .prepareStage, .publishStage, .retirePrivateStage: return true
-        case .ensureManagedDirectory, .snapshotSource, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished: return false
+        case .ensureManagedDirectory, .snapshotSource, .snapshotBaseline, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished: return false
         }
     }
 
@@ -98,6 +99,10 @@ enum NativeAttachmentDraftFileRequest: Sendable {
         case .snapshotSource(let sourceURI):
             try uri(sourceURI)
             input = ["op": "snapshotSource", "sourceURI": sourceURI]
+        case .snapshotBaseline(let attachmentID, let targetURI):
+            try uri(targetURI)
+            guard NativeAttachmentFiles.validBaselineAttachmentID(attachmentID) else { throw NativeAttachmentFilesError.invalidRequest }
+            input = ["op": "snapshotBaseline", "attachmentID": attachmentID, "targetURI": targetURI]
         case .prepareStage(let targetURI, let operationID):
             try uri(targetURI)
             guard operationID.utf8.count == 32,
@@ -317,6 +322,21 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
             return ["sourceURI": proof.sourceURI, "sha256": proof.sha256, "size": proof.size,
                     "identity": proof.identity, "cacheRootIdentity": proof.cacheRootIdentity,
                     "parentIdentity": proof.parentIdentity]
+        case .snapshotBaseline(let attachmentID, let targetURI):
+            switch try files.snapshotBaselineAttachment(attachmentID: attachmentID, targetURI: targetURI, checkCancellation: token.check) {
+            case .present(let proof):
+                return ["kind": "present", "targetURI": proof.targetURI, "sha256": proof.sha256, "size": proof.size,
+                        "identity": proof.identity, "directoryIdentity": proof.directoryIdentity]
+            case .noOwnedGeneration(let targetURI, let absence):
+                let captured: [String: Any]
+                switch absence {
+                case .leafAbsent(let directoryIdentity): captured = ["kind": "leafAbsent", "directoryIdentity": directoryIdentity]
+                case .managedDirectoryAbsent(let documentsIdentity): captured = ["kind": "managedDirectoryAbsent", "documentsIdentity": documentsIdentity]
+                }
+                return ["kind": "noOwnedGeneration", "targetURI": targetURI, "absence": captured]
+            case .unmanaged(let targetURI): return ["kind": "unmanaged", "targetURI": targetURI]
+            case .unsafeEntry(let targetURI): return ["kind": "unsafeEntry", "targetURI": targetURI]
+            }
         case .prepareStage(let targetURI, let operationID):
             let proof = try installer.prepareStage(targetURI: targetURI, operationID: operationID)
             return ["stageURI": proof.stageURI, "stagedIdentity": proof.stagedIdentity,

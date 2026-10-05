@@ -1850,3 +1850,9 @@ Validation: all 44 real JavaScriptCore/file Discard tests passed together with z
 A separate internal V3 projection now validates interleaved file Add and Remove operations while preserving the opening baseline and ordinary editor fields. Remove calls the same soft-delete helper as React Native, retains attachment metadata, and freezes its timestamp and complete before/after payload. Existing Add-only histories remain sealed.
 
 Validation: 427 focused core cases passed across eight suites, including 54 new V3 cases; core typecheck and scoped lint passed. Independent source review corrected Unicode attachment-ID bounds and trailing-newline UUID acceptance in the new version. This is an unbound shared prerequisite; native history storage, Remove admission, Save settlement and editor UI remain unfinished.
+
+### iOS baseline managed-file observation (2026-10-05)
+
+A native-only observer now captures the measured content and inode of an eligible existing managed file. It separately records positive leaf/directory absence, unmanaged provider paths and unsafe entries. Missing files grant no right to delete a later generation; observation creates no directories and performs no deletion. Managed filenames must match the flat ID-name rule.
+
+Validation: 134 real-descriptor/FIFO tests passed together with zero skips, including 22 new observation cases and 112 existing file-proof/retirement cases. Review corrected provider URI handling and slash-boundary admission; one Unicode fixture was corrected to use explicit encoded bytes after Foundation normalized its URL. Signed development build, diagnostics-ledger checks and independent review passed without installation. Native Remove/Save integration and editor UI remain pending.

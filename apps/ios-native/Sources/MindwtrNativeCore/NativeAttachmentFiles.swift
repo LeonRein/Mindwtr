@@ -44,6 +44,26 @@ final class NativeAttachmentFiles {
         let directoryIdentity: String
     }
     enum PublishedAttachmentRetirementOutcome: Sendable, Equatable { case removed, absent }
+    /// Current eligible managed generation, separate from Add publication proof.
+    struct BaselineAttachmentProof: Sendable, Equatable {
+        let targetURI: String
+        let sha256: String
+        let size: Int64
+        let identity: String
+        let directoryIdentity: String
+    }
+    enum BaselineAttachmentAbsence: Sendable, Equatable {
+        case leafAbsent(directoryIdentity: String)
+        case managedDirectoryAbsent(documentsIdentity: String)
+    }
+    /// No case grants deletion or domain authority. In particular an absent
+    /// observation must never adopt a generation which appears afterward.
+    enum BaselineAttachmentObservation: Sendable, Equatable {
+        case present(BaselineAttachmentProof)
+        case noOwnedGeneration(targetURI: String, absence: BaselineAttachmentAbsence)
+        case unmanaged(targetURI: String)
+        case unsafeEntry(targetURI: String)
+    }
     static let maximumBytes = 16 * 1024 * 1024
     private static let chunkBytes = 64 * 1024
     private let libraryRoot: URL
@@ -162,6 +182,105 @@ final class NativeAttachmentFiles {
     /// Only one named regular file or symlink entry; folder durability is a
     /// separate file-thread syncParent call after the core ownership decision.
     func deleteNow(_ uri: String) throws { try remove(reference(uri), directories: false, sync: false) }
+
+    // Matches readNativeAttachments' nonempty 500-character ID bound. Swift's
+    // UTF-16 count preserves JS string-length semantics without a UUID grammar.
+    static func validBaselineAttachmentID(_ value: String) -> Bool {
+        !value.isEmpty && value.utf16.count <= 500 && !value.utf8.contains(0)
+    }
+
+    /// Captures a shared-selected baseline candidate's current local generation.
+    /// This never creates directories, reads unmanaged targets, or retires bytes.
+    func snapshotBaselineAttachment(attachmentID: String, targetURI: String,
+                                    checkCancellation: () throws -> Void = {}) throws -> BaselineAttachmentObservation {
+        guard Self.validBaselineAttachmentID(attachmentID), !targetURI.isEmpty,
+              targetURI.utf8.count <= 16 * 1024, !targetURI.utf8.contains(0),
+              let uri = URLComponents(string: targetURI), let scheme = uri.scheme, !scheme.isEmpty else {
+            throw NativeAttachmentFilesError.invalidRequest
+        }
+        func observed(_ value: BaselineAttachmentObservation) -> BaselineAttachmentObservation {
+            NSLog("Native iOS attachment baseline file observed releaseCheck=v1.3.5/ios-baseline-file-observed outcome=observed")
+            return value
+        }
+        try checkCancellation()
+        // Cross-platform provider/remote records carry no native file authority.
+        // Preserve the URI without attempting resolution or any target IO.
+        guard scheme.lowercased() == "file" else { return observed(.unmanaged(targetURI: targetURI)) }
+        let pathBytes = Array(try Self.filePath(targetURI).utf8), prefix = Array((managedRoot.path + "/").utf8)
+        let leafBytes = Array(pathBytes.dropFirst(prefix.count))
+        // Do not drop empty path components: RN's flat suffix rejects both a
+        // trailing slash and doubled separators, even if POSIX resolves them.
+        guard pathBytes.starts(with: prefix), !leafBytes.isEmpty, !leafBytes.contains(47),
+              leafBytes == Array(attachmentID.utf8) || leafBytes.starts(with: Array((attachmentID + ".").utf8)) else {
+            return observed(.unmanaged(targetURI: targetURI))
+        }
+        let leaf = String(decoding: leafBytes, as: UTF8.self)
+        let documentFD = try openRoot(false); defer { Darwin.close(documentFD) }
+        let managedEntry = Parent(fd: documentFD, leaf: "attachments")
+        func namedIfPresent(_ parent: Parent) throws -> stat? {
+            do { return try Self.named(parent) }
+            catch NativeAttachmentFilesError.missing { return nil }
+        }
+        func validateDocuments() throws {
+            let named = try openRoot(false); defer { Darwin.close(named) }
+            guard try Self.identity(documentFD) == documentsIdentity,
+                  try Self.identity(named) == Self.identity(documentFD) else { throw NativeAttachmentFilesError.unavailable }
+        }
+        guard let entry = try namedIfPresent(managedEntry) else {
+            func validateAbsence() throws {
+                try validateDocuments()
+                guard try namedIfPresent(managedEntry) == nil else { throw NativeAttachmentFilesError.unavailable }
+            }
+            try validateAbsence(); try checkCancellation(); try validateAbsence()
+            return observed(.noOwnedGeneration(targetURI: targetURI,
+                absence: .managedDirectoryAbsent(documentsIdentity: try Self.token(Self.identity(documentFD)))))
+        }
+        guard entry.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { throw NativeAttachmentFilesError.unavailable }
+        let managedFD: Int32
+        do { managedFD = try Self.childDirectory(documentFD, "attachments", create: false) }
+        catch { throw NativeAttachmentFilesError.unavailable }
+        defer { Darwin.close(managedFD) }
+        guard try Self.identity(managedFD) == Identity(entry) else { throw NativeAttachmentFilesError.unavailable }
+        let path = Reference(cache: false, components: ["attachments", leaf]), parent = Parent(fd: managedFD, leaf: leaf)
+        func validateManaged() throws { try validateDocuments(); try verify(parent, path: path) }
+        guard let named = try namedIfPresent(parent) else {
+            func validateAbsence() throws {
+                try validateManaged()
+                guard try namedIfPresent(parent) == nil else { throw NativeAttachmentFilesError.unavailable }
+            }
+            try validateAbsence(); try checkCancellation(); try validateAbsence()
+            return observed(.noOwnedGeneration(targetURI: targetURI,
+                absence: .leafAbsent(directoryIdentity: try Self.token(Self.identity(managedFD)))))
+        }
+        if named.st_mode & mode_t(S_IFMT) != mode_t(S_IFREG) || named.st_nlink != 1 {
+            func validateUnsafe() throws {
+                try validateManaged()
+                guard let current = try namedIfPresent(parent), Self.unchanged(named, current),
+                      named.st_nlink == current.st_nlink else { throw NativeAttachmentFilesError.unavailable }
+            }
+            try validateUnsafe(); try checkCancellation(); try validateUnsafe()
+            return observed(.unsafeEntry(targetURI: targetURI))
+        }
+        let fd = try openFile(parent); defer { Darwin.close(fd) }
+        let before = try Self.regular(fd)
+        guard Self.unchanged(named, before), before.st_nlink == 1,
+              before.st_size <= 9_007_199_254_740_991 else { throw NativeAttachmentFilesError.unavailable }
+        func validatePresent() throws {
+            try stable(fd, before: before, parent: parent, path: path)
+            guard try Self.regular(fd).st_nlink == 1, try Self.named(parent).st_nlink == 1 else {
+                throw NativeAttachmentFilesError.unavailable
+            }
+        }
+        // Cancellation callbacks can mutate bytes and any ancestor. Compare
+        // retained descriptors with the named tree on both sides of each call.
+        func check() throws { try validatePresent(); try checkCancellation(); try validatePresent() }
+        try check()
+        let content = try hashContents(fd, checkCancellation: check)
+        try check()
+        guard content.size == before.st_size else { throw NativeAttachmentFilesError.unavailable }
+        return observed(.present(.init(targetURI: targetURI, sha256: content.sha256, size: content.size,
+            identity: Self.token(Identity(before)), directoryIdentity: try Self.token(Self.identity(managedFD)))))
+    }
 
     /// Native-only evidence for a future durable copy intent, not editor ownership.
     func snapshotCacheSource(_ uri: String, checkCancellation: () throws -> Void = {}) throws -> CacheSourceProof {
