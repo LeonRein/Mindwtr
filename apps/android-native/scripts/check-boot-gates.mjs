@@ -3426,7 +3426,7 @@ export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLogg
 export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLineageV3,
     prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3,
     readNativeAttachmentDraftRemoveFrozen } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft.ts'))};
-export { prepareNativeAttachmentDraftDiscardCandidates } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
+export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
 import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
 export { taskRevisionOf } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
 // File-only changed/noop fixtures have no ordinary patch fields. Refuse any
@@ -5745,5 +5745,35 @@ console.log('Runner: CoreWork on the one host after the app\'s boot order, the q
     } finally {
         rmSync(scratch, { recursive: true, force: true });
     }
+}
+// Task261: real pure V3 Discard candidate routing, without native cleanup authority.
+{
+    const AT = '2026-10-05T00:00:00.000Z', ROOT = 'file:///library/documents/attachments/';
+    const baseline = { id: 'baseline261', kind: 'file', title: 'Retain', uri: ROOT + 'baseline.pdf', createdAt: AT, updatedAt: AT };
+    const initial = JSON.stringify({ version: 2, taskID: 'task261', attachmentsOwned: true,
+        attachmentsBase: [baseline], attachments: [baseline], raw: { notes: 'Opaque 文' } });
+    const after = JSON.stringify({ ...JSON.parse(initial), attachments: [{ ...baseline, deletedAt: AT, updatedAt: AT }] });
+    const removed = { version: 1, kind: 'prepared-file-remove', taskID: 'task261', requestId: '26100000-0000-4000-8000-000000000001',
+        attachmentId: baseline.id, removedAt: AT, beforePayloadJSON: initial, afterPayloadJSON: after };
+    const input = { version: 2, historyVersion: 3, taskID: 'task261', managedDirectoryURI: ROOT, initialPayloadJSON: initial,
+        checkpointPayloadJSON: after, operations: [{ kind: 'remove', phase: 'checkpointed', preparedJSON: JSON.stringify(removed) }] };
+    const expected = { ok: true, value: { version: 2, kind: 'owned-mixed-discard-candidates', taskID: 'task261', historyVersion: 3, candidates: [] } };
+    const historical = makeState(0, [], 'ios'); historical.localTaskReadOnly = true;
+    historical.sandbox = true; historical.workspaceTransition = true; historical.persistenceFailure = { private: 'not a historical gate' };
+    vm.runInNewContext(`globalThis.Date = class extends Date {
+        constructor(...args) { if (!args.length) throw new Error('fresh clock forbidden'); super(...args); }
+    };`, historical);
+    const ticket = historical.MindwtrHost.attachmentDraftDiscardCandidatesV3(JSON.stringify(input));
+    assert.match(ticket, /^[1-9]\d*$/, 'mixed candidates retain Promise-ticket transport');
+    assert.deepEqual(await poll(historical, ticket), expected, 'before boot and after capability loss, retained baseline Remove grants no cleanup candidate');
+    assert.deepEqual(historical.events, []); assert.deepEqual(historical.fileCalls, []); assert.equal(historical.logText ?? '', '');
+    assert.deepEqual(await poll(historical, historical.MindwtrHost.attachmentDraftDiscardCandidatesV3('{private-content')), { ok: false, error: 'INVALID_INPUT' });
+    assert.equal((await poll(historical, historical.MindwtrHost.attachmentDraftDiscardCandidates(JSON.stringify(input)))).ok, false, 'old grammar stays sealed');
+    assert.equal((await poll(historical, historical.MindwtrHost.attachmentDraftDiscardCandidatesV3(JSON.stringify({ ...input, version: 1, historyVersion: 2 })))).ok, false);
+    const android = makeState(0);
+    assert.match((await poll(android, android.MindwtrHost.attachmentDraftDiscardCandidatesV3('{}'))).error, /^NOT_READY:/);
+    assert.equal((await poll(historical, historical.MindwtrHost.attachmentRequest('attachmentDraftDiscardCandidatesV3', JSON.stringify(input)))).ok, false);
+    assert.equal(historical.attachmentInputs.length, 0, 'private mixed candidates do not enter generic attachment commands');
+    console.log('Task261: real pure mixed Discard candidates retain iOS-only historical routing, sealed grammar and no generic file-command admission (NodeVM)');
 }
 console.log('Boot gates, second-read failure, failed-save refresh and editor read, and diagnostic acknowledgment passed');

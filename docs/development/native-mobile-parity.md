@@ -1892,3 +1892,10 @@ Validation: all 12 new JavaScriptCore/SQLite cases passed with zero skips, inclu
 A private synchronous shared bridge validates the frozen mixed Save envelope, derives the complete cleanup candidate, and checks live task/project references plus RN's moved-task revision rule. It selects exactly one native-held callback before returning to JavaScriptCore. Native file proofs and durable cleanup ownership remain separate requirements.
 
 Validation: 73 new executable bridge checks passed using the real shared validator and reference/revision helpers, including changed/no-op decisions and a 257-candidate plan. Core typecheck, scoped TypeScript lint, both native bundles and independent review passed; 14 existing boot-script lint diagnostics remain unchanged. This is bridge evidence, not native settlement, file deletion or UI acceptance.
+
+
+### iOS mixed draft Discard candidate planning (2026-10-05)
+
+The private shared bridge now validates retained V3 Add/Remove history and derives Discard candidates from RN's settlement policy. Only files introduced by the draft become candidates; baseline files and tombstones remain outside Discard cleanup. Pending operations retain their exact before checkpoint. Candidate planning grants no file-deletion authority.
+
+Validation: 320 focused core and regression tests, core typecheck, scoped TypeScript lint, executable bridge checks and both bundle builds passed. The 128-entry test fixture was bounded after repeated fresh-history construction exceeded its timeout; production validation was unchanged. Independent source review passed. Native mixed Discard recovery/cleanup and editor UI remain unfinished; no device acceptance is claimed.

@@ -1,6 +1,8 @@
 import { planAttachmentDraftSettlement } from './attachment-draft-settlement';
 import { readNativeAttachmentDraftFrozen, readNativeAttachmentDraftPayload,
-    validateNativeAttachmentDraftLineage, validateNativeAttachmentDraftLineageV2 } from './native-attachment-draft';
+    readNativeAttachmentDraftRemoveFrozen, validateNativeAttachmentDraftLineage,
+    validateNativeAttachmentDraftLineageV2, validateNativeAttachmentDraftLineageV3,
+    type NativeAttachmentDraftOperationV3 } from './native-attachment-draft';
 
 export type NativeAttachmentDraftDiscardPhase =
     'intent' | 'stagePrepared' | 'stageFilled' | 'published' | 'resultDurable' | 'checkpointed';
@@ -12,6 +14,18 @@ export type NativeAttachmentDraftDiscardInput = Readonly<{
 export type NativeAttachmentDraftDiscardCandidates = Readonly<{
     version: 1; kind: 'owned-add-discard-candidates'; taskID: string; historyVersion: 1 | 2;
     candidates: readonly Readonly<{ requestId: string; targetURI: string; reason: 'uncommitted-draft' }>[];
+}>;
+export type NativeAttachmentDraftDiscardInputV3 = Readonly<{
+    version: 2; historyVersion: 3; taskID: string; managedDirectoryURI: string;
+    initialPayloadJSON: string; checkpointPayloadJSON: string;
+    operations: readonly Readonly<
+        { kind: 'add'; phase: NativeAttachmentDraftDiscardPhase; preparedJSON: string }
+        | { kind: 'remove'; phase: 'intent' | 'checkpointed'; preparedJSON: string }
+    >[];
+}>;
+export type NativeAttachmentDraftDiscardCandidatesV3 = Readonly<{
+    version: 2; kind: 'owned-mixed-discard-candidates'; taskID: string; historyVersion: 3;
+    candidates: NativeAttachmentDraftDiscardCandidates['candidates'];
 }>;
 
 const INPUT_BYTES = 8 * 1024 * 1024;
@@ -99,12 +113,12 @@ const capture = (input: unknown): NativeAttachmentDraftDiscardInput => {
 
 // Opaque JSON remains byte-for-byte intact. Inspect its parsed shape before
 // existing readers compare it, bounding traversal even for hostile nesting.
-const parsed = (json: string, budget: { remaining: number }): unknown => {
+const parsed = (json: string, budget: { remaining: number }, maximumDepth = 40): unknown => {
     const value: unknown = JSON.parse(json);
     const pending = [{ value, depth: 0 }];
     while (pending.length) {
         const entry = pending.pop()!;
-        if (--budget.remaining < 0 || entry.depth > 40) invalid();
+        if (--budget.remaining < 0 || entry.depth > maximumDepth) invalid();
         if (typeof entry.value === 'number' && !Number.isFinite(entry.value)) invalid();
         if (entry.value && typeof entry.value === 'object') {
             const keys = Object.keys(entry.value);
@@ -170,5 +184,100 @@ export function prepareNativeAttachmentDraftDiscardCandidates(input: unknown): N
         if (utf8Bytes(encoded, OUTPUT_BYTES) > OUTPUT_BYTES) invalid();
         return Object.freeze({ version: 1, kind: 'owned-add-discard-candidates', taskID: captured.taskID,
             historyVersion: captured.historyVersion, candidates: Object.freeze(candidates) });
+    } catch { return invalid(); }
+}
+
+const captureMixed = (input: unknown): NativeAttachmentDraftDiscardInputV3 => {
+    const value = fields(input, ['version', 'historyVersion', 'taskID', 'managedDirectoryURI',
+        'initialPayloadJSON', 'checkpointPayloadJSON', 'operations']);
+    if (value.version !== 2 || value.historyVersion !== 3) invalid();
+    const taskID = text(value.taskID, 500), managedDirectoryURI = text(value.managedDirectoryURI, 16 * 1024);
+    const initialPayloadJSON = text(value.initialPayloadJSON, PAYLOAD_BYTES);
+    const checkpointPayloadJSON = text(value.checkpointPayloadJSON, PAYLOAD_BYTES);
+    if (!Array.isArray(value.operations) || Object.getPrototypeOf(value.operations) !== Array.prototype) invalid();
+    const length = Object.getOwnPropertyDescriptor(value.operations, 'length')?.value as unknown;
+    if (typeof length !== 'number' || length > 128 || Reflect.ownKeys(value.operations).length !== length + 1) invalid();
+    const header = `{"version":2,"historyVersion":3,"taskID":${quote(taskID)},`
+        + `"managedDirectoryURI":${quote(managedDirectoryURI)},"initialPayloadJSON":${quote(initialPayloadJSON)},`
+        + `"checkpointPayloadJSON":${quote(checkpointPayloadJSON)},"operations":[]}`;
+    let encodedBytes = utf8Bytes(header, INPUT_BYTES);
+    if (encodedBytes > INPUT_BYTES) invalid();
+    const operations: NativeAttachmentDraftDiscardInputV3['operations'][number][] = [], seen = new Set<object>();
+    for (let index = 0; index < length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value.operations, String(index));
+        if (!descriptor?.enumerable || !own(descriptor, 'value')) invalid();
+        const raw: unknown = descriptor!.value;
+        if (!raw || typeof raw !== 'object' || seen.has(raw)) invalid();
+        seen.add(raw as object);
+        const operation = fields(raw, ['kind', 'phase', 'preparedJSON']);
+        if (operation.kind !== 'add' && operation.kind !== 'remove' || typeof operation.phase !== 'string'
+            || !(operation.kind === 'add' ? PHASES : ['intent', 'checkpointed']).includes(operation.phase)
+            || index < length - 1 && operation.phase !== 'checkpointed') invalid();
+        const captured = { kind: operation.kind, phase: operation.phase,
+            preparedJSON: text(operation.preparedJSON, PREPARED_BYTES) } as NativeAttachmentDraftDiscardInputV3['operations'][number];
+        encodedBytes += utf8Bytes(`{"kind":${quote(captured.kind)},"phase":${quote(captured.phase)},`
+            + `"preparedJSON":${quote(captured.preparedJSON)}}`, INPUT_BYTES) + (index ? 1 : 0);
+        if (encodedBytes > INPUT_BYTES) invalid();
+        operations.push(captured);
+    }
+    return { version: 2, historyVersion: 3, taskID, managedDirectoryURI,
+        initialPayloadJSON, checkpointPayloadJSON, operations };
+};
+
+/** Pure mixed-history candidates. Native separately proves publication and retirement authority. */
+export function prepareNativeAttachmentDraftDiscardCandidatesV3(input: unknown): NativeAttachmentDraftDiscardCandidatesV3 {
+    try {
+        const captured = captureMixed(input);
+        const parse = (json: string): unknown => parsed(json, { remaining: 100_000 }, 64);
+        parse(captured.initialPayloadJSON); parse(captured.checkpointPayloadJSON);
+        const history: NativeAttachmentDraftOperationV3[] = captured.operations.map((entry) => {
+            const raw = parse(entry.preparedJSON);
+            const value = fields(raw, entry.kind === 'add'
+                ? ['version', 'kind', 'taskID', 'requestId', 'picked', 'measuredSize', 'managedDirectoryURI',
+                    'beforePayloadJSON', 'afterPayloadJSON', 'prepared', 'targetURI', 'attachment']
+                : ['version', 'kind', 'taskID', 'requestId', 'attachmentId', 'removedAt', 'beforePayloadJSON', 'afterPayloadJSON']);
+            parse(text(value.beforePayloadJSON, PAYLOAD_BYTES)); parse(text(value.afterPayloadJSON, PAYLOAD_BYTES));
+            return entry.kind === 'add' ? { kind: 'add', operation: readNativeAttachmentDraftFrozen(raw) }
+                : { kind: 'remove', operation: readNativeAttachmentDraftRemoveFrozen(raw) };
+        });
+        const last = history[history.length - 1];
+        const pending = Boolean(last) && captured.operations[captured.operations.length - 1].phase !== 'checkpointed';
+        const lineage = (priorOperations: typeof history, beforePayloadJSON: string) => validateNativeAttachmentDraftLineageV3({
+            version: 3, taskID: captured.taskID, managedDirectoryURI: captured.managedDirectoryURI,
+            initialPayloadJSON: captured.initialPayloadJSON, beforePayloadJSON, priorOperations,
+        });
+        const latestPayloadJSON = pending ? last.operation.afterPayloadJSON : captured.checkpointPayloadJSON;
+        lineage(history, latestPayloadJSON);
+        if (pending) {
+            if (captured.checkpointPayloadJSON !== last.operation.beforePayloadJSON) invalid();
+            lineage(history.slice(0, -1), captured.checkpointPayloadJSON);
+        }
+        const opening = readNativeAttachmentDraftPayload(captured.initialPayloadJSON, captured.taskID);
+        const latest = readNativeAttachmentDraftPayload(latestPayloadJSON, captured.taskID);
+        const additions = history.flatMap((entry) => entry.kind === 'add' ? [entry.operation] : []);
+        const baselineIDs = new Set(opening.baselineAttachments.map((attachment) => attachment.id));
+        const retainedURIs = new Set([...opening.baselineAttachments, ...opening.attachments].map((attachment) => attachment.uri));
+        const targets = new Set<string>();
+        for (const addition of additions) {
+            if (baselineIDs.has(addition.requestId) || retainedURIs.has(addition.targetURI) || targets.has(addition.targetURI)) invalid();
+            targets.add(addition.targetURI);
+        }
+        const planned = planAttachmentDraftSettlement({ baselineAttachments: opening.baselineAttachments,
+            draftAttachments: latest.attachments, committedAttachments: opening.baselineAttachments });
+        const byID = new Map(additions.map((addition) => [addition.requestId, addition]));
+        const candidates: { requestId: string; targetURI: string; reason: 'uncommitted-draft' }[] = [];
+        for (const candidate of planned) {
+            if (baselineIDs.has(candidate.attachment.id)) continue;
+            const addition = byID.get(candidate.attachment.id);
+            if (!addition || candidate.reason !== 'uncommitted-draft' || candidate.attachment.uri !== addition.targetURI) invalid();
+            candidates.push(Object.freeze({ requestId: addition.requestId, targetURI: addition.targetURI, reason: 'uncommitted-draft' }));
+        }
+        if (candidates.length !== additions.length || candidates.some((candidate, index) => candidate.requestId !== additions[index].requestId)) invalid();
+        const encoded = `{"version":2,"kind":"owned-mixed-discard-candidates","taskID":${quote(captured.taskID)},`
+            + `"historyVersion":3,"candidates":[${candidates.map((candidate) =>
+                `{"requestId":${quote(candidate.requestId)},"targetURI":${quote(candidate.targetURI)},"reason":"uncommitted-draft"}`).join(',')}]}`;
+        if (utf8Bytes(encoded, OUTPUT_BYTES) > OUTPUT_BYTES) invalid();
+        return Object.freeze({ version: 2, kind: 'owned-mixed-discard-candidates', taskID: captured.taskID,
+            historyVersion: 3, candidates: Object.freeze(candidates) });
     } catch { return invalid(); }
 }

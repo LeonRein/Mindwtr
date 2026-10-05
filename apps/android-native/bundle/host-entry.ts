@@ -32,6 +32,7 @@ import {
     readNativeAttachmentDraftRemoveFrozen,
     completeNativeAttachmentDraftAdd,
     prepareNativeAttachmentDraftDiscardCandidates,
+    prepareNativeAttachmentDraftDiscardCandidatesV3,
     isAttachmentFileInUse,
     taskRevisionOf,
     formatI18nTemplate,
@@ -3237,6 +3238,12 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
             return prepareNativeAttachmentDraftDiscardCandidates(attachmentDraftJson(json));
+        });
+    },
+    attachmentDraftDiscardCandidatesV3(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return prepareNativeAttachmentDraftDiscardCandidatesV3(attachmentDraftJson(json));
         });
     },
     /** Private, synchronous final handoff; native passes ephemeral proof-bound callbacks. */
