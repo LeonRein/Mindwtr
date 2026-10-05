@@ -11,7 +11,10 @@ import { ASSOCIATIONS, LIFECYCLE, RECURRENCE, SCHEDULE, getNativeTaskRecurrenceB
 import { isNativeJsonWithinBytes, readChecklist, sameChecklist, toChecklist } from './native-host-contract-task-view';
 import type { ChecklistItem, Task } from './types';
 import type { Attachment } from './types';
-import { mergeNativeTaskLinkHalf, readNativeAttachments, readNativeTaskLinkHalf } from './native-host-contract-attachments';
+import { mergeNativeTaskLinkHalf, readNativeAttachments, readNativeTaskLinkHalf, type NativeTaskLinkHalf } from './native-host-contract-attachments';
+import { mergeTaskDraftAttachments } from './attachment-editor-model';
+import { readNativeAttachmentDraftPayload, validateNativeAttachmentDraftLineageV3 } from './native-attachment-draft';
+import { captureNativeOwnedFileAddSaveData } from './native-host-contract-owned-file-save';
 
 const OWNED_GROUPS = [SCHEDULE, RECURRENCE, ASSOCIATIONS, LIFECYCLE] as const;
 const own = (value: object, field: string) => Object.prototype.hasOwnProperty.call(value, field);
@@ -110,11 +113,29 @@ export function validateNativeTaskEditorOpeningFields(
     return { ok: true, value: { freshDraft, freshScheduleBase, freshRecurrenceBase, freshChecklistBase } };
 }
 
-export function createTaskEditorResumeMethods(deps: {
+type ResumeDependencies = {
     readiness: () => NativeHostResult<null>;
     validateField: (field: TaskDraftField, value: unknown) => boolean;
     isReadOnly: (task: Task) => boolean;
-}) {
+};
+async function checkSavedOpening(input: NativeTaskEditorResumeCheck, deps: ResumeDependencies,
+    attachments: NativeTaskLinkHalf | undefined, selection: 'links' | 'owned'): Promise<NativeHostResult<NativeTaskEditorResumeReady>> {
+    const saved = await currentTask(input.id);
+    if (!saved.ok) return saved;
+    const { task, projects } = saved.value;
+    if (deps.isReadOnly(task) || isStatusListTaskReadOnly(task, projects))
+        return fail('INVALID_INPUT', 'Task is read-only');
+    const freshAttachmentsBase = readNativeAttachments(task.attachments ?? []);
+    const merged = freshAttachmentsBase && attachments ? selection === 'owned'
+        ? readNativeAttachments(mergeTaskDraftAttachments(freshAttachmentsBase, attachments.base, attachments.value))
+        : mergeNativeTaskLinkHalf(freshAttachmentsBase, attachments) : freshAttachmentsBase;
+    if (!freshAttachmentsBase || !merged) return fail('INVALID_INPUT', 'Invalid editor recovery attachments');
+    const opening = validateNativeTaskEditorOpeningFields(input, task, deps.validateField);
+    if (!opening.ok) return opening;
+    return { ok: true, value: { kind: 'ready', ...opening.value, freshAttachmentsBase } };
+}
+
+export function createTaskEditorResumeMethods(deps: ResumeDependencies) {
     return {
         async checkTaskEditorResume(input: NativeTaskEditorResumeCheck): Promise<NativeHostResult<NativeTaskEditorResumeReady>> {
             const ready = deps.readiness();
@@ -138,18 +159,45 @@ export function createTaskEditorResumeMethods(deps: {
                 ? readNativeTaskLinkHalf({ base: input.attachmentsBase, value: input.attachments }, false) : undefined;
             if (attachments === null) return fail('INVALID_INPUT', 'Invalid editor recovery attachments');
 
-            const saved = await currentTask(input.id);
-            if (!saved.ok) return saved;
-            const { task, projects } = saved.value;
-            if (deps.isReadOnly(task) || isStatusListTaskReadOnly(task, projects))
-                return fail('INVALID_INPUT', 'Task is read-only');
-            const freshAttachmentsBase = readNativeAttachments(task.attachments ?? []);
-            if (!freshAttachmentsBase || attachments
-                && mergeNativeTaskLinkHalf(freshAttachmentsBase, attachments) === null)
-                return fail('INVALID_INPUT', 'Invalid editor recovery attachments');
-            const opening = validateNativeTaskEditorOpeningFields(input, task, deps.validateField);
-            if (!opening.ok) return opening;
-            return { ok: true, value: { kind: 'ready', ...opening.value, freshAttachmentsBase } };
+            return checkSavedOpening(input, deps, attachments, 'links');
+        },
+    };
+}
+
+/** Internal historical lineage selection; native file/editor authority remains outside this factory. */
+export function createOwnedTaskEditorResumeMethods(deps: ResumeDependencies) {
+    return {
+        async checkOwnedTaskEditorResume(input: unknown): Promise<NativeHostResult<NativeTaskEditorResumeReady>> {
+            const ready = deps.readiness(); if (!ready.ok) return ready;
+            const captured = captureNativeOwnedFileAddSaveData(input, 8 * 1024 * 1024);
+            const exact = (value: unknown, fields: readonly string[]): value is Record<string, unknown> => record(value)
+                && Object.keys(value).length === fields.length && fields.every((field) => own(value, field));
+            if (!exact(captured, ['version', 'kind', 'checkpoint', 'ownedDraft']) || captured.version !== 1 || captured.kind !== 'owned-editor-resume'
+                || !exact(captured.checkpoint, ['version', 'sessionID', 'taskID', 'generation', 'payloadJSON']))
+                return fail('INVALID_INPUT', 'An exact owned editor checkpoint and lineage are required');
+            const checkpoint = captured.checkpoint;
+            if (checkpoint.version !== 1 || typeof checkpoint.sessionID !== 'string'
+                || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(checkpoint.sessionID)
+                || typeof checkpoint.taskID !== 'string' || !checkpoint.taskID.trim() || checkpoint.taskID.length > 500
+                || typeof checkpoint.generation !== 'number' || !Number.isSafeInteger(checkpoint.generation) || checkpoint.generation < 1
+                || typeof checkpoint.payloadJSON !== 'string') return fail('INVALID_INPUT', 'Invalid owned editor checkpoint');
+            let opening: NativeTaskEditorResumeCheck, attachments: NativeTaskLinkHalf;
+            try {
+                const lineage = validateNativeAttachmentDraftLineageV3(captured.ownedDraft);
+                if (!record(captured.ownedDraft) || !Array.isArray(captured.ownedDraft.priorOperations)
+                    || checkpoint.generation < captured.ownedDraft.priorOperations.length + 1
+                    || checkpoint.taskID !== lineage.taskID || checkpoint.payloadJSON !== lineage.payloadJSON)
+                    return fail('INVALID_INPUT', 'Owned editor checkpoint disagrees with its lineage');
+                const payload: unknown = JSON.parse(checkpoint.payloadJSON);
+                if (!record(payload) || payload.version !== 2 || payload.attachmentsOwned !== true || !record(payload.touchedBase))
+                    return fail('INVALID_INPUT', 'Invalid owned editor opening fields');
+                const half = readNativeAttachmentDraftPayload(checkpoint.payloadJSON, checkpoint.taskID);
+                attachments = { base: half.baselineAttachments, value: half.attachments };
+                opening = { id: checkpoint.taskID, touchedBase: payload.touchedBase,
+                    ...Object.fromEntries(['scheduleBase', 'recurrenceBase', 'checklistBase'].filter((field) => own(payload, field))
+                        .map((field) => [field, payload[field]])) };
+            } catch { return fail('INVALID_INPUT', 'Invalid owned editor lineage'); }
+            return checkSavedOpening(opening, deps, attachments, 'owned');
         },
     };
 }
