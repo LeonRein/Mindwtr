@@ -4176,6 +4176,34 @@ const poll = async (state, id) => {
         assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('discard-finish', 'confirmed'))).ok, true);
         assert.equal(android.logText, null, 'terminal capability exception remains iOS-only');
     });
+    await check('logical unstarted Discard diagnostic stays distinct and exact', async () => {
+        const local = makeState(0, [], 'ios', configureLocal);
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', 'confirmed'))).ok, true);
+        const marker = JSON.parse(local.logText.trim());
+        assert.deepEqual(marker.context, { releaseCheck: 'v1.3.5/ios-unstarted-add-discard', operation: 'discard-unstarted', outcome: 'confirmed' });
+        const before = local.logText;
+        for (const outcome of ['replayed', 'retained', 'released', 'discarded', '']) {
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', outcome))).ok, true);
+        }
+        assert.equal(local.logText, before, 'no other logical pair can produce an acknowledgment');
+    });
+    await check('logical unstarted Discard terminal diagnostic survives capability and log loss', async () => {
+        const absent = makeState(0, [], 'ios');
+        for (const outcome of ['replayed', 'retained', 'released', 'discarded']) {
+            assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', outcome))).ok, true);
+        }
+        assert.equal(absent.logText, null, 'only confirmed may bypass optional capability loss');
+        assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', 'confirmed'))).ok, true);
+        assert.deepEqual(JSON.parse(absent.logText.trim()).context,
+            { releaseCheck: 'v1.3.5/ios-unstarted-add-discard', operation: 'discard-unstarted', outcome: 'confirmed' });
+        const before = absent.logText;
+        absent.logFailure = 'private diagnostics failure';
+        assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', 'confirmed'))).ok, true);
+        assert.equal(absent.logText, before, 'diagnostic failure does not fabricate a marker or invalidate completion');
+        const android = makeState(0);
+        assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged('discard-unstarted', 'confirmed'))).ok, true);
+        assert.equal(android.logText, null, 'logical terminal capability exception remains iOS-only');
+    });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);

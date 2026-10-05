@@ -399,14 +399,17 @@ final class NativeAttachmentDraftCoordinator {
 
     /// Version 1 remains the fully published contract. Version 2 grants only
     /// recorded private-stage retirement for one last unpublished operation.
+    /// Version 3 gives up an unproven intent without touching its namespace.
     static func ownedDiscardVersion(_ record: NativeAttachmentDraftStore.Record) throws -> Int {
         if record.operations.allSatisfy({ [.published, .resultDurable, .checkpointed].contains($0.phase)
             && $0.stage != nil && $0.published != nil }) { return 1 }
-        guard let last = record.operations.last, last.phase == .stagePrepared,
-              last.stage != nil, last.filled == nil, last.published == nil, last.replyJSON == nil,
+        guard let last = record.operations.last,
+              last.filled == nil, last.published == nil, last.replyJSON == nil,
               record.operations.dropLast().allSatisfy({ $0.phase == .checkpointed
                   && $0.stage != nil && $0.published != nil }) else { throw Self.failure }
-        return 2
+        if last.phase == .stagePrepared && last.stage != nil { return 2 }
+        if last.phase == .intent && last.stage == nil { return 3 }
+        throw Self.failure
     }
 
     /// Pure domain candidacy only. The Engine separately binds the detached
