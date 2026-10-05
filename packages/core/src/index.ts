@@ -341,7 +341,10 @@ export type { NativeReferenceTasksRemoveTagRequest, NativeReferenceTasksRemoveTa
 
 export { validateNativeAttachmentDraftBegin, validateNativeAttachmentDraftLineage, prepareNativeAttachmentDraftAdd,
     completeNativeAttachmentDraftAdd, validateNativeAttachmentDraftBeginV2, validateNativeAttachmentDraftLineageV2,
-    prepareNativeAttachmentDraftAddV2 } from './native-attachment-draft';
+    prepareNativeAttachmentDraftAddV2, validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLineageV3,
+    prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3, readNativeAttachmentDraftRemoveFrozen } from './native-attachment-draft';
+export type { NativeAttachmentDraftLineageInputV3, NativeAttachmentDraftOperationV3,
+    NativeAttachmentDraftRemovePrepared } from './native-attachment-draft';
 
 export { prepareNativeAttachmentDraftDiscardCandidates } from './native-attachment-draft-discard';
 export type { NativeAttachmentDraftDiscardInput, NativeAttachmentDraftDiscardPhase,

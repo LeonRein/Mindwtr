@@ -1874,3 +1874,9 @@ Validation: 157 real-descriptor/FIFO cases passed together with zero skips, incl
 The existing private sidecar now has a separate V3 reader and writer for ordered Add/Remove history. Remove retains exact request, projection and checkpoint evidence across interrupted writes. Older V1/V2 records cannot be overwritten through the V3 API, and the existing APIs remain unchanged. Capacity checks include the actual encoded record.
 
 Validation: 134 storage regression cases passed with zero failures or skips, including 20 new mixed-history cases; the signed development build and independent source review passed. An initial Swift overload ambiguity was corrected by giving the new write/preflight methods distinct names. No phone installation is claimed. Native Remove admission, mixed Save/Discard settlement and editor UI remain unfinished.
+
+### iOS private mixed-draft bindings (2026-10-05)
+
+The private iOS bridge now exposes V3 Begin, mixed lineage, Add/Remove preparation and frozen Remove validation, plus the mixed ordinary Save factory. Fresh operations retain current capability/editability checks; historical validation uses frozen evidence. Begin applies V3 payload safety bounds before admitting a draft. Older routes and generic attachment allowlists remain unchanged.
+
+Validation: 248 focused core cases and 59 new executable binding checks passed; core typecheck, both bundle builds and scoped TypeScript lint passed. The boot script retains 14 pre-existing lint diagnostics with none introduced. All 50 existing native JavaScriptCore/SQLite Save and checkpoint cases passed with zero skips against the updated bundle. Signed development build and independent review also passed, without phone installation. Those regressions cover existing native owners; native mixed Remove/Save admission, cleanup and editor UI remain unfinished.

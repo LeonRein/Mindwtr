@@ -326,6 +326,16 @@ export function validateNativeAttachmentDraftBeginV2(input: unknown, deps: Nativ
     return Object.freeze({ version: 2, taskID, payloadJSON });
 }
 
+export function validateNativeAttachmentDraftBeginV3(input: unknown, deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftLineageV3 {
+    if (!exact(input, ['taskID', 'payloadJSON'])) invalid();
+    const object = input as Record<string, unknown>;
+    const taskID = text(object.taskID, 500, true), payloadJSON = text(object.payloadJSON, PAYLOAD_BYTES, true);
+    const initial = payloadV3(payloadJSON, taskID);
+    if (!same(initial.object.attachmentsBase, initial.attachments)) invalid();
+    deps.assertEditable(taskID);
+    return Object.freeze({ version: 3, taskID, payloadJSON });
+}
+
 export async function prepareNativeAttachmentDraftAdd(input: unknown, deps: NativeAttachmentDraftDependencies):
 Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
     return prepareDraftAdd(input, deps, 1);

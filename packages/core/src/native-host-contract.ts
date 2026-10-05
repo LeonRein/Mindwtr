@@ -255,6 +255,7 @@ import {
 import { createReviewViewMethods } from './native-host-contract-review-views';
 import { createQuickCaptureMethods } from './native-host-contract-quick-capture';
 import { createMindSweepMethods } from './native-host-contract-mind-sweep';
+import { createOwnedEditorFileEditTaskDraftSaveMethods } from './native-host-contract-owned-file-edit-save';
 import { createOwnedEditorFileAddTaskDraftSaveMethods } from './native-host-contract-owned-editor-save';
 import { createOwnedFileAddTaskDraftSaveMethods } from './native-host-contract-owned-file-save';
 import { createTaskDraftSaveMethods, getNativeTaskScheduleBase, getNativeTaskRecurrenceBase, type NativeTaskScheduleBase, type NativeTaskRecurrenceBase } from './native-host-contract-task-save';
@@ -1605,6 +1606,7 @@ export function createNativeHostContract(options: {
         ...createTaskDraftSaveMethods({ readiness, save, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value) }),
         ...createOwnedFileAddTaskDraftSaveMethods({ readiness, save, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value) }),
         ...createOwnedEditorFileAddTaskDraftSaveMethods({ readiness, save, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value) }),
+        ...createOwnedEditorFileEditTaskDraftSaveMethods({ readiness, save, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value) }),
         ...createTaskEditorResumeMethods({ readiness, validateField: (field, value) => DRAFT_VALUE_CHECKS[field](value),
             isReadOnly: isInArchivedProject }),
         ...taskChecklistMethods,

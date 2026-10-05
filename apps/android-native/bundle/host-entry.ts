@@ -25,6 +25,11 @@ import {
     validateNativeAttachmentDraftBeginV2,
     validateNativeAttachmentDraftLineageV2,
     prepareNativeAttachmentDraftAddV2,
+    validateNativeAttachmentDraftBeginV3,
+    validateNativeAttachmentDraftLineageV3,
+    prepareNativeAttachmentDraftAddV3,
+    prepareNativeAttachmentDraftRemoveV3,
+    readNativeAttachmentDraftRemoveFrozen,
     completeNativeAttachmentDraftAdd,
     prepareNativeAttachmentDraftDiscardCandidates,
     isAttachmentFileInUse,
@@ -3149,6 +3154,27 @@ globalThis.MindwtrHost = {
     attachmentDraftPrepareV2(json: string): string {
         return submit(async () => prepareNativeAttachmentDraftAddV2(attachmentDraftJson(json), attachmentDraftDependencies));
     },
+    attachmentDraftBeginV3(json: string): string {
+        return submit(async () => validateNativeAttachmentDraftBeginV3(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
+    attachmentDraftValidateLineageV3(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return validateNativeAttachmentDraftLineageV3(attachmentDraftJson(json));
+        });
+    },
+    attachmentDraftPrepareV3(json: string): string {
+        return submit(async () => prepareNativeAttachmentDraftAddV3(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
+    attachmentDraftRemovePrepareV3(json: string): string {
+        return submit(async () => prepareNativeAttachmentDraftRemoveV3(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
+    attachmentDraftValidateRemove(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return readNativeAttachmentDraftRemoveFrozen(attachmentDraftJson(json));
+        });
+    },
     attachmentDraftDiscardCandidates(json: string): string {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
@@ -3179,6 +3205,25 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             requireOwnedAttachmentSave();
             return unwrap(await contract.commitPreparedOwnedEditorFileAddTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorFileAddTaskDraftSave>[0]));
+        });
+    },
+    attachmentFileEditSavePrepare(json: string): string {
+        return submit(async () => {
+            requireOwnedAttachmentSave();
+            requireSaved();
+            return unwrap(await contract.prepareOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorFileEditTaskDraftSave>[0]));
+        });
+    },
+    attachmentFileEditSaveValidate(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return unwrap(contract.validatePreparedOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0]));
+        });
+    },
+    attachmentFileEditSaveCommit(json: string): string {
+        return submit(async () => {
+            requireOwnedAttachmentSave();
+            return unwrap(await contract.commitPreparedOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorFileEditTaskDraftSave>[0]));
         });
     },
     /** Called only after the native private record and exact checkpoint are durable. */
