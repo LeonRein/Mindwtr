@@ -1,5 +1,7 @@
 // Split from i18n-translations.ts to make community translation contributions easier.
 export const koOverrides: Record<string, string> = {
+    'task.copyTitle': '제목 복사',
+    'task.titleCopied': '제목이 복사되었습니다',
     "settings.mcpTitle": "로컬 MCP 서버 (고급)",
     "settings.mcpDesc": "이 컴퓨터의 AI 클라이언트를 Mindwtr에 연결합니다.",
     "settings.mcpUnavailable": "샌드박스 밖의 데스크톱 앱에서만 사용할 수 있습니다.",

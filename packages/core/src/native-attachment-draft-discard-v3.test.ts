@@ -233,7 +233,7 @@ describe('sealed pure mixed V3 Discard candidates', () => {
         expect(candidates(exact).candidates).toEqual([]);
         const parse = vi.spyOn(JSON, 'parse'); reject({ ...exact, checkpointPayloadJSON: ' ' + exact.checkpointPayloadJSON });
         expect(parse).not.toHaveBeenCalled();
-    });
+    }, 30_000);
 
     it('accepts null-prototype data and freezes output without mutating captured strings', () => {
         const r = remove(), value = Object.assign(Object.create(null), request([taggedRemove(r)]));

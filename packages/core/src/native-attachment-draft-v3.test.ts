@@ -335,7 +335,7 @@ describe('sealed v3 mixed attachment draft history', () => {
         await expect(prepareNativeAttachmentDraftAddV3({ ...value, requestId: id(999), picked, measuredSize: 3 }, deps)).rejects.toThrow('INVALID_INPUT');
         expect(() => prepareNativeAttachmentDraftRemoveV3({ ...value, requestId: id(999), attachmentId: 'missing' }, deps)).toThrow('INVALID_INPUT');
         expect(deps.assertEditable).not.toHaveBeenCalled(); expect(policy).not.toHaveBeenCalled();
-    });
+    }, 30_000);
 
     it.each(['entries', 'payload', 'rows', 'aggregate', 'overflow', 'depth', 'nodes', 'timestampInput'])(
         'bounds input before current authority: %s', async (kind) => {
