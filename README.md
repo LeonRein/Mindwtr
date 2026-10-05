@@ -255,10 +255,13 @@ Thanks to these monthly sponsors for supporting Mindwtr. Companies interested in
   <a href="https://github.com/TomLisankie" title="@TomLisankie">
     <img src="docs/assets/sponsors/tomlisankie.png" width="60" height="60" alt="@TomLisankie" />
   </a>
+  <a href="https://github.com/MrSirMangoo" title="@MrSirMangoo">
+    <img src="docs/assets/sponsors/mrsirmangoo.png" width="60" height="60" alt="@MrSirMangoo" />
+  </a>
 </p>
 
 <p align="center">
-  <sub><a href="https://github.com/jarrydstan">@jarrydstan</a> · <a href="https://github.com/ronmolenda">@ronmolenda</a> · <a href="https://github.com/karl1990">@karl1990</a> · <a href="https://github.com/srijan">@srijan</a> · <a href="https://github.com/davibicudo">@davibicudo</a> · <a href="https://github.com/PLPeeters">@PLPeeters</a> · <a href="https://github.com/danhs">@danhs</a> · <a href="https://github.com/NikoScotch">@NikoScotch</a> · <a href="https://github.com/nicopico-dev">@nicopico-dev</a> · <a href="https://github.com/Hillside502">@Hillside502</a> · <a href="https://github.com/alxgda">@alxgda</a> · <a href="https://github.com/TomLisankie">@TomLisankie</a></sub>
+  <sub><a href="https://github.com/jarrydstan">@jarrydstan</a> · <a href="https://github.com/ronmolenda">@ronmolenda</a> · <a href="https://github.com/karl1990">@karl1990</a> · <a href="https://github.com/srijan">@srijan</a> · <a href="https://github.com/davibicudo">@davibicudo</a> · <a href="https://github.com/PLPeeters">@PLPeeters</a> · <a href="https://github.com/danhs">@danhs</a> · <a href="https://github.com/NikoScotch">@NikoScotch</a> · <a href="https://github.com/nicopico-dev">@nicopico-dev</a> · <a href="https://github.com/Hillside502">@Hillside502</a> · <a href="https://github.com/alxgda">@alxgda</a> · <a href="https://github.com/TomLisankie">@TomLisankie</a> · <a href="https://github.com/MrSirMangoo">@MrSirMangoo</a></sub>
 </p>
 
 ---
