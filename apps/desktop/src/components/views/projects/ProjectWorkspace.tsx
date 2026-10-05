@@ -909,11 +909,35 @@ export function ProjectWorkspace({
         return sortProjectTasks(references);
     }, [allTasks, normalizedSearchQuery, selectedProject, sortProjectTasks]);
 
+    const referenceTaskGroups = useMemo(() => {
+        if (!hasProjectSections) return [];
+        const tasksBySection = new Map<string, Task[]>(projectSections.map((section) => [section.id, []]));
+        const unsectioned: Task[] = [];
+        // References are already sorted; retain that order within each bucket.
+        for (const task of projectReferenceTasks) {
+            const sectionTasks = task.projectId === selectedProjectId && task.sectionId
+                ? tasksBySection.get(task.sectionId)
+                : undefined;
+            (sectionTasks ?? unsectioned).push(task);
+        }
+        return [
+            ...projectSections.map((section) => ({
+                id: section.id,
+                title: section.title,
+                tasks: tasksBySection.get(section.id)!,
+            })),
+            { id: NO_SECTION_CONTAINER, title: t('projects.noSection'), tasks: unsectioned },
+        ].filter((group) => group.tasks.length > 0);
+    }, [hasProjectSections, projectReferenceTasks, projectSections, selectedProjectId, t]);
+
     // Reference tasks render as their own section below the task list, so the
     // keyboard walks them last rather than skipping them.
     const keyboardVisibleTasks = useMemo(
-        () => [...visibleProjectTaskList, ...projectReferenceTasks],
-        [projectReferenceTasks, visibleProjectTaskList],
+        () => [
+            ...visibleProjectTaskList,
+            ...(hasProjectSections ? referenceTaskGroups.flatMap((group) => group.tasks) : projectReferenceTasks),
+        ],
+        [hasProjectSections, projectReferenceTasks, referenceTaskGroups, visibleProjectTaskList],
     );
     const [selectedTaskIndex, setSelectedTaskIndex] = useState(0);
     // Last highlight id whose row was handed DOM focus (#1014).
@@ -1941,15 +1965,29 @@ export function ProjectWorkspace({
                             </section>
 
                             {projectReferenceTasks.length > 0 && (
-                                <section className="border-t border-border/50 py-5">
+                                <section data-project-reference-tasks className="border-t border-border/50 py-5">
                                     <div className="mb-3 flex items-center justify-between">
                                         <div className="text-xs uppercase tracking-wider text-muted-foreground">
                                             {t('status.reference')} ({projectReferenceTasks.length})
                                         </div>
                                     </div>
-                                    <div className="border-t border-border/40">
-                                        {renderStaticTasks(projectReferenceTasks)}
-                                    </div>
+                                    {hasProjectSections ? (
+                                        <div className="space-y-3">
+                                            {referenceTaskGroups.map((group) => (
+                                                <div key={group.id} className="rounded-lg border border-border/60">
+                                                    <h3 className="flex items-center gap-2 border-b border-border/50 px-3 py-2 text-sm font-semibold">
+                                                        <span>{group.title}</span>
+                                                        <span className="text-xs text-muted-foreground">{group.tasks.length}</span>
+                                                    </h3>
+                                                    <div className="p-3">{renderStaticTasks(group.tasks)}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="border-t border-border/40">
+                                            {renderStaticTasks(projectReferenceTasks)}
+                                        </div>
+                                    )}
                                 </section>
                             )}
                             <div data-list-end className={LIST_END_GAP} aria-hidden="true" />

@@ -1,4 +1,4 @@
-import { fireEvent, render, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, waitFor, within } from '@testing-library/react';
 import type { ComponentProps, RefObject } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DndContext } from '@dnd-kit/core';
@@ -7,6 +7,7 @@ import type { Project, Section, Task } from '@mindwtr/core';
 
 import { useUiStore } from '../../../store/ui-store';
 import { LanguageProvider } from '../../../contexts/language-context';
+import type { TaskListScope } from '../../../contexts/keybinding-context';
 import { ProjectWorkspace } from './ProjectWorkspace';
 
 vi.mock('../../TaskItem', () => ({
@@ -46,6 +47,11 @@ vi.mock('./ProjectDetailsFields', () => ({ ProjectDetailsFields: () => null }));
 vi.mock('./ProjectNotesSection', () => ({ ProjectNotesSection: () => null }));
 
 const storeHolder = vi.hoisted(() => ({ current: null as unknown }));
+const registerTaskListScope = vi.hoisted(() => vi.fn());
+vi.mock('../../../contexts/keybinding-context', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../../../contexts/keybinding-context')>(),
+    useOptionalKeybindings: () => ({ registerTaskListScope }),
+}));
 vi.mock('./useProjectWorkspaceStore', () => ({
     useProjectWorkspaceStore: () => storeHolder.current,
 }));
@@ -68,6 +74,7 @@ const translations: Record<string, string> = {
     'taskEdit.moreOptions': 'More options',
     'sort.default': 'Default',
     'sort.label': 'Sort',
+    'status.reference': 'Reference',
 };
 
 const t = (key: string) => translations[key] ?? key;
@@ -383,6 +390,86 @@ describe('ProjectWorkspace sections-as-columns (#1019)', () => {
         fireEvent.keyDown(firstAction, { key: 'Escape' });
         expect(queryByRole('menuitem', { name: 'Move section right: Planning' })).not.toBeInTheDocument();
         expect(trigger).toHaveFocus();
+    });
+});
+
+describe('ProjectWorkspace reference sections', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        useUiStore.setState({ editingTaskId: null, projectLayouts: {} });
+        window.localStorage.clear();
+    });
+
+    const references = [
+        task('ref-loose', 'Loose reference', { status: 'reference', order: 0 }),
+        task('ref-shipping', 'Shipping reference', { status: 'reference', sectionId: shipping.id, order: 1 }),
+        task('ref-planning-2', 'Second planning reference', { status: 'reference', sectionId: planning.id, order: 3 }),
+        task('ref-planning-1', 'First planning reference', { status: 'reference', sectionId: planning.id, order: 2 }),
+        task('ref-missing', 'Missing section reference', { status: 'reference', sectionId: 'missing', order: 4 }),
+        task('ref-foreign', 'Linked reference', {
+            status: 'reference', projectId: 'other-project', sectionId: planning.id, tags: ['#launch'], order: 5,
+        }),
+        task('ref-deleted-section', 'Deleted section reference', { status: 'reference', sectionId: 'deleted', order: 6 }),
+        task('ref-unrelated', 'Unrelated reference', { status: 'reference', projectId: 'other-project', order: 6 }),
+    ];
+    const referenceStore = {
+        projects: [{ ...project, tagIds: ['#launch'] }],
+        sections: [
+            shipping, section('empty', 'Empty', 2), planning,
+            { ...section('deleted', 'Deleted', 3), deletedAt: '2026-05-13T00:00:00.000Z' },
+        ],
+        allTasks: [...tasks, ...references],
+    };
+    const referenceArea = (container: HTMLElement) =>
+        container.querySelector<HTMLElement>('[data-project-reference-tasks]')!;
+    const rowIds = (element: HTMLElement) => Array.from(element.querySelectorAll('[data-task-id]'))
+        .map((row) => row.getAttribute('data-task-id'));
+    const expectedReferenceOrder = [
+        'ref-planning-1', 'ref-planning-2', 'ref-shipping', 'ref-loose', 'ref-missing', 'ref-foreign', 'ref-deleted-section',
+    ];
+
+    it.each(['list', 'columns'] as const)('groups references separately in section order in %s layout', (layout) => {
+        const { container } = renderWorkspace({ store: referenceStore, layout });
+        const area = referenceArea(container);
+
+        expect(within(area).getAllByRole('heading').map((heading) => heading.textContent))
+            .toEqual(['Planning2', 'Shipping1', 'No Section4']);
+        expect(rowIds(area)).toEqual(expectedReferenceOrder);
+        expect(rowIds(container)).toEqual([...tasks.map((item) => item.id), ...expectedReferenceOrder]);
+        expect(within(area).queryByText('Empty')).toBeNull();
+        expect(within(area).queryByText('Deleted')).toBeNull();
+        expect(within(area).queryByText('Unrelated reference')).toBeNull();
+    });
+
+    it('walks grouped references in rendered order after actionable tasks', () => {
+        const { container } = renderWorkspace({ store: referenceStore });
+        const scope = registerTaskListScope.mock.calls[registerTaskListScope.mock.calls.length - 1]?.[0] as TaskListScope;
+        act(() => scope.selectFirst());
+        for (const id of [...tasks.map((item) => item.id), ...expectedReferenceOrder]) {
+            expect(document.activeElement?.closest('[data-task-id]')).toHaveAttribute('data-task-id', id);
+            act(() => scope.selectNext());
+        }
+        expect(rowIds(referenceArea(container))).toEqual(expectedReferenceOrder);
+    });
+
+    it('filters references before grouping and hides newly empty groups', () => {
+        const { container, getByRole } = renderWorkspace({ store: referenceStore });
+        fireEvent.change(getByRole('textbox', { name: 'Search...' }), { target: { value: 'Shipping reference' } });
+
+        const area = referenceArea(container);
+        expect(within(area).getAllByRole('heading').map((heading) => heading.textContent)).toEqual(['Shipping1']);
+        expect(rowIds(area)).toEqual(['ref-shipping']);
+    });
+
+    it('keeps references flat when the project has no sections', () => {
+        const { container } = renderWorkspace({ store: { ...referenceStore, sections: [] } });
+        const area = referenceArea(container);
+
+        expect(within(area).queryByRole('heading')).toBeNull();
+        expect(within(area).queryByText('No Section')).toBeNull();
+        expect(rowIds(area)).toEqual([
+            'ref-loose', 'ref-shipping', 'ref-planning-1', 'ref-planning-2', 'ref-missing', 'ref-foreign', 'ref-deleted-section',
+        ]);
     });
 });
 
