@@ -3427,6 +3427,12 @@ export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLine
     prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3,
     readNativeAttachmentDraftRemoveFrozen } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft.ts'))};
 export { prepareNativeAttachmentDraftDiscardCandidates } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
+import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
+export { taskRevisionOf } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
+// File-only changed/noop fixtures have no ordinary patch fields. Refuse any
+// field edit rather than manufacturing a second editor field policy here.
+const realMixedSaveMethods = createRealMixedSaveMethods({ readiness: () => ({ ok: true, value: null }),
+    save: async () => ({ ok: true, value: null }), validateField: () => false });
 export { isAttachmentFileInUse } from ${JSON.stringify(resolve(app, '../../packages/core/src/attachment-draft-settlement.ts'))};
 export { canSaveTaskListTag } from ${JSON.stringify(resolve(app, '../../packages/core/src/task-list-bulk-actions.ts'))};
 export { formatListItemCount } from ${JSON.stringify(resolve(app, '../../packages/core/src/list-count.ts'))};
@@ -3563,7 +3569,8 @@ export function createNativeHostContract(bindings = {}) {
       return { ok: true, value: { version: 1, id: input.id, readOnly: globalThis.localTaskReadOnly === true, rows: [], checklistBase: [{ id: 'c', title: 'Milk', isCompleted: true }] } };
     },
     async prepareOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['prepare', input]); return globalThis.fileEditSaveReply; },
-    validatePreparedOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['validate', input]); return globalThis.fileEditSaveReply; },
+    validatePreparedOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['validate', input]);
+        return globalThis.realMixedSaveValidation ? realMixedSaveMethods.validatePreparedOwnedEditorFileEditTaskDraftSave(input) : globalThis.fileEditSaveReply; },
     async commitPreparedOwnedEditorFileEditTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['commit', input]); return globalThis.fileEditSaveReply; },
     async prepareOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyPrepare', input]); return globalThis.fileEditSaveReply; },
     validatePreparedOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyValidate', input]); return globalThis.fileEditSaveReply; },
@@ -3729,6 +3736,7 @@ export const useTaskStore = { getState: () => {
   return {
   settings: globalThis.settings,
   _allTasks: globalThis.lastLoaded ? globalThis.lastLoaded.tasks : globalThis.emptyOwnerTasks,
+  _tasksById: globalThis.ownerTaskMap,
   _allProjects: globalThis.ownerProjects, _allSections: [], _allAreas: [], _allPeople: [],
   persistenceFailure: globalThis.persistenceFailure, isLoading: globalThis.storeLoading, editLockCount: globalThis.storeEditLocks,
 }; } };
@@ -3820,7 +3828,7 @@ const makeState = (taskCount, fakeDataSequence = [], hostPlatform = undefined, c
         logText: null, logOps: [], logFailure: null,
         localAttachmentTest: false, localShaInstallCount: 0, attachmentInputs: [],
         fileEditSaveInputs: [], fileEditSaveReply: { ok: true, value: null },
-        emptyOwnerTasks: [], ownerProjects: [], storeLoading: false, storeEditLocks: 0,
+        emptyOwnerTasks: [], ownerProjects: [], ownerTaskMap: new Map(), storeLoading: false, storeEditLocks: 0,
         attachmentReply: { ok: true, value: { kind: 'saved', ids: [], attachments: [] } },
         __mindwtrNative: {
             sqlAll(sql) {
@@ -4071,6 +4079,237 @@ const poll = async (state, id) => {
         assert(!(local.logText ?? '').includes('mixed-draft'), 'binding dispatch is not a native acknowledgment');
     });
     console.log(`Task257: ${cases} private mixed-draft binding/transport checks (real pure V3 helpers; Save dispatch stand-ins only)`);
+}
+// Task259: direct Save fence with real254 pure file-only validation and actual
+// shared reference/revision policy. No native proof owner or JSC claim.
+{
+    const configureLocal = (state) => {
+        state.localAttachmentTest = true;
+        state.realMixedSaveValidation = true;
+        for (const name of ['fileCall', 'installerCall', 'fileAbort', 'fileDeleteNow', 'ioNext', 'ioBody']) state.__mindwtrNative[name] = () => '';
+        state.__mindwtrNative.fileDirectories = () => JSON.stringify({ document: 'file:///library/documents/', cache: 'file:///library/cache/' });
+        state.__mindwtrFileCall = async () => null; state.__mindwtrInstallerCall = async () => null;
+    };
+    const ROOT = 'file:///library/documents/attachments/', AT = '2026-10-05T00:00:00.000Z';
+    const SESSION = '25900000-0000-4000-8000-000000000001';
+    const REQUEST = '25900000-0000-4000-8000-000000000002';
+    let cases = 0;
+    const check = async (work) => { await work(); cases++; };
+    const fixtureState = makeState(0, [], 'ios', configureLocal);
+    assert.equal((await poll(fixtureState, fixtureState.MindwtrHost.boot())).ok, true);
+    const fixtures = new Map();
+    const fixture = async (count = 1, kind = 'noop') => {
+        const key = `${count}:${kind}`;
+        if (fixtures.has(key)) return fixtures.get(key);
+        const baseline = Array.from({ length: count }, (_, n) => ({ id: `baseline${n}`, kind: 'file', title: 'File',
+            uri: ROOT + `baseline${n}.pdf`, createdAt: AT, updatedAt: AT, ...(n ? { deletedAt: AT } : {}) }));
+        const initialPayloadJSON = JSON.stringify({ version: 2, taskID: 'task259', tab: 'task', touchedBase: {}, edited: {},
+            raw: { title: '', note: '', location: '', estimate: '', estimateResolved: '', timeSpent: '', timeSpentResolved: '',
+                tokens: {}, tokenCanonical: {}, tokenResolved: {}, tokenEdited: [], checklistInputs: {}, checklistAppend: '',
+                relativeAmount: '', relativeUnit: '', relativeOwned: false, relativeCommitRequested: false,
+                recurrenceInputs: {}, recurrenceOwned: [], recurrenceCommitRequested: [] }, scheduleEdits: [], scheduleFailedID: null,
+            attachmentsOwned: true, attachmentsBase: baseline, attachments: baseline, linkSheet: {} });
+        const owned = { version: 3, taskID: 'task259', initialPayloadJSON, beforePayloadJSON: initialPayloadJSON,
+            priorOperations: [], managedDirectoryURI: ROOT };
+        const removed = await poll(fixtureState, fixtureState.MindwtrHost.attachmentDraftRemovePrepareV3(JSON.stringify({ ...owned,
+            requestId: REQUEST, attachmentId: baseline[0].id })));
+        assert.equal(removed.ok, true);
+        const op = removed.value, draft = JSON.parse(op.afterPayloadJSON).attachments;
+        const saveRequest = { id: 'task259', base: {}, patch: {},
+            scheduleBase: { startTime: null, dueDate: null, relativeStartOffset: null, reviewAt: null }, attachments: { base: baseline, value: draft } };
+        const request = { version: 1, kind: 'owned-editor-file-edit-save',
+            checkpoint: { version: 1, sessionID: SESSION, taskID: 'task259', generation: 2, payloadJSON: op.afterPayloadJSON },
+            ownedDraft: { ...owned, beforePayloadJSON: op.afterPayloadJSON, priorOperations: [{ kind: 'remove', operation: op }] }, saveRequest };
+        const before = { id: 'task259', title: 'Task', status: 'next', tags: [], contexts: [], createdAt: AT, updatedAt: AT, rev: 8, revBy: 'before',
+            attachments: kind === 'noop' ? draft : baseline };
+        const after = kind === 'noop' ? before : { ...before, attachments: draft, updatedAt: op.removedAt, rev: 9, revBy: 'device' };
+        const scope = { sourceProject: null, targetProject: null, targetSection: null, targetArea: null, nextProjectOrder: null };
+        const decision = kind === 'noop' ? { kind, preparedAt: op.removedAt, deviceIdBefore: 'device', scope, effect: { task: { before, after } } }
+            : { kind, prepared: { version: 2, request: saveRequest, preparedAt: op.removedAt, deviceIdBefore: 'device',
+                deviceIdToInitialize: null, scope, effect: { task: { before, after } } } };
+        const envelope = { request, prepared: { version: 1, kind: 'owned-editor-file-edit-save', request, decision } };
+        const validation = await poll(fixtureState, fixtureState.MindwtrHost.attachmentFileEditSaveValidate(JSON.stringify(envelope)));
+        assert.equal(validation.ok, true, 'real254 validates the full file-only checkpoint/noop or changed effect');
+        assert.equal(validation.value.settlementPlan.length, count);
+        const value = { envelope, after, plan: validation.value.settlementPlan };
+        fixtures.set(key, value); return value;
+    };
+    const plain = await fixture(), changed = await fixture(1, 'changed'), many = await fixture(257);
+    const make = async (f = plain, configure = configureLocal, platform = 'ios') => {
+        const state = makeState(0, [], platform, configure);
+        assert.equal((await poll(state, state.MindwtrHost.boot())).ok, true);
+        state.lastLoaded.tasks = [JSON.parse(JSON.stringify(f.after))];
+        state.ownerTaskMap = new Map([[f.after.id, state.lastLoaded.tasks[0]]]);
+        state.persistenceStatus = { generation: 0, queued: false, inFlight: false, immediate: false, retrying: false, failed: false };
+        return state;
+    };
+    const input = (f = plain, index = 0) => JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(f.envelope), candidateIndex: index });
+    const invoke = (state, json = input(), outcome = 'removed') => {
+        const seen = [];
+        const callback = (label) => function () { assert.equal(arguments.length, 0); seen.push(label); return JSON.stringify({ outcome: label === 'retire' ? outcome : label }); };
+        const value = state.MindwtrHost.attachmentFileEditSaveRetire(json, callback('referenced'), callback('taskChanged'), callback('retire'));
+        return { value: JSON.parse(value), seen };
+    };
+    for (const f of [plain, changed, many]) await check(async () => {
+        const state = await make(f), before = state.fileEditSaveInputs.length;
+        assert.deepEqual(invoke(state, input(f, f.plan.length - 1)), { value: { outcome: 'removed' }, seen: ['retire'] });
+        assert.equal(state.fileEditSaveInputs.length - before, 1, 'full frozen envelope is validated once before candidate selection');
+    });
+    for (const outcome of ['removed', 'absent', 'generationChanged', 'unsafeEntry', 'noOwnedGeneration', 'unmanaged']) await check(async () => {
+        assert.deepEqual(invoke(await make(), input(), outcome), { value: { outcome }, seen: ['retire'] });
+    });
+    for (const where of ['task', 'project', 'archived', 'deletedOwner', 'deletedAttachment', 'link']) await check(async () => {
+        const state = await make(), attachment = { kind: where === 'link' ? 'link' : 'file', uri: plain.plan[0].attachment.uri,
+            ...(where === 'deletedAttachment' ? { deletedAt: AT } : {}) };
+        const owner = { id: 'other', attachments: [attachment], ...(where === 'deletedOwner' ? { deletedAt: AT } : {}),
+            ...(where === 'archived' ? { status: 'archived' } : {}) };
+        (where === 'project' ? state.ownerProjects : state.lastLoaded.tasks).push(owner);
+        const kept = ['task', 'project', 'archived'].includes(where);
+        assert.deepEqual(invoke(state), { value: { outcome: kept ? 'referenced' : 'removed' }, seen: [kept ? 'referenced' : 'retire'] });
+    });
+    for (const change of ['missing', 'rev', 'revBy', 'updatedAt']) await check(async () => {
+        const state = await make();
+        if (change === 'missing') state.ownerTaskMap = new Map();
+        else state.ownerTaskMap = new Map([['task259', { ...plain.after, [change]: change === 'rev' ? 9 : 'changed' }]]);
+        assert.deepEqual(invoke(state), { value: { outcome: 'taskChanged' }, seen: ['taskChanged'] });
+    });
+    await check(async () => {
+        const state = await make(); state.ownerTaskMap = new Map();
+        state.ownerProjects = [{ attachments: [{ kind: 'file', uri: plain.plan[0].attachment.uri }] }];
+        assert.deepEqual(invoke(state), { value: { outcome: 'referenced' }, seen: ['referenced'] }, 'live reference wins moved-task reason');
+    });
+    await check(async () => {
+        const owned = plain.envelope.request.ownedDraft;
+        const added = await poll(fixtureState, fixtureState.MindwtrHost.attachmentDraftPrepareV3(JSON.stringify({ ...owned,
+            requestId: '25900000-0000-4000-8000-000000000003', picked: { uri: 'file:///library/cache/picked.pdf',
+                name: 'Picked.pdf', mimeType: null, size: null }, measuredSize: 3 })));
+        assert.equal(added.ok, true); assert.equal(added.value.kind, 'prepared');
+        const withAdd = { ...owned, beforePayloadJSON: added.value.afterPayloadJSON,
+            priorOperations: [...owned.priorOperations, { kind: 'add', operation: added.value }] };
+        const removed = await poll(fixtureState, fixtureState.MindwtrHost.attachmentDraftRemovePrepareV3(JSON.stringify({ ...withAdd,
+            requestId: '25900000-0000-4000-8000-000000000004', attachmentId: added.value.requestId })));
+        assert.equal(removed.ok, true);
+        const envelope = JSON.parse(JSON.stringify(plain.envelope)), request = envelope.request;
+        request.checkpoint = { ...request.checkpoint, generation: 4, payloadJSON: removed.value.afterPayloadJSON };
+        request.ownedDraft = { ...withAdd, beforePayloadJSON: removed.value.afterPayloadJSON,
+            priorOperations: [...withAdd.priorOperations, { kind: 'remove', operation: removed.value }] };
+        request.saveRequest.attachments.value = JSON.parse(removed.value.afterPayloadJSON).attachments;
+        const after = { ...plain.after, attachments: request.saveRequest.attachments.value };
+        envelope.prepared.request = request;
+        envelope.prepared.decision.effect.task = { before: after, after };
+        const validation = await poll(fixtureState, fixtureState.MindwtrHost.attachmentFileEditSaveValidate(JSON.stringify(envelope)));
+        assert.equal(validation.ok, true, 'real254 validates mixed Remove/Add/Remove file-only noop');
+        const f = { envelope, after, plan: validation.value.settlementPlan }, index = f.plan.findIndex((value) => value.reason === 'uncommitted-draft');
+        assert(index >= 0);
+        const state = await make(f); state.ownerTaskMap = new Map();
+        assert.deepEqual(invoke(state, input(f, index)), { value: { outcome: 'removed' }, seen: ['retire'] }, 'new draft copy ignores moved-task fence');
+        assert.throws(() => invoke(state, input(f, index), 'generationChanged'), /INVALID_INPUT: Invalid attachment Save handoff/);
+    });
+    await check(async () => {
+        const state = await make(); let release;
+        state.backupPrepareHold = new Promise((resolveHeld) => { release = resolveHeld; });
+        const ticket = state.MindwtrHost.backupDocumentPrepare('{}');
+        assert.throws(() => invoke(state), /NOT_READY: Attachment Save requires settled native storage/);
+        release(); await new Promise((resolveTick) => setImmediate(resolveTick));
+        assert.deepEqual(invoke(state), { value: { outcome: 'removed' }, seen: ['retire'] }, 'done unpolled slot is settled');
+        assert.equal((await poll(state, ticket)).ok, true);
+    });
+    for (const field of ['queued', 'inFlight', 'immediate', 'retrying', 'failed']) await check(async () => {
+        const state = await make(); state.persistenceStatus = { ...state.persistenceStatus, [field]: true };
+        assert.throws(() => invoke(state), /NOT_READY: Attachment Save requires settled native storage/);
+    });
+    for (const kind of ['beforeBoot', 'nonIOS', 'noCapability', 'sandbox', 'transition', 'loading', 'failure', 'editLock', 'adapter']) await check(async () => {
+        let state;
+        if (kind === 'beforeBoot') state = makeState(0, [], 'ios', configureLocal);
+        else if (kind === 'nonIOS') state = await make(plain, configureLocal, 'android');
+        else if (kind === 'noCapability') state = await make(plain, (value) => { value.realMixedSaveValidation = true; });
+        else state = await make();
+        if (kind === 'sandbox') state.sandbox = true;
+        if (kind === 'transition') state.workspaceTransition = true;
+        if (kind === 'loading') state.storeLoading = true;
+        if (kind === 'failure') state.persistenceFailure = { private: 'secret' };
+        if (kind === 'editLock') state.storeEditLocks = 1;
+        if (kind === 'adapter') state.adapter = {};
+        assert.throws(() => invoke(state), /NOT_READY: Attachment Save requires settled native storage/);
+    });
+    for (const field of ['tasks', 'projects', 'map', 'generation', 'queued', 'sandbox', 'adapter']) await check(async () => {
+        const state = await make();
+        const row = { id: 'inert' };
+        Object.defineProperty(row, 'attachments', { get() {
+            if (field === 'tasks') state.lastLoaded.tasks = [...state.lastLoaded.tasks];
+            if (field === 'projects') state.ownerProjects = [];
+            if (field === 'map') state.ownerTaskMap = new Map(state.ownerTaskMap);
+            if (field === 'generation') state.persistenceStatus.generation++;
+            if (field === 'queued') state.persistenceStatus.queued = true;
+            if (field === 'sandbox') state.sandbox = true;
+            if (field === 'adapter') state.adapter = {};
+            return [];
+        } });
+        state.lastLoaded.tasks.push(row);
+        assert.throws(() => invoke(state), /NOT_READY: Attachment Save requires settled native storage/);
+    });
+    const invalid = 'INVALID_INPUT: Invalid attachment Save handoff';
+    const awaitReady259 = await make();
+    for (const value of [null, [], {}, { version: 2, envelopeJSON: '{}', candidateIndex: 0 },
+        { version: 1, envelopeJSON: 3, candidateIndex: 0 }, { version: 1, envelopeJSON: '{}', candidateIndex: 0, permission: true },
+        ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1, true, null, 1].map((candidateIndex) => ({ version: 1, envelopeJSON: JSON.stringify(plain.envelope), candidateIndex }))]) await check(async () => {
+        assert.throws(() => invoke(awaitReady259, JSON.stringify(value)), { message: invalid });
+    });
+    for (const json of ['{private-draft', JSON.stringify({ version: 1, envelopeJSON: '{secret', candidateIndex: 0 }),
+        'x'.repeat(8 * 1024 * 1024 + 1), JSON.stringify({ version: 1, envelopeJSON: '界'.repeat(3 * 1024 * 1024), candidateIndex: 0 })]) await check(async () => {
+        assert.throws(() => invoke(awaitReady259, json), { message: invalid });
+    });
+    await check(async () => {
+        const forged = JSON.parse(JSON.stringify(plain.envelope)); forged.prepared.decision.effect.task.after.rev++;
+        assert.throws(() => invoke(awaitReady259, JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(forged), candidateIndex: 0 })), { message: invalid });
+    });
+    for (const field of ['session', 'request']) await check(async () => {
+        const forged = JSON.parse(JSON.stringify(plain.envelope));
+        if (field === 'session') forged.request.checkpoint.sessionID += '\n';
+        else forged.request.ownedDraft.priorOperations[0].operation.requestId += '\n';
+        forged.prepared.request = forged.request;
+        assert.throws(() => invoke(awaitReady259, JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(forged), candidateIndex: 0 })), { message: invalid });
+    });
+    for (const reply of ['!MindwtrNativeError:secret-content', '{private-content', '{}', '{"outcome":"referenced"}',
+        '{"outcome":"removed","extra":"secret"}', '界'.repeat(400), Promise.resolve('{"outcome":"removed"}')]) await check(async () => {
+        const seen = [];
+        assert.throws(() => awaitReady259.MindwtrHost.attachmentFileEditSaveRetire(input(), () => { seen.push('keep'); return '{}'; },
+            () => { seen.push('moved'); return '{}'; }, () => { seen.push('retire'); return reply; }), { message: invalid });
+        assert.deepEqual(seen, ['retire'], 'malformed acknowledgment never retries another callback');
+    });
+    await check(async () => {
+        const seen = [];
+        assert.throws(() => awaitReady259.MindwtrHost.attachmentFileEditSaveRetire(input(), () => '{}', () => '{}', () => {
+            seen.push('retire'); throw Error('private content/path');
+        }), { message: 'NOT_READY: Attachment Save requires settled native storage' });
+        assert.deepEqual(seen, ['retire']);
+    });
+    await check(async () => {
+        for (const callbacks of [[null, () => '{}', () => '{}'], [() => '{}', null, () => '{}'], [() => '{}', () => '{}', null]]) {
+            assert.throws(() => awaitReady259.MindwtrHost.attachmentFileEditSaveRetire(input(), ...callbacks), { message: invalid });
+        }
+    });
+    await check(async () => {
+        const state = await make(); state.order259 = []; state.input259 = input();
+        state.keep259 = () => { throw Error('wrong branch'); };
+        state.retire259 = () => { state.order259.push('retire'); return '{"outcome":"absent"}'; };
+        vm.runInNewContext(`Promise.resolve().then(() => order259.push('microtask'));
+            globalThis.direct259 = MindwtrHost.attachmentFileEditSaveRetire(input259, keep259, keep259, retire259);
+            order259.push('returned');`, state);
+        assert.deepEqual(state.order259, ['retire', 'returned']);
+        await new Promise((resolveTick) => setImmediate(resolveTick));
+        assert.deepEqual(state.order259, ['retire', 'returned', 'microtask']);
+        assert.equal(state.direct259, '{"outcome":"absent"}');
+    });
+    await check(async () => {
+        const state = await make();
+        const before = JSON.stringify({ events: state.events, data: state.fakeData, files: state.fileCalls, logOps: state.logOps });
+        invoke(state);
+        assert.equal(JSON.stringify({ events: state.events, data: state.fakeData, files: state.fileCalls, logOps: state.logOps }), before,
+            'unbound fence performs no native file/flush/store/diagnostic work');
+        assert.equal((await poll(state, state.MindwtrHost.attachmentRequest('attachmentFileEditSaveRetire', '{}'))).ok, false);
+    });
+    console.log(`Task259: ${cases} synchronous mixed Save fence checks (real254 file-only pure validation + shared references/revision; NodeVM only)`);
 }
 // Task244: production direct handoff plus actual RN live-reference helper.
 // Native proof/lease/filesystem and real-JSC ordering acceptance are Task243.

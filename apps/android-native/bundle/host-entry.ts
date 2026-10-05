@@ -33,6 +33,7 @@ import {
     completeNativeAttachmentDraftAdd,
     prepareNativeAttachmentDraftDiscardCandidates,
     isAttachmentFileInUse,
+    taskRevisionOf,
     formatI18nTemplate,
     canSaveTaskListTag,
     createNativeHostContract,
@@ -1068,6 +1069,63 @@ const retireAttachmentDiscard = (json: string, keepCallback: () => string, retir
         }
         return result;
     } catch { throw attachmentDiscardInvalid(); }
+};
+const attachmentSaveInvalid = (): Error => new Error('INVALID_INPUT: Invalid attachment Save handoff');
+const attachmentSaveNotReady = (): Error => new Error('NOT_READY: Attachment Save requires settled native storage');
+const settledAttachmentSaveState = () => {
+    try { return settledAttachmentDiscardState(); }
+    catch { throw attachmentSaveNotReady(); }
+};
+/** Private same-turn Save settlement fence; callbacks carry native-held proofs. */
+const retireAttachmentFileEditSave = (json: string, referencedCallback: () => string,
+    taskChangedCallback: () => string, retireCallback: () => string): string => {
+    if ([referencedCallback, taskChangedCallback, retireCallback].some((callback) => typeof callback !== 'function')) {
+        throw attachmentSaveInvalid();
+    }
+    let envelope: Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
+    let candidate: ReturnType<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave> & { ok: true };
+    let index: number;
+    try {
+        const input = attachmentDraftJson(json) as Record<string, unknown> | null;
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 3
+            || input.version !== 1 || typeof input.envelopeJSON !== 'string'
+            || !Number.isSafeInteger(input.candidateIndex) || (input.candidateIndex as number) < 0) throw attachmentSaveInvalid();
+        envelope = attachmentDraftJson(input.envelopeJSON) as typeof envelope;
+        const checked = contract.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope);
+        if (!checked.ok || (input.candidateIndex as number) >= checked.value.settlementPlan.length) throw attachmentSaveInvalid();
+        candidate = checked;
+        index = input.candidateIndex as number;
+    } catch { throw attachmentSaveInvalid(); }
+    const selected = candidate.value.settlementPlan[index];
+    const decision = envelope.prepared.decision;
+    const afterTask = decision.kind === 'changed' ? decision.prepared.effect.task.after : decision.effect.task.after;
+    const before = settledAttachmentSaveState();
+    const tasks = before.state._allTasks, projects = before.state._allProjects, taskMap = before.state._tasksById;
+    const generation = before.status.generation;
+    let referenced: boolean, moved: boolean;
+    try {
+        referenced = isAttachmentFileInUse(selected.attachment.uri, [...tasks, ...projects]);
+        const currentTask = taskMap.get(envelope.request.saveRequest.id);
+        moved = selected.reason !== 'uncommitted-draft'
+            && (!currentTask || taskRevisionOf(currentTask) !== taskRevisionOf(afterTask));
+    } catch { throw attachmentSaveNotReady(); }
+    const after = settledAttachmentSaveState();
+    if (after.state._allTasks !== tasks || after.state._allProjects !== projects || after.state._tasksById !== taskMap
+        || after.status.generation !== generation) throw attachmentSaveNotReady();
+    let result: unknown;
+    try { result = referenced ? referencedCallback() : moved ? taskChangedCallback() : retireCallback(); }
+    catch { throw attachmentSaveNotReady(); }
+    // No fallback or second callback, including malformed/failed acknowledgment.
+    try {
+        if (typeof result !== 'string' || result.length > 1024 || new TextEncoder().encode(result).byteLength > 1024) throw attachmentSaveInvalid();
+        const value = JSON.parse(result) as Record<string, unknown> | null;
+        const outcomes = referenced ? ['referenced'] : moved ? ['taskChanged']
+            : selected.reason === 'uncommitted-draft' ? ['removed', 'absent']
+                : ['removed', 'absent', 'generationChanged', 'unsafeEntry', 'noOwnedGeneration', 'unmanaged'];
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1
+            || typeof value.outcome !== 'string' || !outcomes.includes(value.outcome)) throw attachmentSaveInvalid();
+        return result;
+    } catch { throw attachmentSaveInvalid(); }
 };
 // Pure validation remains available before boot; applying an owned Save also
 // requires the current iOS file capability and stable personal workspace.
@@ -3225,6 +3283,11 @@ globalThis.MindwtrHost = {
             requireOwnedAttachmentSave();
             return unwrap(await contract.commitPreparedOwnedEditorFileEditTaskDraftSave(attachmentDraftJson(json) as Parameters<typeof contract.commitPreparedOwnedEditorFileEditTaskDraftSave>[0]));
         });
+    },
+    /** Private synchronous Save handoff; no native retirement authority is supplied by JSON. */
+    attachmentFileEditSaveRetire(json: string, referencedCallback: () => string, taskChangedCallback: () => string,
+        retireCallback: () => string): string {
+        return retireAttachmentFileEditSave(json, referencedCallback, taskChangedCallback, retireCallback);
     },
     /** Called only after the native private record and exact checkpoint are durable. */
     attachmentDraftAcknowledged(operation: string, outcome: string): string {
