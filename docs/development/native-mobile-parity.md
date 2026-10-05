@@ -1856,3 +1856,9 @@ Validation: 427 focused core cases passed across eight suites, including 54 new 
 A native-only observer now captures the measured content and inode of an eligible existing managed file. It separately records positive leaf/directory absence, unmanaged provider paths and unsafe entries. Missing files grant no right to delete a later generation; observation creates no directories and performs no deletion. Managed filenames must match the flat ID-name rule.
 
 Validation: 134 real-descriptor/FIFO tests passed together with zero skips, including 22 new observation cases and 112 existing file-proof/retirement cases. Review corrected provider URI handling and slash-boundary admission; one Unicode fixture was corrected to use explicit encoded bytes after Foundation normalized its URL. Signed development build, diagnostics-ledger checks and independent review passed without installation. Native Remove/Save integration and editor UI remain pending.
+
+### iOS mixed file-edit Save authority (2026-10-05)
+
+A separate internal Save factory validates the complete ordinary editor checkpoint and mixed attachment history, then uses RN's attachment merge against the latest saved task. It derives all cleanup candidates from the actual saved result, including existing tombstones. A frozen no-op decision handles changes already applied elsewhere without creating a task revision or initializing a device ID; confirmation checks the exact durable row, scope and settled persistence state.
+
+Validation: 453 focused core cases passed, including 46 new cases; typecheck, scoped lint and independent review passed. Both native bundles built and 69 binding checks passed. All 23 existing owned-Save JavaScriptCore recovery tests passed on the Mac with the updated bundle. Those native tests cover the existing Save path after private factory refactoring; the new mixed-file factory remains unbound. Native history/admission, cleanup journaling and editor UI are still pending.

@@ -1,7 +1,7 @@
 import type { NativeHostResult } from './native-host-contract';
 import type { PreparedTaskEdit } from './store-types';
 import type { Area, Attachment, Project, Section, Task } from './types';
-import { useTaskStore } from './store';
+import { getPersistenceStatus, getStorageAdapter, useTaskStore } from './store';
 import { applyTaskUpdates, createProjectOrderReserver, ensureDeviceId, findTaskProjectReactivationTarget,
     getNextProjectOrder, nextRevision, normalizeTaskUpdate } from './store-helpers';
 import { applyPreparedTaskEditChanges, buildPreparedTaskEditChanges, prepareTaskUpdatesForStore, taskEditValuesEqual } from './store-tasks';
@@ -68,6 +68,12 @@ export type NativePreparedTaskDraftSaveV2 = {
     effect: { task: { before: Task; after: Task } };
 };
 export type NativePreparedTaskDraftSaveAny = NativePreparedTaskDraftSave | NativePreparedTaskDraftSaveV2;
+/** Private selected-file authority only; legacy prepared V2 remains change-only. */
+export type NativeOwnedTaskDraftNoopDecision = {
+    kind: 'noop'; preparedAt: string; deviceIdBefore: string | null;
+    scope: NativePreparedTaskDraftSaveV2['scope'];
+    effect: NativePreparedTaskDraftSaveV2['effect'];
+};
 export type NativeReviewTaskWriteInput = Extract<NativeReviewAction, { type: 'markTaskReviewed' }>;
 
 const FIELDS: readonly SaveField[] = ['title', 'description', 'location', 'assignedTo', 'priority', 'energyLevel', 'timeEstimate', 'contexts', 'tags', 'status', 'focusedToday', 'completedAt', 'timeSpentMinutes',
@@ -550,6 +556,63 @@ function createTaskDraftSaveFactory(deps: NativeTaskDraftSaveDependencies, strat
     const readAnyPrepared = (input: unknown): NativePreparedTaskDraftSaveAny | null =>
         record(input) && input.version === 2 ? readPreparedV2(input) : readPrepared(input);
 
+    const readNoop = (input: unknown, originalRequest: NativeTaskDraftSaveRequest): NativeOwnedTaskDraftNoopDecision | null => {
+        if (!strategy) return null;
+        const value = strategy.detachPrepared(input), request = readRequest(originalRequest, true, true);
+        if (!request || !record(value) || !keys(value, ['kind', 'preparedAt', 'deviceIdBefore', 'scope', 'effect'])
+            || value.kind !== 'noop' || !iso(value.preparedAt) || !nullableText(value.deviceIdBefore)
+            || !record(value.scope) || !keys(value.scope, ['sourceProject', 'targetProject', 'targetSection', 'targetArea', 'nextProjectOrder'])
+            || !record(value.effect) || !keys(value.effect, ['task']) || !record(value.effect.task)
+            || !keys(value.effect.task, ['before', 'after']) || !validRawTask(value.effect.task.before, request.id)
+            || !validRawTask(value.effect.task.after, request.id)) return null;
+        const scope = value.scope;
+        if (scope.sourceProject !== null && !validProjectWitness(scope.sourceProject)
+            || scope.targetProject !== null && !validProjectWitness(scope.targetProject)
+            || scope.targetSection !== null && !validSectionWitness(scope.targetSection)
+            || scope.targetArea !== null && !validAreaWitness(scope.targetArea)
+            || scope.nextProjectOrder !== null && !(typeof scope.nextProjectOrder === 'number'
+                && Number.isSafeInteger(scope.nextProjectOrder) && scope.nextProjectOrder >= 0)) return null;
+        const noop = value as unknown as NativeOwnedTaskDraftNoopDecision, before = noop.effect.task.before;
+        try {
+            if (before.deletedAt || before.purgedAt || before.status === 'reference' && !referenceEditable(request)
+                || !rawTaskEqual(before, noop.effect.task.after)
+                || !taskEditValuesEqual(draftSaveScope(before, request, { tasks: [before], ...scopeRows(noop.scope) }), noop.scope)) return null;
+            // This transient calculation value never becomes a device witness or a write.
+            const after = draftSaveEffect(before, request, noop.scope, noop.preparedAt,
+                noop.deviceIdBefore ?? 'native-noop-calculation', mergeAttachments);
+            return after && rawTaskEqual(before, after) ? noop : null;
+        } catch { return null; }
+    };
+
+    const confirmNoop = async (noop: NativeOwnedTaskDraftNoopDecision, request: NativeTaskDraftSaveRequest):
+        Promise<NativeHostResult<{ id: string; draft: TaskDraft }>> => {
+        const ready = deps.readiness();
+        if (!ready.ok) return ready;
+        const captured = readNoop(noop, request);
+        if (!captured) return fail('INVALID_INPUT', 'An exact frozen no-op decision is required');
+        const generation = getPersistenceStatus().generation;
+        const read = await readAreaDurableData(false, true);
+        if (!read.ok) return read;
+        const afterReady = deps.readiness();
+        if (!afterReady.ok) return afterReady;
+        const status = getPersistenceStatus(), state = useTaskStore.getState(), bound = read.value.authority.state;
+        if (getStorageAdapter() !== read.value.adapter || status.generation !== generation
+            || state._allTasks !== bound._allTasks || state._allProjects !== bound._allProjects
+            || state._allSections !== bound._allSections || state._allAreas !== bound._allAreas
+            || state._allPeople !== bound._allPeople || state.settings !== bound.settings || state.lastDataChangeAt !== bound.lastDataChangeAt)
+            return fail('STALE_REVISION', 'Task data changed while confirming a no-op');
+        if (state.persistenceFailure || status.queued || status.inFlight || status.immediate || status.retrying || status.failed)
+            return fail('SAVE_FAILED', 'Task edit has unresolved persistence work');
+        const data = read.value.authority.snapshot, matches = data.tasks.filter((row) => row.id === request.id);
+        const current = matches.length === 1 ? matches[0] : null;
+        if (!current || !rawTaskEqual(current, captured.effect.task.before)
+            || (data.settings.deviceId ?? null) !== captured.deviceIdBefore
+            || isStatusListTaskReadOnly(current, data.projects) || current.status === 'reference' && !referenceEditable(request)
+            || !taskEditValuesEqual(draftSaveScope(current, request, data), captured.scope))
+            return fail('STALE_REVISION', 'Task or destination changed while confirming a no-op');
+        return { ok: true, value: taskResult(captured.effect.task.after) };
+    };
+
     const commitV2 = async (prepared: NativePreparedTaskDraftSaveV2, identity: unknown = prepared):
         Promise<NativeHostResult<{ id: string; draft: TaskDraft }>> => {
         const ready = deps.readiness();
@@ -586,6 +649,60 @@ function createTaskDraftSaveFactory(deps: NativeTaskDraftSaveDependencies, strat
             : applied.reason === 'invalid' ? 'INVALID_INPUT' : 'STALE_REVISION', applied.error ?? 'Task changed while editing');
         const saved = await saves.finish(identity, read.value.adapter, applied.outcome === 'replayed', read.value.authority.saveBoundary);
         return saved.ok ? { ok: true, value: taskResult(prepared.effect.task.after) } : saved;
+    };
+
+    const prepareV2 = async (input: NativeTaskDraftSaveRequest, captureNoop?: (value: NativeOwnedTaskDraftNoopDecision) => void): Promise<NativeHostResult<
+        { kind: 'noop'; result: { id: string; draft: TaskDraft } }
+        | { kind: 'prepared'; prepared: NativePreparedTaskDraftSaveV2 }>> => {
+        const ready = deps.readiness();
+        if (!ready.ok) return ready;
+        const request = readRequest(input, true, true);
+        if (!request) return fail('INVALID_INPUT', 'A complete task draft and raw baselines are required');
+        const read = await readAreaDurableData(false, true);
+        if (!read.ok) return read;
+        const data = read.value.authority.snapshot;
+        const matches = data.tasks.filter((row) => row.id === request.id);
+        const task = captureNoop ? (matches.length === 1 ? matches[0] : null) : matches[0];
+        if (!task || task.deletedAt || task.purgedAt) return fail('TASK_NOT_FOUND', 'Task not found');
+        if (isStatusListTaskReadOnly(task, data.projects)
+            || task.status === 'reference' && !referenceEditable(request))
+            return fail('INVALID_INPUT', 'Task is not editable');
+        if (!validBases(task, request, true)) return fail('STALE_REVISION', 'Task changed while editing');
+        if (own(request.patch, 'projectId') && request.patch.projectId
+            && !data.projects.some((project) => project.id === request.patch.projectId && isSelectableProjectForTaskAssignment(project))) {
+            return fail('INVALID_INPUT', 'Project is not available');
+        }
+        if (request.patch.areaId && !data.areas.some((area) => area.id === request.patch.areaId && !area.deletedAt)) {
+            return fail('INVALID_INPUT', 'Area is not available');
+        }
+        if (request.patch.sectionId && !data.sections.some((section) => section.id === request.patch.sectionId
+            && section.projectId === request.patch.projectId && !section.deletedAt)) {
+            return fail('INVALID_INPUT', 'Section is not available');
+        }
+        const preparedAt = new Date().toISOString();
+        const scope = draftSaveScope(task, request, data);
+        let device = captureNoop ? { deviceId: data.settings.deviceId ?? 'native-noop-calculation', updated: !data.settings.deviceId }
+            : ensureDeviceId(data.settings);
+        let after = draftSaveEffect(task, request, scope, preparedAt, device.deviceId, mergeAttachments);
+        if (!after) return fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
+        if (rawTaskEqual(task, after)) {
+            if (captureNoop) captureNoop({ kind: 'noop', preparedAt, deviceIdBefore: data.settings.deviceId ?? null,
+                scope, effect: { task: { before: JSON.parse(JSON.stringify(task)) as Task, after: JSON.parse(JSON.stringify(task)) as Task } } });
+            return { ok: true, value: { kind: 'noop', result: taskResult(task) } };
+        }
+        if (captureNoop && device.updated) {
+            device = ensureDeviceId(data.settings);
+            after = draftSaveEffect(task, request, scope, preparedAt, device.deviceId, mergeAttachments);
+            if (!after) return fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
+        }
+        const before = JSON.parse(JSON.stringify(task)) as Task;
+        const frozenAfter = JSON.parse(JSON.stringify(after)) as Task;
+        const prepared = readPreparedV2({ version: 2, request, preparedAt,
+            deviceIdBefore: data.settings.deviceId ?? null,
+            deviceIdToInitialize: device.updated ? device.deviceId : null,
+            scope, effect: { task: { before, after: frozenAfter } } });
+        return prepared ? { ok: true, value: { kind: 'prepared', prepared } }
+            : fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
     };
 
     const methods = {
@@ -629,47 +746,8 @@ function createTaskDraftSaveFactory(deps: NativeTaskDraftSaveDependencies, strat
             return prepared ? { ok: true, value: prepared } : fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
         },
 
-        async prepareTaskDraftSaveV2(input: NativeTaskDraftSaveRequest): Promise<NativeHostResult<
-            { kind: 'noop'; result: { id: string; draft: TaskDraft } }
-            | { kind: 'prepared'; prepared: NativePreparedTaskDraftSaveV2 }>> {
-            const ready = deps.readiness();
-            if (!ready.ok) return ready;
-            const request = readRequest(input, true, true);
-            if (!request) return fail('INVALID_INPUT', 'A complete task draft and raw baselines are required');
-            const read = await readAreaDurableData(false, true);
-            if (!read.ok) return read;
-            const data = read.value.authority.snapshot;
-            const task = data.tasks.find((row) => row.id === request.id);
-            if (!task || task.deletedAt || task.purgedAt) return fail('TASK_NOT_FOUND', 'Task not found');
-            if (isStatusListTaskReadOnly(task, data.projects)
-                || task.status === 'reference' && !referenceEditable(request))
-                return fail('INVALID_INPUT', 'Task is not editable');
-            if (!validBases(task, request, true)) return fail('STALE_REVISION', 'Task changed while editing');
-            if (own(request.patch, 'projectId') && request.patch.projectId
-                && !data.projects.some((project) => project.id === request.patch.projectId && isSelectableProjectForTaskAssignment(project))) {
-                return fail('INVALID_INPUT', 'Project is not available');
-            }
-            if (request.patch.areaId && !data.areas.some((area) => area.id === request.patch.areaId && !area.deletedAt)) {
-                return fail('INVALID_INPUT', 'Area is not available');
-            }
-            if (request.patch.sectionId && !data.sections.some((section) => section.id === request.patch.sectionId
-                && section.projectId === request.patch.projectId && !section.deletedAt)) {
-                return fail('INVALID_INPUT', 'Section is not available');
-            }
-            const preparedAt = new Date().toISOString();
-            const scope = draftSaveScope(task, request, data);
-            const device = ensureDeviceId(data.settings);
-            const after = draftSaveEffect(task, request, scope, preparedAt, device.deviceId, mergeAttachments);
-            if (!after) return fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
-            if (rawTaskEqual(task, after)) return { ok: true, value: { kind: 'noop', result: taskResult(task) } };
-            const before = JSON.parse(JSON.stringify(task)) as Task;
-            const frozenAfter = JSON.parse(JSON.stringify(after)) as Task;
-            const prepared = readPreparedV2({ version: 2, request, preparedAt,
-                deviceIdBefore: data.settings.deviceId ?? null,
-                deviceIdToInitialize: device.updated ? device.deviceId : null,
-                scope, effect: { task: { before, after: frozenAfter } } });
-            return prepared ? { ok: true, value: { kind: 'prepared', prepared } }
-                : fail('INVALID_INPUT', 'Task edit cannot produce a valid prepared journal');
+        prepareTaskDraftSaveV2(input: NativeTaskDraftSaveRequest) {
+            return prepareV2(input);
         },
 
         validatePreparedTaskDraftSave(input: { request: NativeTaskDraftSaveRequest; prepared: NativePreparedTaskDraftSaveAny }):
@@ -756,7 +834,19 @@ function createTaskDraftSaveFactory(deps: NativeTaskDraftSaveDependencies, strat
             return prepared;
         },
     };
-    return { publicMethods, authority: { prepare: methods.prepareTaskDraftSaveV2, readPrepared: readPreparedV2, commit: commitV2 } };
+    return { publicMethods, authority: { prepare: methods.prepareTaskDraftSaveV2, readPrepared: readPreparedV2, commit: commitV2,
+        readNoop, confirmNoop,
+        async prepareDecision(input: NativeTaskDraftSaveRequest): Promise<NativeHostResult<
+            { kind: 'changed'; prepared: NativePreparedTaskDraftSaveV2 } | NativeOwnedTaskDraftNoopDecision>> {
+            if (!strategy) return fail('INVALID_INPUT', 'A selected owned-file authority is required');
+            let noop: NativeOwnedTaskDraftNoopDecision | null = null;
+            const result = await prepareV2(input, (value) => { noop = value; });
+            if (!result.ok) return result;
+            if (result.value.kind === 'prepared') return { ok: true, value: { kind: 'changed', prepared: result.value.prepared } };
+            const checked = readNoop(noop, input);
+            return checked ? { ok: true, value: checked } : fail('INVALID_INPUT', 'A valid frozen no-op is required');
+        },
+    } };
 }
 
 export function createTaskDraftSaveMethods(deps: NativeTaskDraftSaveDependencies) {
