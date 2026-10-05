@@ -915,7 +915,7 @@ export function CalendarView() {
                                                 />
                                             ))}
                                             {showNow && (
-                                                <div className="absolute left-0 right-0 z-20 flex -translate-y-1/2 items-center" style={{ top: nowTop }}>
+                                                <div className="pointer-events-none absolute left-0 right-0 z-20 flex -translate-y-1/2 items-center" style={{ top: nowTop }}>
                                                     <span className="h-2 w-2 -translate-x-1 rounded-full bg-destructive" />
                                                     <span className="h-0.5 flex-1 bg-destructive" />
                                                 </div>

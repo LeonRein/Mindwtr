@@ -1073,22 +1073,50 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_mcp_readiness_timeout_kills_and_reaps_the_child() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
         let directory = tempfile::tempdir().unwrap();
         let pid_path = directory.path().join("pid");
-        let mut command = fixture_command(
-            &directory,
-            &format!(
-                "printf '%s' $$ > '{}'\nwhile :; do :; done",
-                pid_path.display()
-            ),
-        );
+        let pid_file = std::fs::File::create(&pid_path).unwrap();
+        let pid_fd = pid_file.as_raw_fd();
+        let mut command = fixture_command(&directory, "while :; do :; done");
+        // Publish the PID before spawn returns and the readiness deadline starts.
+        // The shell may otherwise be killed before its first instruction on CI.
+        // SAFETY: the forked child only uses async-signal-safe getpid/write;
+        // pid_file keeps this descriptor alive through start, and all data is local.
+        unsafe {
+            command.pre_exec(move || {
+                let bytes = libc::getpid().to_ne_bytes();
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let written = libc::write(
+                        pid_fd,
+                        bytes.as_ptr().add(offset).cast(),
+                        bytes.len() - offset,
+                    );
+                    if written < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    if written == 0 {
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    offset += written as usize;
+                }
+                Ok(())
+            });
+        }
         let started = Instant::now();
         assert!(matches!(
             ManagedProcess::start(&mut command, Duration::from_millis(50), None),
             Err(McpError::StartFailed)
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
-        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        let pid = i32::from_ne_bytes(std::fs::read(pid_path).unwrap().try_into().unwrap());
         assert_eq!(
             unsafe { libc::kill(pid, 0) },
             -1,
