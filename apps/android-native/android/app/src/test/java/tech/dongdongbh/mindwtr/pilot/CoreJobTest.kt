@@ -54,38 +54,44 @@ class CoreJobTest {
 
     @Test fun theHostBootsBeforeTheJobAndWidgetsRefreshAfterIt() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure", "widgets"), events)
     }
 
     // #1257: what a capture job stored while the app was closed is sent before the job ends (core's capture run), never after.
     @Test fun aCaptureJobSendsWhatItStoredBeforeItEnds() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure", "widgets"), events)
         assertEquals(listOf("Native Android core work ingest success"), lines)
     }
 
     // Review S4a 2: a capture job succeeds only once its upload is owned: sent, or failed and recorded with the scheduled job in
     // WorkManager to retry it (the first native start after RN's may be a capture, with no screen to schedule it).
+    // A widget tap or a capture is stored and drawn before the job waits for any sync (a dead server can hold that for minutes).
+    @Test fun aCaptureJobStoresAndDrawsWhatItDrainedBeforeItWaitsForTheSync() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("drain", "widgets", "sync capture"), events.filter { it in setOf("drain", "widgets", "sync capture") }.take(3))
+    }
+
     @Test fun aCaptureJobMakesSureTheScheduledJobExistsWhenCoreWantsIt() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
         assertEquals(listOf("sync capture", "ensure"), events.filter { it == "sync capture" || it == "ensure" })
         events.clear()
         syncWanted = false
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "widgets"), events)
     }
 
     @Test fun aCaptureWhoseScheduledJobIsNotStoredRetries() {
         ensured = false
         assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture", "ensure"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure"), events)
     }
 
     @Test fun aCaptureWhoseSyncThrowsRetriesItsUpload() {
         // The capture is committed; the retry sends it (the count it owes survives in OwedUploads).
         syncFailure = IllegalStateException("Core backgroundSync timed out")
         assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "sync capture"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture"), events)
         assertEquals(listOf("Native Android core work ingest retry Core backgroundSync timed out"), lines)
     }
 

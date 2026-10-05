@@ -63,7 +63,8 @@ internal object CoreJob {
      * A reminder's Done and Snooze are journaled core commands whose request UUID makes every try the same request, so they retry
      * until core answers, unless core refuses the input itself (INVALID_INPUT). Snooze's alarm is made in the engine against core's
      * native state, once per request however many tries; Done plans the alarms again, as the store changed.
-     * A capture job (INGEST) then sends what the drains stored and waits for that sync. It succeeds only once that upload is owned:
+     * A capture job (INGEST): the drain has stored its items (recovery runs first) and the widgets are drawn before it sends what
+     * the drains stored and waits for that sync. It succeeds only once that upload is owned:
      * sent, or failed and recorded by core with the scheduled sync job stored to retry it ([ensureSync], when core wants the job:
      * the first native start after RN's may be this job, with no screen to schedule it). A run that throws, or a job not stored,
      * retries; what the drains stored stays owed (OwedUploads), so the retry sends it. The sync job (SYNC) runs core's scheduled run,
@@ -84,7 +85,11 @@ internal object CoreJob {
             val host = boot()
             if (!host.recover() || !host.drain()) Outcome.Retry
             else when (name) {
-                INGEST -> if (host.backgroundSync("capture").optBoolean("schedule") && !ensureSync()) Outcome.Retry else Outcome.Success
+                INGEST -> {
+                    // What the drain stored (a capture, a widget's check-off) reaches the widgets now, not after the sync's wait.
+                    refreshWidgets()
+                    if (host.backgroundSync("capture").optBoolean("schedule") && !ensureSync()) Outcome.Retry else Outcome.Success
+                }
                 SYNC -> {
                     val again = if (host.appActive()) {
                         line.put("skipped", "foreground")
