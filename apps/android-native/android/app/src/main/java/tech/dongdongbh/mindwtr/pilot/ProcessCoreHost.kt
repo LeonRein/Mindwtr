@@ -121,7 +121,7 @@ internal object ProcessCoreHost {
             keyValue, HostFiles(app.filesDir, app.cacheDir, content = AndroidContentSource(app)), installer,
             ReminderAlarms(app, keyValue, checkpointRnState = { if (legacy != null) LegacyRnStoreGuard.checkpointRnState(app.dataDir) }),
             HostWidgets(app) { appState },
-            scheduleBackgroundSync = { on -> CoreWork.scheduleSync(app, on) })
+            scheduleBackgroundSync = { on -> CoreWork.scheduleSyncStored(app, on) })
         try {
             runtime.start(coreBundle(app), legacy?.bootState ?: "", legacy?.backup ?: "")
             setLanguage(runtime, language ?: legacy?.language)

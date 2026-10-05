@@ -386,8 +386,9 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
     const reconcileBackgroundSync = async () => {
         void refreshConfigured();
         const on = await backgroundSyncWanted();
-        bindings.trace(`Native Android background sync schedule=${on ? 'on' : 'off'}`);
+        // Kotlin answers once WorkManager stored it (bounded); a refusal throws to the caller, and the next reconcile tries again.
         bindings.scheduleBackgroundSync(on);
+        bindings.trace(`Native Android background sync schedule=${on ? 'on' : 'off'}`);
     };
     const appStateListeners = new Set<(state: string) => void>();
     /** What Kotlin's start order stored from the capture queue since the last run took it (core's drain port). */

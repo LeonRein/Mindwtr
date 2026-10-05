@@ -90,6 +90,14 @@ class CoreWork(context: Context, params: WorkerParameters) : Worker(context, par
             if (on) work.enqueueUniqueWork(SYNC_WORK, ExistingWorkPolicy.KEEP, syncRequest()) else work.cancelUniqueWork(SYNC_WORK)
         }
 
+        /**
+         * [scheduleSync] once WorkManager stored it (or cancelled it), waiting at most [STORE_WAIT_SECONDS]: the engine's bridge call
+         * (CoreHost's bgSyncSchedule) returns its failure to core, which logs it; the next reconcile (start, resume, leave) retries.
+         */
+        fun scheduleSyncStored(context: Context, on: Boolean) {
+            scheduleSync(context, on).result.get(STORE_WAIT_SECONDS, TimeUnit.SECONDS)
+        }
+
         /** The running sync job's next run, appended after it: it waits its 15 minutes from this run's end. */
         fun syncAgain(context: Context): Operation =
             WorkManager.getInstance(context).enqueueUniqueWork(SYNC_WORK, ExistingWorkPolicy.APPEND_OR_REPLACE, syncRequest())

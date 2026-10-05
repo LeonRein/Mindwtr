@@ -11,10 +11,11 @@ import { createDeadlineFetch, createNativeSync } from './host-sync';
 const globals = globalThis as unknown as Record<string, unknown>;
 const realFetch = globalThis.fetch;
 
-const host = (stored: Record<string, string> = {}) => {
+const host = (stored: Record<string, string> = {}, refuseSchedule = false) => {
     const kv = new Map(Object.entries(stored));
     const schedules: boolean[] = [];
     const lines: string[] = [];
+    const traces: string[] = [];
     const sync = createNativeSync({
         keyValue: {
             get: async (key) => kv.get(key) ?? null,
@@ -29,11 +30,14 @@ const host = (stored: Record<string, string> = {}) => {
         appendLog: async (entry) => { lines.push(entry.message); return null; },
         translate: (key) => key,
         emit: () => undefined,
-        trace: () => undefined,
-        scheduleBackgroundSync: (on) => { schedules.push(on); },
+        trace: (line) => { traces.push(line); },
+        scheduleBackgroundSync: (on) => {
+            if (refuseSchedule) throw new Error('WorkManager did not store the work');
+            schedules.push(on);
+        },
         isFossBuild: false,
     });
-    return { sync, kv, schedules, lines };
+    return { sync, kv, schedules, lines, traces };
 };
 
 const fetches: string[] = [];
@@ -61,6 +65,17 @@ describe('native background sync binding', () => {
         const file = host({ [SYNC_BACKEND_KEY]: 'file', '@mindwtr_sync_path': 'content://folder' });
         await file.sync.settingsHost.reconcileBackgroundSync();
         expect(file.schedules).toEqual([false]);
+    });
+
+    // Review S4a 4: the schedule is reported only once WorkManager stored it; a refusal reaches the caller (and is retried at the
+    // next start, resume or leave, which reconcile again).
+    it('reports the job scheduled only once the host stored it; a refusal fails the reconcile', async () => {
+        const { sync, traces } = host({ [SYNC_BACKEND_KEY]: 'webdav', [WEBDAV_URL_KEY]: 'http://127.0.0.1:1/dav' }, true);
+        await expect(sync.settingsHost.reconcileBackgroundSync()).rejects.toThrow('WorkManager did not store the work');
+        expect(traces.filter((line) => line.startsWith('Native Android background sync schedule'))).toEqual([]);
+        const stored = host({ [SYNC_BACKEND_KEY]: 'webdav', [WEBDAV_URL_KEY]: 'http://127.0.0.1:1/dav' });
+        await stored.sync.settingsHost.reconcileBackgroundSync();
+        expect(stored.traces).toContain('Native Android background sync schedule=on');
     });
 
     it('a capture run with nothing imported sends nothing; one with an import syncs and records its failure', async () => {
