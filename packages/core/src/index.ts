@@ -343,6 +343,10 @@ export { validateNativeAttachmentDraftBegin, validateNativeAttachmentDraftLineag
     completeNativeAttachmentDraftAdd, validateNativeAttachmentDraftBeginV2, validateNativeAttachmentDraftLineageV2,
     prepareNativeAttachmentDraftAddV2 } from './native-attachment-draft';
 
+export { prepareNativeAttachmentDraftDiscardCandidates } from './native-attachment-draft-discard';
+export type { NativeAttachmentDraftDiscardInput, NativeAttachmentDraftDiscardPhase,
+    NativeAttachmentDraftDiscardCandidates } from './native-attachment-draft-discard';
+
 export type { OwnedFileAddSaveRequest, PreparedOwnedFileAddSave } from './native-host-contract-owned-file-save';
 
 export type { OwnedEditorFileAddSaveRequest, PreparedOwnedEditorFileAddSave } from './native-host-contract-owned-editor-save';

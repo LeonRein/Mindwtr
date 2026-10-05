@@ -197,6 +197,22 @@ const validateFrozen = (value: NativeAttachmentDraftPrepared): void => {
         || !same(after.object, { ...before.object, attachments: [...before.attachments, value.attachment] })) invalid();
 };
 
+/** Internal structural reader; no current policy, IO or publication authority. */
+export function readNativeAttachmentDraftFrozen(input: unknown): NativeAttachmentDraftPrepared {
+    const captured = frozenShape(input);
+    validateFrozen(captured);
+    return captured;
+}
+
+/** Internal attachment projection reader. Opaque editor fields remain untouched. */
+export function readNativeAttachmentDraftPayload(input: unknown, taskID: string): {
+    baselineAttachments: Attachment[]; attachments: Attachment[];
+} {
+    const captured = payload(input, taskID);
+    return { baselineAttachments: readNativeAttachments(captured.object.attachmentsBase)!,
+        attachments: captured.attachments };
+}
+
 type CapturedLineage = Omit<NativeAttachmentDraftLineageInput, 'version'> & { version: 1 | 2 };
 const captureLineage = (object: Record<string, unknown>, additionalFields: object = {}, version: 1 | 2 = 1): CapturedLineage => {
     if (object.version !== version || !Array.isArray(object.priorAdditions) || object.priorAdditions.length > 128) invalid();

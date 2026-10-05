@@ -1796,3 +1796,9 @@ Validation: 23 new real JavaScriptCore/SQLite/file tests passed together against
 New ordinary checkpoint advances now measure the exact future Discard decision and detached record before accepting the change. This prevents a growing raw editor payload from consuming the space needed to record Discard. Recovery of an older pending checkpoint retains its original admission rules and completes the exact recorded transition.
 
 Validation: two new real JavaScriptCore/file cases passed using actual encoded histories at the capacity boundary, and all 25 existing checkpoint recovery tests passed. The tests preserve editor bytes, file proofs and unrelated database rows on refusal; a fitting checkpoint can still Discard after restart. Older pending recovery emits no new capacity-reservation marker. Bundle startup, scoped lint, diagnostic-field checks and the signed development build passed without installation. Independent review passed. Terminal file cleanup and the attachment picker remain separate work.
+
+### iOS shared owned-Add Discard candidates (2026-10-05)
+
+A pure shared helper now validates retained version1/version2 Add history and derives Discard candidates through the existing RN settlement planner. It preserves opening baseline files and tombstones, keeps pending Add proposals distinct from acknowledged checkpoints, and returns only the exact frozen new-Add identities and target URIs. Candidates do not prove that a copy exists or authorize deletion.
+
+Validation: 206 shared tests passed (64 new, 142 existing), with typecheck and scoped lint passing. Both native bundles rebuilt successfully; the iOS bundle remained byte-identical because this helper is not bound to a native caller yet. Independent review passed. Native live-reference checks, file retirement, terminal ownership release and picker UI remain separate work.
