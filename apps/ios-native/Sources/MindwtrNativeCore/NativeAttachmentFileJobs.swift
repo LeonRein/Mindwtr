@@ -52,6 +52,7 @@ enum NativeAttachmentDraftFileRequest: Sendable {
     case snapshotSource(sourceURI: String)
     case prepareStage(targetURI: String, operationID: String)
     case fillStage(source: NativeAttachmentFiles.CacheSourceProof, stage: NativeAttachmentFiles.ReservedAttachmentStageProof)
+    case observeFilledStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof, sha256: String, size: Int64)
     case publishStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof, targetURI: String, sha256: String)
     case verifyPublication(targetURI: String, stage: NativeAttachmentFiles.ReservedAttachmentStageProof, sha256: String, size: Int64)
     case retirePublished(targetURI: String, proof: NativeAttachmentFiles.PublishedAttachmentProof)
@@ -60,7 +61,7 @@ enum NativeAttachmentDraftFileRequest: Sendable {
     fileprivate var isInstaller: Bool {
         switch self {
         case .prepareStage, .publishStage, .retirePrivateStage: return true
-        case .ensureManagedDirectory, .snapshotSource, .fillStage, .verifyPublication, .retirePublished: return false
+        case .ensureManagedDirectory, .snapshotSource, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished: return false
         }
     }
 
@@ -114,6 +115,10 @@ enum NativeAttachmentDraftFileRequest: Sendable {
         case .publishStage(let stage, let targetURI, let sha256):
             try uri(targetURI); try digest(sha256)
             input = ["op": "publishStage", "stage": try stageObject(stage), "targetURI": targetURI, "sha256": sha256]
+        case .observeFilledStage(let stage, let sha256, let size):
+            try digest(sha256)
+            guard size >= 0, size <= 9_007_199_254_740_991 else { throw NativeAttachmentFilesError.invalidRequest }
+            input = ["op": "observeFilledStage", "stage": try stageObject(stage), "sha256": sha256, "size": size]
         case .verifyPublication(let targetURI, let stage, let sha256, let size):
             try uri(targetURI); try digest(sha256)
             guard size >= 0, size <= 9_007_199_254_740_991 else { throw NativeAttachmentFilesError.invalidRequest }
@@ -323,6 +328,10 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
             return ["sha256": content.sha256, "size": content.size, "identity": stage.stagedIdentity]
         case .publishStage(let stage, let targetURI, let sha256):
             return ["status": try installer.publishStage(stage: stage, targetURI: targetURI, sha256: sha256)]
+        case .observeFilledStage(let stage, let sha256, let size):
+            let content = try files.observeFilledAttachmentStage(stageProof: stage, sha256: sha256, size: size,
+                                                                 checkCancellation: token.check)
+            return ["sha256": content.sha256, "size": content.size, "identity": stage.stagedIdentity]
         case .verifyPublication(let targetURI, let stage, let sha256, let size):
             let proof = try files.verifyPublishedAttachment(targetURI: targetURI, stageProof: stage,
                 sha256: sha256, size: size, checkCancellation: token.check)

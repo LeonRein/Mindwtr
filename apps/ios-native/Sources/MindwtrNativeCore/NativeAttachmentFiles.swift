@@ -196,7 +196,7 @@ final class NativeAttachmentFiles {
         let sourcePath = try reference(sourceProof.sourceURI), stagePath = try reference(stageProof.stageURI)
         guard sourcePath.cache, !sourcePath.components.isEmpty,
               !stagePath.cache, stagePath.components.count == 3, stagePath.components[0] == "attachments",
-              stagePath.components[1].range(of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate$", options: .regularExpression) != nil,
+              stagePath.components[1].range(of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate\\z", options: .regularExpression) != nil,
               stagePath.components[2] == "stage" else { throw NativeAttachmentFilesError.invalidRequest }
         let cacheRoot = try openRoot(true); defer { Darwin.close(cacheRoot) }
         let source = try openParent(sourcePath); defer { Darwin.close(source.fd) }
@@ -262,6 +262,50 @@ final class NativeAttachmentFiles {
         return content
     }
 
+    /// Positive present-stage observation only; this does not prove that
+    /// publication was never attempted or grant cleanup authority. Refusal is
+    /// unclassified, and this path never opens a source or public target.
+    func observeFilledAttachmentStage(stageProof: ReservedAttachmentStageProof, sha256: String, size: Int64,
+                                      checkCancellation: () throws -> Void = {}) throws -> AttachmentStageContent {
+        guard Self.validDigest(sha256), size >= 0, size <= 9_007_199_254_740_991,
+              [stageProof.stagedIdentity, stageProof.directoryIdentity,
+               stageProof.privateDirectoryIdentity].allSatisfy(Self.validToken) else {
+            throw NativeAttachmentFilesError.invalidRequest
+        }
+        let path = try reference(stageProof.stageURI)
+        guard !path.cache, path.components.count == 3, path.components[0] == "attachments",
+              path.components[1].range(of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate\\z", options: .regularExpression) != nil,
+              path.components[2] == "stage" else { throw NativeAttachmentFilesError.invalidRequest }
+        try checkCancellation()
+        let managedPath = Reference(cache: false, components: ["attachments"])
+        let managed = try openDirectory(managedPath); defer { Darwin.close(managed) }
+        let parent = try openParent(path); defer { Darwin.close(parent.fd) }
+        let fd = try openFile(parent); defer { Darwin.close(fd) }
+        let before = try Self.regular(fd)
+        func validate() throws {
+            try stable(fd, before: before, parent: parent, path: path)
+            let currentManaged = try openDirectory(managedPath); defer { Darwin.close(currentManaged) }
+            let opened = try Self.regular(fd), named = try Self.named(parent)
+            guard try Self.token(Self.identity(managed)) == stageProof.directoryIdentity,
+                  try Self.identity(currentManaged) == Self.identity(managed),
+                  try Self.token(Self.identity(parent.fd)) == stageProof.privateDirectoryIdentity,
+                  Self.token(Identity(before)) == stageProof.stagedIdentity,
+                  before.st_size == size, opened.st_nlink == 1, named.st_nlink == 1 else {
+                throw NativeAttachmentFilesError.unavailable
+            }
+        }
+        // Cancellation predicates may mutate content and any ancestor. Retain
+        // descriptors and compare the named tree again after every callback.
+        func check() throws { try checkCancellation(); try validate() }
+        try check()
+        let content = try hashContents(fd, checkCancellation: check)
+        try check()
+        guard content.sha256 == sha256, content.size == size else { throw NativeAttachmentFilesError.unavailable }
+        try validate()
+        NSLog("Native iOS attachment filled stage observed releaseCheck=v1.3.5/ios-filled-stage-observed outcome=present")
+        return content
+    }
+
     /// Re-proves a lost publication acknowledgment from the recorded stage inode.
     /// Equal content alone is never ownership. This reads/flushes and retains every
     /// uncertain file/namespace for the future durable draft owner.
@@ -276,7 +320,7 @@ final class NativeAttachmentFiles {
         let targetPath = try reference(targetURI), stagePath = try reference(stageProof.stageURI)
         guard !targetPath.cache, targetPath.components.count == 2, targetPath.components[0] == "attachments",
               !stagePath.cache, stagePath.components.count == 3, stagePath.components[0] == "attachments",
-              stagePath.components[1].range(of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate$", options: .regularExpression) != nil,
+              stagePath.components[1].range(of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate\\z", options: .regularExpression) != nil,
               stagePath.components[2] == "stage" else { throw NativeAttachmentFilesError.invalidRequest }
         let parent = try openParent(targetPath); defer { Darwin.close(parent.fd) }
         let fd = try openFile(parent); defer { Darwin.close(fd) }

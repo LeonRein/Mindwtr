@@ -501,7 +501,7 @@ final class AttachmentFileInstallerEngine {
       staged.lastPathComponent == "stage",
       privateDirectory.deletingLastPathComponent() == targetRoot,
       privateDirectory.lastPathComponent.range(
-        of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate$",
+        of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate\\z",
         options: .regularExpression
       ) != nil
     else {
@@ -853,7 +853,7 @@ final class AttachmentFileInstallerEngine {
     let privateStage = staged.lastPathComponent == "stage"
       && stagedParent.deletingLastPathComponent() == targetRoot
       && stagedParent.lastPathComponent.range(
-        of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate$",
+        of: "^\\.mindwtr-install-[a-f0-9]{32}\\.candidate\\z",
         options: .regularExpression
       ) != nil
     guard
