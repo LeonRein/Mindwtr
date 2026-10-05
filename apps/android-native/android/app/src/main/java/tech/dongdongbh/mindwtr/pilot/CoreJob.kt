@@ -5,11 +5,14 @@ import org.json.JSONObject
 /**
  * One CoreWork run (CoreWork.kt), apart from Android: [boot] hands over this process's host (ProcessCoreHost.get, whose boot
  * is the app's own: validated load, journal replay, queue drain), then recovery in the same order (an owed journal replay,
- * then the drain it held back), then the one named job runs on it, then the widgets refresh (a hook for the widgets pass).
+ * then the drain it held back), then the one named job runs on it, then the widgets refresh.
  * JVM-tested (CoreJobTest).
  */
 internal object CoreJob {
-    /** Drain the pending-captures queue (the capture intent's items). */
+    /**
+     * Drain the pending-captures queue (the capture intent's items, the capture window's, widget check-offs), then send what it
+     * stored (core's capture run, #1257) before the job ends.
+     */
     const val INGEST = "ingest"
     /** An automation trigger's notification (the ACTIVATE_CONTEXT and DEACTIVATE_CONTEXT broadcasts): `action` and `context`. */
     const val CONTEXT = "context"
@@ -22,7 +25,9 @@ internal object CoreJob {
     const val REMINDER_DONE = "reminderDone"
     /** A reminder's Snooze: `requestId`, `requestedAt` (the tap's time, ms) and `details` (the fired alarm's). */
     const val REMINDER_SNOOZE = "reminderSnooze"
-    private val JOBS = setOf(INGEST, CONTEXT, REMINDERS, REMINDER_DONE, REMINDER_SNOOZE)
+    /** RN's scheduled background sync (expo-background-task's worker): core's scheduled run, then the next run queued. */
+    const val SYNC = "backgroundSync"
+    private val JOBS = setOf(INGEST, CONTEXT, REMINDERS, REMINDER_DONE, REMINDER_SNOOZE, SYNC)
 
     enum class Outcome { Success, Retry, Failure }
 
@@ -42,6 +47,13 @@ internal object CoreJob {
         fun reminderDone(requestId: String, taskId: String): JSONObject = throw UnsupportedOperationException("reminderDone")
         /** Core's snoozeReminder with [json] (`{ requestId, requestedAt, details }`), journaled; the engine makes its alarm once. */
         fun reminderSnooze(json: String): JSONObject = throw UnsupportedOperationException("reminderSnooze")
+        /**
+         * Core's background run ([trigger] "capture" or "scheduled"; CoreHost.backgroundSync), awaited: it settles with the sync
+         * (sent, failed and recorded, skipped by core's cooldown, or abandoned at core's 4 min deadline). `{ schedule }`.
+         */
+        fun backgroundSync(trigger: String): JSONObject = throw UnsupportedOperationException("backgroundSync")
+        /** Whether the app is in front (MainActivity resumed): its own triggers sync then. */
+        fun appActive(): Boolean = false
     }
 
     /**
@@ -51,10 +63,14 @@ internal object CoreJob {
      * A reminder's Done and Snooze are journaled core commands whose request UUID makes every try the same request, so they retry
      * until core answers, unless core refuses the input itself (INVALID_INPUT). Snooze's alarm is made in the engine against core's
      * native state, once per request however many tries; Done plans the alarms again, as the store changed.
+     * A capture job (INGEST) then sends what the drains stored and waits for that sync: a failed upload is core's recorded failure,
+     * which the sync job retries, so the job still succeeds (the capture is stored). The sync job (SYNC) runs core's scheduled run,
+     * none while the app is in front (as RN's Expo worker), then [syncAgain] queues its next run unless core says sync is no longer
+     * wanted; a run that failed outright retries in place, so the chain never breaks.
      * [log] gets one line per run, its fields apart (the job, its outcome, a failure's code: never a task's words).
      */
     fun run(name: String?, input: Map<String, String?>, boot: () -> Calls, post: (JSONObject) -> Unit, refreshWidgets: () -> Unit,
-            log: (String, JSONObject) -> Unit): Outcome {
+            log: (String, JSONObject) -> Unit, syncAgain: () -> Unit = {}): Outcome {
         val line = JSONObject().put("job", name ?: JSONObject.NULL)
         if (name !in JOBS) {
             log(LINE, line.put("outcome", "unknown"))
@@ -65,7 +81,19 @@ internal object CoreJob {
             val host = boot()
             if (!host.recover() || !host.drain()) Outcome.Retry
             else when (name) {
-                INGEST -> Outcome.Success
+                INGEST -> {
+                    runCatching { host.backgroundSync("capture") }
+                        .onFailure { line.put("error", (it.message ?: it.javaClass.simpleName).substringBefore(':')) }
+                    Outcome.Success
+                }
+                SYNC -> {
+                    val again = if (host.appActive()) {
+                        line.put("skipped", "foreground")
+                        true
+                    } else host.backgroundSync("scheduled").optBoolean("schedule")
+                    if (again) syncAgain()
+                    Outcome.Success
+                }
                 REMINDERS -> {
                     host.reminders(input["mode"] ?: "cycle", input["key"].orEmpty())
                     Outcome.Success

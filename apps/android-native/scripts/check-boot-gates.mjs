@@ -731,7 +731,7 @@ const kotlinFiles = [activity, model, owner, editorUi, focusUi, projectsUi, labe
 assert.equal(kotlinFiles.join('\n').match(/(?<!class )CoreHost\(/g).length, 1);
 // The dev build keeps its own database. The upgradetest build gets the RN database and RN's state
 // only from the guard, before CoreHost exists: before any open of it, the checkpoint, and any core write.
-assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val installer = HostInstaller\(app\.filesDir, app\.cacheDir\)\s*val keyValue = RnKeyValue\(app\.getDatabasePath\("RKStorage"\)\)\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}, HostIo\(app\),\s*File\(app\.filesDir, "journal"\), deviceStore\(app\),\s*File\(app\.filesDir, DiagnosticsLogFile\.RELATIVE_PATH\),\s*keyValue, HostFiles\(app\.filesDir, app\.cacheDir, content = AndroidContentSource\(app\)\), installer,\s*ReminderAlarms\(app, keyValue, checkpointRnState = \{ if \(legacy != null\) LegacyRnStoreGuard\.checkpointRnState\(app\.dataDir\) \}\),\s*HostWidgets\(app\) \{ appState \}\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
+assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val installer = HostInstaller\(app\.filesDir, app\.cacheDir\)\s*val keyValue = RnKeyValue\(app\.getDatabasePath\("RKStorage"\)\)\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}, HostIo\(app\),\s*File\(app\.filesDir, "journal"\), deviceStore\(app\),\s*File\(app\.filesDir, DiagnosticsLogFile\.RELATIVE_PATH\),\s*keyValue, HostFiles\(app\.filesDir, app\.cacheDir, content = AndroidContentSource\(app\)\), installer,\s*ReminderAlarms\(app, keyValue, checkpointRnState = \{ if \(legacy != null\) LegacyRnStoreGuard\.checkpointRnState\(app\.dataDir\) \}\),\s*HostWidgets\(app\) \{ appState \},\s*scheduleBackgroundSync = \{ on -> CoreWork\.scheduleSync\(app, on\) \}\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
 // RN's installer journal recovery runs at boot after the validated load and before the journal's replay, the first write that
 // can reach files/attachments (pass A2); it is RN's own Kotlin, compiled as it is.
 assert.match(owner, /loadTheme\(runtime, legacy\?\.theme\)\s*(?:\/\/[^\n]*\n\s*)*recoverInstalls\(installer\)\s*if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)/);
@@ -854,7 +854,7 @@ assert.match(model, /ProcessCoreHost\.get\(/);
 // Storage exceptions never cross the QuickJS JNI boundary.
 assert.equal(coreHost.match(/JSCallFunction \{/g).length, 1, 'the only JS callback constructor is guarded');
 const bridgeCallbacks = coreHost.match(/bridge\.setProperty\([^\n]*/g);
-assert.equal(bridgeCallbacks.length, 40, 'the SQL calls, trace, nowMs, randomBytes, rnStateCommit, collationKey, dateTimeFormat, log, the fetch, secret and sync crypto calls, logFile, the key-value calls, hostEvent, the queue\'s file calls the attachment file, delete, abort and installer calls and the reminder alarms\' calls: and the widgets\' three calls: each guarded');
+assert.equal(bridgeCallbacks.length, 41, 'the SQL calls, trace, nowMs, randomBytes, rnStateCommit, collationKey, dateTimeFormat, log, the fetch, secret and sync crypto calls, logFile, the key-value calls, hostEvent, the queue\'s file calls the attachment file, delete, abort and installer calls and the reminder alarms\' calls: and the widgets\' three calls, and the background sync\'s schedule: each guarded');
 assert(bridgeCallbacks.includes('bridge.setProperty("fileAbort", guarded { args -> io.fileAbort(args[0] as String); null })'));
 assert(bridgeCallbacks.includes('bridge.setProperty("fileDeleteNow", guarded { args -> files.deleteNow(args[0] as String); null })'));
 // The attachment file port and the installer only start their call on the engine thread; HostIo's files thread runs it.
@@ -1116,7 +1116,7 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
         assert.match(coreHost, /if \(debugFault\("ai_consent_reset"\) == "1"\) keyValue\.remove\("mindwtr-ai-provider-consent-v1"\)/);
     }
     // Core's AI device binds RN's stores (host-ai.ts): the refused secret calls (an AI key is no sync commit), RN's AsyncStorage.
-    assert.match(hostEntry, /const nativeAI = nativeSync \? createNativeAI\(keyValue, \(\) => globalThis\.__mindwtrSecrets as HostSecrets\) : null;/);
+    assert.match(hostEntry, /const nativeAI = nativeSync \? createNativeAI\(keyValue, \(\) => globalThis\.__mindwtrSecrets as HostSecrets, isFossBuild\) : null;/);
     assert.match(hostEntry, /const localAttachments = nativeSync \? null : createNativeLocalAttachmentsForHost\(\);/);
     assert.match(hostEntry, /const attachmentsHost = nativeSync\?\.attachmentsHost \?\? localAttachments\?\.contractHost;/);
     assert.match(hostEntry, /createNativeHostContract\(\{ \.\.\.\(nativeSync \? \{ syncSettings: nativeSync\.settingsHost \} : \{\}\), \.\.\.\(nativeAI \? \{ ai: nativeAI \} : \{\}\),\s*\.\.\.\(attachmentsHost \? \{ attachments: attachmentsHost \} : \{\}\) \}\)/);
@@ -1188,8 +1188,11 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
         // only an unjournaled write or a read, so no journaled write can skip the journal through it.
         assert.match(journalKt, /fun unjournaled\(method: String, args: List<Any\?>\): Boolean = method in WRITES && key\(method, args\) in UNJOURNALED/);
         assert.match(coreHost, /private fun callLong\(method: String, vararg args: Any\?, handle: LongCall = LongCall\(\)\): JSONObject \{\s+require\(method !in WriteJournal\.WRITES \|\| WriteJournal\.unjournaled\(method, args\.toList\(\)\)\)/);
-        assert.deepEqual([...coreHost.matchAll(/\bcallLong\("(\w+)"/g)].map((m) => m[1]), ['menuCommand', 'aiRequest', 'attachmentRequest'],
-            'only Settings › Sync\'s commands, the AI\'s requests and the attachments\' downloads take the long path');
+        assert.deepEqual([...coreHost.matchAll(/\bcallLong\("(\w+)"/g)].map((m) => m[1]), ['backgroundSync', 'menuCommand', 'aiRequest', 'attachmentRequest'],
+            'only CoreWork\'s background sync run, Settings › Sync\'s commands, the AI\'s requests and the attachments\' downloads take the long path');
+        // S4a: CoreWork's background run (core's runner) is a read-and-sync like Sync now: no journaled write.
+        assert.match(coreHost, /fun backgroundSync\(trigger: String, stored: Int\): JSONObject =\s+callLong\("backgroundSync", trigger, stored, debugFault\("bgsync_deadline_ms"\)\.toIntOrNull\(\) \?: 0\)/);
+        assert(!writes.includes('backgroundSync'), 'a background sync run is no journaled write');
         assert.match(coreHost, /fun attachmentRequest\(name: String, json: String\): JSONObject = callLong\("attachmentRequest", name, json\)/);
         assert(!writes.includes('attachmentRequest'), 'an attachment request is no journaled write');
         assert.match(coreHost, /fun syncCommand\(name: String, json: String\): JSONObject = callLong\("menuCommand", name, json\)/);
@@ -1265,12 +1268,15 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
     // drain (ProcessCoreHost.recovered), or once the owed journal retry went through; nothing else starts them.
     assert.match(owner, /loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.hold\(runtime\)\s+return runtime/);
     assert.equal([activity, model, owner, menuModel].join('\n').match(/syncStart\(/g).length, 1, 'one start of the triggers, in startSync');
-    assert.equal([activity, model, owner, menuModel].join('\n').match(/startSync\(app, runtime\)/g).length, 1, 'startSync only in recovered, after the drain (at once, or held for the first screen\'s content)');
+    assert.equal([activity, model, owner, menuModel].join('\n').match(/startSync\(app, runtime\)/g).length, 3, 'startSync only in recovered, after the drain (held for the first screen\'s content, or CoreWork\'s through startSyncWithScreen)');
     // Startup follow-up: the boot's start is held until the first screen shows its content: the Inbox's first rows (contentShown),
     // another tab's boot read, or a 3 s fallback; CoreWork's and the owed retry's start at once. One start at a time.
     // The reminder alarms start with sync (pass R1), held with it.
-    assert.match(owner, /startSync = \{\s+val start = \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+if \(deferSync\) deferredSync\.set\(start\) else start\(\)\s+\},/);
-    assert.match(owner, /fun startDeferredSync\(trigger: String = "content"\) \{\s+deferredSync\.getAndSet\(null\)\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.take\(\)\?\.let \{ publishHeldWidgets\(it, trigger\) \}\s+\}/, 'the boot\'s widget publication waits with its sync start');
+    assert.match(owner, /startSync = \{\s+if \(deferSync\) deferredSync\.set \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\} else \{\s+startSyncWithScreen\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+\},/);
+    assert.match(owner, /fun startDeferredSync\(trigger: String = "content"\) \{\s+synchronized\(deferredSync\) \{\s+screenShown = true\s+deferredSync\.getAndSet\(null\)\s+\}\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.take\(\)\?\.let \{ publishHeldWidgets\(it, trigger\) \}\s+\}/, 'the boot\'s widget publication waits with its sync start');
+    // S4a: a process no screen showed in (a CoreWork job's) starts no triggers: as RN's headless runs, it syncs only through core's
+    // background run, which the job awaits. Once a screen showed, CoreWork's recovery starts them at once.
+    assert.match(owner, /private fun startSyncWithScreen\(app: Application, runtime: CoreHost\) \{\s+val now = synchronized\(deferredSync\) \{\s+(?:\/\/[^\n]*\s+)*if \(!screenShown\) deferredSync\.compareAndSet\(null\) \{ startSync\(app, runtime\) \}\s+screenShown\s+\}\s+if \(now\) startSync\(app, runtime\)\s+\}/);
     assert.match(owner, /fun contentShown\(\) \{\s+startDeferredSync\(\)/);
     assert.match(owner, /private fun startSync\(app: Application, runtime: CoreHost\): Unit = synchronized\(syncLock\) \{\s+if \(syncHost != null\) return/);
     assert.match(model, /if \(screen != Screen\.Inbox\) ProcessCoreHost\.startDeferredSync\(\)\s+main\.postDelayed\(\{ ProcessCoreHost\.startDeferredSync\("boot-timeout"\) \}, SYNC_FALLBACK_MS\)/);
@@ -1513,14 +1519,40 @@ assert.match(owner, /runtime\.language\(stored \?: "", Locale\.getDefault\(\)\.t
 assert.match(owner, /runtime\.start\([^\n]*\)\s+setLanguage\(runtime, language \?: legacy\?\.language\)\s+loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.hold\(runtime\)\s+return runtime/);
 // After a finished replay (the boot's, the owed retry's, CoreWork's): the queue drain, then sync (StartOrder, StartOrderTest). Any
 // drain that did not finish becomes the screens' owed journal retry, holds sync back, and CoreWork retries it.
-assert.match(owner, /fun recovered\(app: Application, runtime: CoreHost, deferSync: Boolean = false\): Boolean = StartOrder\.afterReplay\(\s+drain = \{ drain\(runtime, queue\(app\), app\) \},\s+owe = \{ message -> recordFailure\(PendingFailure\(FailedAction\("journal", ""\), message, null\)\) \},\s+retryLater = \{ runCatching \{ CoreWork\.retryDrain\(app\) \}[^\n]*\},\s+(?:\/\/[^\n]*\s+)*startSync = \{\s+val start = \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+if \(deferSync\) deferredSync\.set\(start\) else start\(\)\s+\},\s+refreshWidgets = \{ refreshWidgets\(runtime\) \},\s+\)/);
+assert.match(owner, /fun recovered\(app: Application, runtime: CoreHost, deferSync: Boolean = false\): Boolean = StartOrder\.afterReplay\(\s+drain = \{ drain\(runtime, queue\(app\), app\) \},\s+owe = \{ message -> recordFailure\(PendingFailure\(FailedAction\("journal", ""\), message, null\)\) \},\s+retryLater = \{ runCatching \{ CoreWork\.retryDrain\(app\) \}[^\n]*\},\s+(?:\/\/[^\n]*\s+)*startSync = \{\s+if \(deferSync\) deferredSync\.set \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\} else \{\s+startSyncWithScreen\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+\},\s+refreshWidgets = \{ refreshWidgets\(runtime\) \},\s+\)/);
 assert.match(source('StartOrder.kt'), /Drain\.Done -> \{\s+startSync\(\)\s+return true\s+\}\s+Drain\.Unswept -> \{\s+startSync\(\)\s+(?:\/\/[^\n]*\s+)*refreshWidgets\(\)\s+retryLater\(\)\s+\}\s+Drain\.Waiting -> retryLater\(\)\s+is Drain\.Failed -> \{\s+owe\(result\.message\)\s+retryLater\(\)\s+\}/);
 assert.match(source('CoreWork.kt'), /fun retryDrain\(context: Context\) = enqueue\(context, CoreJob\.INGEST, emptyMap\(\), ExistingWorkPolicy\.KEEP\)/, 'a retry never cancels a running drain');
+// S4a: the background sync job, as RN's expo-background-task worker: core's interval, a network, its next run appended after it; a
+// reconcile keeps a queued or running job (KEEP: RN's #1001 fix), only core's "off" cancels it; RN's own worker is cancelled at every
+// process start. Core's runner and schedule decision on the host's ports are tested in bundle/host-sync.test.ts (bun), run here.
+{
+    const coreWork = source('CoreWork.kt');
+    const rnScheduler = readFileSync(resolve(app, '../../node_modules/expo-background-task/android/src/main/java/expo/modules/backgroundtask/BackgroundTaskScheduler.kt'), 'utf8');
+    const coreRunner = readFileSync(resolve(app, '../../packages/core/src/mobile-background-sync.ts'), 'utf8');
+    assert.equal(/const val RN_SYNC_WORK = "(\w+)"/.exec(coreWork)[1], /WORKER_IDENTIFIER = "(\w+)"/.exec(rnScheduler)[1], 'RN\'s worker name is Expo\'s');
+    assert.equal(/const val SYNC_INTERVAL_MINUTES = (\d+)L/.exec(coreWork)[1], /MOBILE_BACKGROUND_SYNC_MINIMUM_INTERVAL_MINUTES = (\d+);/.exec(coreRunner)[1], 'core\'s interval');
+    assert.match(rnScheduler, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
+    assert.match(coreWork, /\.setInitialDelay\(SYNC_INTERVAL_MINUTES, TimeUnit\.MINUTES\)\s+\.setConstraints\(Constraints\.Builder\(\)\.setRequiredNetworkType\(NetworkType\.CONNECTED\)\.build\(\)\)/);
+    assert.match(coreWork, /if \(on\) work\.enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.KEEP, syncRequest\(\)\) else work\.cancelUniqueWork\(SYNC_WORK\)/);
+    assert.match(coreWork, /enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.APPEND_OR_REPLACE, syncRequest\(\)\)/);
+    assert.equal(coreWork.match(/enqueueUniqueWork\(SYNC_WORK/g).length, 2, 'the sync job is queued only by core\'s decision and by its own run');
+    assert.match(coreWork, /syncAgain = \{ if \(!isStopped\) runCatching \{ syncAgain\(app\)/, 'a cancelled run queues no next one');
+    assert.match(source('MindwtrApplication.kt'), /runCatching \{ CoreWork\.cancelRnSync\(this\) \}/);
+    assert.match(hostEntry, /scheduleBackgroundSync: \(on\) => \{ const bridge = native\(\); if \(bridge\.bgSyncSchedule\) checked\(bridge\.bgSyncSchedule\(on\)\); \},/);
+    const tested = spawnSync('bun', ['test', 'apps/android-native/bundle/host-sync.test.ts'], { cwd: resolve(app, '../..'), encoding: 'utf8' });
+    assert.equal(tested.status, 0, `bundle/host-sync.test.ts: ${tested.stderr.slice(-1500)}`);
+    // D8: the channel is the build's flavor, read by core as RN's isFossBuild; no host passes a fixed false any more.
+    assert.match(readFileSync(resolve(app, 'android/app/build.gradle.kts'), 'utf8'), /create\("play"\) \{\s+dimension = "channel"\s+buildConfigField\("boolean", "FOSS", "false"\)\s+\}\s+create\("foss"\) \{\s+dimension = "channel"\s+buildConfigField\("boolean", "FOSS", "true"\)/);
+    assert.match(coreHost, /engine\.globalObject\.setProperty\("__mindwtrFossBuild", BuildConfig\.FOSS\)/);
+    assert.match(hostEntry, /const isFossBuild = globalThis\.__mindwtrFossBuild === true;/);
+    const bundleHosts = ['host-sync.ts', 'host-ai.ts'].map((name) => readFileSync(resolve(app, 'bundle', name), 'utf8')).join('\n');
+    assert.doesNotMatch(bundleHosts, /isFossBuild: false/, 'every host reads the flavor');
+}
 // The queue drain (RN's startup drain; CoreWork's ingest job too): after the journal replay, before any screen, entry point or
 // sync gets the host; never while a save is owed; a failed save becomes the journal's owed retry, which drains again.
 assert.match(owner, /fun queue\(app: Application\) = File\(app\.filesDir, PendingCaptureWriter\.DIRECTORY\)/, 'the queue is RN\'s writer\'s folder');
 assert.match(owner, /private fun drain\(runtime: CoreHost, queue: File, app: Application\): StartOrder\.Drain \{\s+if \(failure != null\) return StartOrder\.Drain\.Waiting\s+(?:\/\/[^\n]*\s+)*val unswept = runCatching \{ CheckoffStore\.sweep\(app\)\.failed > 0 \}[^\n]*\.getOrDefault\(true\)\s+if \(unswept\) runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "unswept"\)\)\s+val drained = if \(unswept\) StartOrder\.Drain\.Unswept else StartOrder\.Drain\.Done\s+when \(StartOrder\.queueEmpty\(queue\.list\(\), queue\.exists\(\)\)\) \{\s+true -> return drained\s+(?:\/\/[^\n]*\s+)*null -> \{\s+runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "unreadable"\)\)\s+return StartOrder\.Drain\.Unswept\s+\}\s+false -> Unit\s+\}\s+return try \{\s+val ingested = runtime\.ingestPendingCaptures\(UUID\.randomUUID\(\)\.toString\(\)\)/, 'a failed check-off sweep is retried, the queue still drained');
-assert.match(owner, /val ingested = [^\n]+\n[^\n]+"drained"[^\n]+\n\s+drained\n/);
+assert.match(owner, /val ingested = [^\n]+\n\s+imported\.addAndGet\(ingested\)\n[^\n]+"drained"[^\n]+\n\s+drained\n/, 'what a drain stored goes with CoreWork\'s next background run (S4a)');
 assert.match(owner, /\.put\("error", message\.substringBefore\(':'\)\)\)\s+StartOrder\.Drain\.Failed\(message\)/);
 // The runner's lines go through core's logger (logcat, and RN's diagnostics log file), their fields in context; a failure's code only.
 assert.match(owner, /runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "drained"\)\.put\("ingested", ingested\)\)/);
@@ -2822,7 +2854,8 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
             rmSync(scratch, { recursive: true, force: true });
         }
         assert.equal(gradle.match(/--allow-module-trace/g)?.length, 1, 'one place allows module hooks');
-        assert.match(gradle, /if \(name == "mergeBenchmarkTraceAssets"\) "--allow-module-trace"/, 'only benchmarkTrace\'s merged assets may carry them');
+        // Each channel's benchmarkTrace (mergePlayBenchmarkTraceAssets, mergeFossBenchmarkTraceAssets), no other variant.
+        assert.match(gradle, /if \(name\.endsWith\("BenchmarkTraceAssets"\)\) "--allow-module-trace"/, 'only benchmarkTrace\'s merged assets may carry them');
     }
     // RN's shortcuts from RN's own builder: the same ids, capabilities, labels and links, on the build's scheme; Add task opens
     // RN's quick capture dialog in the build's package, as RN's does (pass W1 brings it).

@@ -156,9 +156,9 @@ try {
     if (wanted.length === 0) console.log(`RN APKs cached for ${V132.slice(0, 12)} and ${RECOVERY_COMMIT.slice(0, 12)} / patch ${patchId}`);
 
     const nativeDir = resolve(repo, 'apps/android-native/android');
-    run('./gradlew', [':app:assembleUpgradetest', '--offline'], { cwd: nativeDir });
+    run('./gradlew', [':app:assemblePlayUpgradetest', '--offline'], { cwd: nativeDir });
     const nativeApk = resolve(apks, 'native-upgradetest-153.apk');
-    sign(resolve(nativeDir, 'app/build/outputs/apk/upgradetest/app-upgradetest.apk'), nativeApk);
+    sign(resolve(nativeDir, 'app/build/outputs/apk/play/upgradetest/app-play-upgradetest.apk'), nativeApk);
 
     const result = {
         package: PKG,

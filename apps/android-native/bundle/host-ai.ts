@@ -21,9 +21,9 @@ type Secrets = {
  * the same ones. The providers use the polyfill's fetch, which logs no URL (Gemini's model list puts the key in the query).
  * Core passes no key to the log. No offline Whisper model files until the Whisper pass (D4).
  */
-export const createNativeAI = (keyValue: KeyValue, secrets: () => Secrets): NativeAIHost => ({
-    // ponytail: the native app has no FOSS flavor yet (D8); the flavor pass sets this from the build.
-    platform: { isFossBuild: false },
+export const createNativeAI = (keyValue: KeyValue, secrets: () => Secrets, isFossBuild: boolean): NativeAIHost => ({
+    // The build's flavor (D8): a FOSS build defaults speech to offline Whisper and refuses cloud speech, as RN's.
+    platform: { isFossBuild },
     storage: {
         getItem: (key) => keyValue.get(key),
         setItem: (key, value) => keyValue.set(key, value),
