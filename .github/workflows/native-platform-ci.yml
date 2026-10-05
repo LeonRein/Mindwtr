@@ -758,6 +758,7 @@ jobs:
             -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
             -target "$(uname -m)-apple-ios15.1-simulator" \
             apps/mobile/widgets-ios/*.swift \
+            apps/mobile/modules/ios-widget/ios/MindwtrWidgetTaskItem.swift \
             apps/mobile/modules/ios-widget/ios/MindwtrWidgetActionStore.swift
 
       - name: Typecheck Watch receiver against the iOS SDK

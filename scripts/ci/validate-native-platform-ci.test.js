@@ -306,6 +306,7 @@ test("native CI typechecks all maintained widgets before the expensive host buil
   expect(command).toContain("-application-extension");
   expect(command).toContain("-apple-ios15.1-simulator");
   expect(command).toContain("apps/mobile/widgets-ios/*.swift");
+  expect(command).toContain("apps/mobile/modules/ios-widget/ios/MindwtrWidgetTaskItem.swift");
   expect(command).toContain("apps/mobile/modules/ios-widget/ios/MindwtrWidgetActionStore.swift");
 });
 
