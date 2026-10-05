@@ -92,6 +92,16 @@ public final class CoreHost: @unchecked Sendable {
     public func discardAttachmentDraft(requestJSON: String) async throws -> String {
         try await perform { try $0.discardAttachmentDraft(requestJSON: requestJSON) }
     }
+    public func finishAttachmentDraftDiscard(expectedSession: String, requestId: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.finishAttachmentDraftDiscard(expectedSession: expectedSession,
+                requestId: requestId, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func addAttachmentDraft(requestJSON: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
@@ -246,6 +256,54 @@ private enum TerminalResult: Codable {
 // ownership. The public facade holds only immutable references and schedules all
 // access here. No JSValue, JSContext or SQLite handle crosses this boundary.
 private final class Engine: @unchecked Sendable {
+    private static let ownedDiscardMethod = "attachmentOwnedDiscardFinish"
+    private static let ownedDiscardFailure = HostFailure("Attachment Discard could not be confirmed; retry the exact retained decision")
+    private struct OwnedDiscardJournal {
+        let session: String
+        let requestId: String
+        let fingerprint: String
+        let operationIDs: [String]
+        let record: NativeAttachmentDraftStore.Record?
+    }
+    private struct OwnedDiscardIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+    }
+    private final class OwnedDiscardTurn {
+        let generation: UInt64
+        let runtime: JSContext
+        let recordIdentity: OwnedDiscardIdentity?
+        var journalIdentity: OwnedDiscardIdentity?
+        init(generation: UInt64, runtime: JSContext, recordIdentity: OwnedDiscardIdentity?) {
+            self.generation = generation; self.runtime = runtime; self.recordIdentity = recordIdentity
+        }
+    }
+    /// A leaked JS callback holds only a weak reference to this ephemeral slot.
+    /// Consume before any authority check/IO; even failed or duplicate entries
+    /// cannot acquire a second retirement. Invalidation drops captured proofs.
+    private final class OwnedDiscardCallbackLease {
+        var active = true
+        var consumed = false
+        var failed = false
+        var outcome: String?
+        var work: ((Bool) throws -> String)?
+        func enter(referenced: Bool) -> String {
+            guard active, !consumed, let work else {
+                failed = true
+                return "!MindwtrNativeError:Attachment Discard callback is unavailable"
+            }
+            consumed = true
+            do {
+                let value = try work(referenced)
+                outcome = value
+                return "{\"outcome\":\"" + value + "\"}"
+            } catch {
+                failed = true
+                return "!MindwtrNativeError:Attachment Discard callback is unavailable"
+            }
+        }
+        func invalidate() { active = false; work = nil }
+    }
     private static let ownedSaveMethod = "attachmentOwnedSaveCommit"
     private static let ownedSaveMaximumBytes = 8 * 1024 * 1024
     private static let ownedSaveRejectionBytes = 64 * 1024
@@ -516,8 +574,11 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func loadPendingJournal(checkingEditorSnapshot: Bool = true) throws -> PendingCommand? {
-        guard FileManager.default.fileExists(atPath: journalURL.path) else { return nil }
-        let journalData = try Data(contentsOf: journalURL)
+        // Preserve legacy grammar/size limits, but read the same validated
+        // no-follow descriptor so corrupt FIFO/symlink entries cannot hang boot
+        // or redirect the read after a separate path check.
+        guard let journalData = try readJournalBytes(maximumBytes: nil,
+            failure: HostFailure("Invalid pending command journal"), singleLink: false) else { return nil }
         guard let raw = try NativeJSON.jsonObject(with: journalData) as? [String: Any],
               Set(raw.keys).isSubset(of: ["version", "method", "argumentsJSON", "terminal", "editorDraft"]),
               raw["editorDraft"] == nil || (raw["editorDraft"] as? [String: Any]).map({
@@ -527,7 +588,9 @@ private final class Engine: @unchecked Sendable {
             throw HostFailure("Invalid pending command journal")
         }
         guard saved.version == 2 else { throw HostFailure("Unsupported pending command journal; raw captures cannot be safely replanned") }
-        if saved.method == Self.ownedSaveMethod {
+        if saved.method == Self.ownedDiscardMethod {
+            _ = try decodeOwnedDiscardJournal(journalData, checkingNative: true)
+        } else if saved.method == Self.ownedSaveMethod {
             _ = try decodeOwnedSaveJournal(journalData, checkingNative: true)
         } else if saved.method == "projectLifecycleCommit" {
             _ = try projectLifecycleJournalArguments(saved)
@@ -1471,22 +1534,25 @@ private final class Engine: @unchecked Sendable {
     /// Only used by the new owned command's mutation guards. The legacy
     /// journal loader and its historical transport limits remain unchanged.
     private func ownedJournalBytes() throws -> Data? {
+        try readJournalBytes(maximumBytes: Self.ownedSaveMaximumBytes, failure: Self.ownedSaveFailure, singleLink: true)
+    }
+    private func readJournalBytes(maximumBytes: Int?, failure: HostFailure, singleLink: Bool) throws -> Data? {
         let fd = open(journalURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0 {
             if errno == ENOENT { return nil }
-            throw Self.ownedSaveFailure
+            throw failure
         }
         defer { Darwin.close(fd) }
         var before = stat()
-        guard fstat(fd, &before) == 0, (before.st_mode & S_IFMT) == S_IFREG, before.st_nlink == 1,
-              before.st_size >= 0, before.st_size <= Int64(Self.ownedSaveMaximumBytes) else { throw Self.ownedSaveFailure }
+        guard fstat(fd, &before) == 0, (before.st_mode & S_IFMT) == S_IFREG, !singleLink || before.st_nlink == 1,
+              before.st_size >= 0, maximumBytes.map({ before.st_size <= Int64($0) }) ?? true else { throw failure }
         var result = Data(), buffer = Data(count: 64 * 1024)
         while true {
             let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
             if count < 0 && errno == EINTR { continue }
-            guard count >= 0 else { throw Self.ownedSaveFailure }
+            guard count >= 0 else { throw failure }
             if count == 0 { break }
-            guard result.count + count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+            guard maximumBytes.map({ result.count + count <= $0 }) ?? true else { throw failure }
             result.append(buffer.prefix(count))
         }
         var after = stat(), named = stat()
@@ -1497,20 +1563,24 @@ private final class Engine: @unchecked Sendable {
                 && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
         }
         guard result.count == Int(before.st_size), fstat(fd, &after) == 0, lstat(journalURL.path, &named) == 0,
-              same(before, after), same(after, named) else { throw Self.ownedSaveFailure }
+              same(before, after), same(after, named) else { throw failure }
         return result
     }
     private func ownedEncoded<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; return try encoder.encode(value)
     }
+    private func decodeOwnedJournal(_ data: Data, method: String) throws -> PendingCommand {
+        if method == Self.ownedDiscardMethod { return try decodeOwnedDiscardJournal(data, checkingNative: false) }
+        return try decodeOwnedSaveJournal(data, checkingNative: false)
+    }
     private func requireOwnedJournalOnDisk(_ command: PendingCommand) throws {
         guard let data = try ownedJournalBytes() else { throw Self.ownedSaveFailure }
-        let actual = try decodeOwnedSaveJournal(data, checkingNative: false)
+        let actual = try decodeOwnedJournal(data, method: command.method)
         guard try ownedEncoded(actual) == ownedEncoded(command) else { throw Self.ownedSaveFailure }
     }
     private func requireOwnedJournalWriteIdentity(_ command: PendingCommand) throws {
         guard let bytes = try ownedJournalBytes() else { return }
-        let actual = try decodeOwnedSaveJournal(bytes, checkingNative: false)
+        let actual = try decodeOwnedJournal(bytes, method: command.method)
         var before = actual, after = command; before.terminal = nil; after.terminal = nil
         guard try ownedEncoded(before) == ownedEncoded(after) else { throw Self.ownedSaveFailure }
         if let terminal = actual.terminal {
@@ -1582,6 +1652,283 @@ private final class Engine: @unchecked Sendable {
         if lstat(journalURL.path, &info) == 0 { return false }
         guard errno == ENOENT else { throw Self.ownedSaveFailure }
         return true
+    }
+
+    private static func ownedDiscardUUID(_ value: Any?) -> String? {
+        guard let value = value as? String, UUID(uuidString: value)?.uuidString.lowercased() == value else { return nil }
+        return value
+    }
+    private func ownedDiscardJournal(_ command: PendingCommand, checkingNative: Bool = true) throws -> OwnedDiscardJournal {
+        guard command.version == 2, command.method == Self.ownedDiscardMethod, command.editorDraft == nil,
+              try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes,
+              command.argumentsJSON.utf8.count <= Self.ownedSaveMaximumBytes,
+              let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
+              let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
+              Set(wrapper.keys) == Set(["version", "sessionID", "requestId", "recordSHA256", "operationIDs"]),
+              Self.isInteger(wrapper["version"], equalTo: 1),
+              let session = Self.ownedDiscardUUID(wrapper["sessionID"]), let id = Self.ownedDiscardUUID(wrapper["requestId"]),
+              let fingerprint = wrapper["recordSHA256"] as? String, fingerprint.utf8.count == 64,
+              fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              let ids = wrapper["operationIDs"] as? [String], ids.count <= 128, Set(ids).count == ids.count,
+              ids.allSatisfy({ Self.ownedDiscardUUID($0) != nil && $0 != id }) else { throw Self.ownedDiscardFailure }
+        if let terminal = command.terminal {
+            guard case .success(let value) = terminal else { throw Self.ownedDiscardFailure }
+            try validateOwnedDiscardResult(value, session: session, requestId: id, operationIDs: ids)
+        }
+        let record = checkingNative ? try NativeAttachmentDraftStore(databaseURL: databaseURL).read() : nil
+        if checkingNative {
+            guard try editorDrafts.read() == nil else { throw Self.ownedDiscardFailure }
+            if let record {
+                guard Self.ownedEqual(try NativeAttachmentDraftStore.ownedDiscardFingerprint(record), fingerprint),
+                      Self.ownedEqual(record.session.sessionID, session), record.discard.map({ Self.ownedEqual($0.requestId, id) }) == true,
+                      record.operations.map(\.requestId) == ids,
+                      record.operations.allSatisfy({ [.published, .resultDurable, .checkpointed].contains($0.phase)
+                          && $0.stage != nil && $0.published != nil }) else { throw Self.ownedDiscardFailure }
+            } else {
+                guard case .success = command.terminal else { throw Self.ownedDiscardFailure }
+            }
+        }
+        return OwnedDiscardJournal(session: session, requestId: id, fingerprint: fingerprint, operationIDs: ids, record: record)
+    }
+    private func validateOwnedDiscardResult(_ value: String, session: String, requestId: String, operationIDs: [String]) throws {
+        guard value.utf8.count <= 64 * 1024,
+              let result = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any],
+              Set(result.keys) == Set(["version", "status", "sessionID", "requestId", "operations"]),
+              Self.isInteger(result["version"], equalTo: 1), result["status"] as? String == "released",
+              let actualSession = result["sessionID"] as? String, Self.ownedEqual(actualSession, session),
+              let actualID = result["requestId"] as? String, Self.ownedEqual(actualID, requestId),
+              let operations = result["operations"] as? [[String: Any]], operations.count == operationIDs.count else { throw Self.ownedDiscardFailure }
+        for (operation, id) in zip(operations, operationIDs) {
+            guard Set(operation.keys) == Set(["requestId", "target", "stage"]), operation["requestId"] as? String == id,
+                  let target = operation["target"] as? String, ["removed", "absent", "referenced"].contains(target),
+                  let stage = operation["stage"] as? String, ["removed", "missing"].contains(stage) else { throw Self.ownedDiscardFailure }
+        }
+    }
+    private func decodeOwnedDiscardJournal(_ data: Data, checkingNative: Bool) throws -> PendingCommand {
+        guard data.count <= Self.ownedSaveMaximumBytes,
+              let raw = try NativeJSON.jsonObject(with: data) as? [String: Any],
+              Set(raw.keys) == Set(["version", "method", "argumentsJSON"] + (raw["terminal"] == nil ? [] : ["terminal"])),
+              Self.isInteger(raw["version"], equalTo: 2),
+              let command = try? JSONDecoder().decode(PendingCommand.self, from: data), command.method == Self.ownedDiscardMethod else { throw Self.ownedDiscardFailure }
+        if let terminal = raw["terminal"] {
+            guard let object = terminal as? [String: Any], Set(object.keys) == Set(["success"]),
+                  let body = object["success"] as? [String: Any], Set(body.keys) == Set(["_0"]), body["_0"] is String else { throw Self.ownedDiscardFailure }
+        }
+        _ = try ownedDiscardJournal(command, checkingNative: checkingNative)
+        return command
+    }
+    private func ownedDiscardIdentity(_ url: URL) throws -> OwnedDiscardIdentity? {
+        var info = stat()
+        if lstat(url.path, &info) < 0 {
+            if errno == ENOENT { return nil }
+            throw Self.ownedDiscardFailure
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1 else { throw Self.ownedDiscardFailure }
+        return .init(device: info.st_dev, inode: info.st_ino)
+    }
+    private func ownedDiscardTurn(_ command: PendingCommand) throws -> OwnedDiscardTurn {
+        guard started, !closed, lockFD >= 0, let context else { throw Self.ownedDiscardFailure }
+        let identity = try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url)
+        let captured = try ownedDiscardJournal(command)
+        guard (captured.record == nil) == (identity == nil),
+              try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == identity else { throw Self.ownedDiscardFailure }
+        return .init(generation: attachmentGeneration, runtime: context, recordIdentity: identity)
+    }
+    private func requireOwnedDiscardAuthority(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                             cancellation: NativeAttachmentCancellation,
+                                             terminalPromotion: Bool = false, sidecarAbsent: Bool = false) throws -> OwnedDiscardJournal {
+        dispatchPrecondition(condition: .onQueue(queue))
+        try cancellation.check()
+        guard started, !closed, lockFD >= 0, attachmentGeneration == turn.generation, context === turn.runtime,
+              let current = pending, try ownedEncoded(current) == ownedEncoded(command) else { throw Self.ownedDiscardFailure }
+        if terminalPromotion { try requireOwnedJournalWriteIdentity(command) }
+        else { try requireOwnedJournalOnDisk(command) }
+        guard let identity = try ownedDiscardIdentity(journalURL), identity == turn.journalIdentity else { throw Self.ownedDiscardFailure }
+        let captured = try ownedDiscardJournal(command)
+        let actualIdentity = try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url)
+        if captured.record != nil {
+            guard actualIdentity == turn.recordIdentity else { throw Self.ownedDiscardFailure }
+        } else { guard actualIdentity == nil else { throw Self.ownedDiscardFailure } }
+        if sidecarAbsent { guard captured.record == nil else { throw Self.ownedDiscardFailure } }
+        return captured
+    }
+    private func ownedDiscardResult(_ captured: OwnedDiscardJournal, operations: [[String: String]]) throws -> String {
+        let value = try Self.ownedJSON(["version": 1, "status": "released", "sessionID": captured.session,
+            "requestId": captured.requestId, "operations": operations] as [String: Any])
+        try validateOwnedDiscardResult(value, session: captured.session, requestId: captured.requestId, operationIDs: captured.operationIDs)
+        return value
+    }
+    private func preflightOwnedDiscard(_ command: PendingCommand) throws {
+        let captured = try ownedDiscardJournal(command, checkingNative: false)
+        let reserved = try ownedDiscardResult(captured, operations: captured.operationIDs.map {
+            ["requestId": $0, "target": "referenced", "stage": "removed"]
+        })
+        var terminal = command; terminal.terminal = .success(reserved)
+        for candidate in [command, terminal] {
+            guard try JSONEncoder().encode(candidate).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedDiscardFailure }
+        }
+    }
+
+    func finishAttachmentDraftDiscard(expectedSession: String, requestId: String,
+                                      cancellation: NativeAttachmentCancellation) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        do {
+            guard started, !closed, !recoveryActivationPending, pending == nil,
+                  Self.ownedDiscardUUID(expectedSession) != nil, Self.ownedDiscardUUID(requestId) != nil,
+                  let record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
+                  Self.ownedEqual(record.session.sessionID, expectedSession),
+                  record.discard.map({ Self.ownedEqual($0.requestId, requestId) }) == true else { throw Self.ownedDiscardFailure }
+            let fingerprint = try NativeAttachmentDraftStore.ownedDiscardFingerprint(record)
+            let wrapper = try Self.ownedJSON(["version": 1, "sessionID": expectedSession, "requestId": requestId,
+                "recordSHA256": fingerprint, "operationIDs": record.operations.map(\.requestId)] as [String: Any])
+            let command = PendingCommand(version: 2, method: Self.ownedDiscardMethod,
+                argumentsJSON: String(decoding: try JSONEncoder().encode([wrapper]), as: UTF8.self))
+            let turn = try ownedDiscardTurn(command)
+            let coordinator = try ownedSaveCoordinatorForWork()
+            _ = try coordinator.prepareOwnedDiscardCandidates(record)
+            try preflightOwnedDiscard(command)
+            try cancellation.check()
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.beforeDiscardFinishJournal)
+            #endif
+            guard pending == nil, try ownedJournalIsAbsent(),
+                  try ownedDiscardIdentity(NativeAttachmentDraftStore(databaseURL: databaseURL).url) == turn.recordIdentity else { throw Self.ownedDiscardFailure }
+            _ = try ownedDiscardJournal(command)
+            pending = command
+            try persist(command)
+            turn.journalIdentity = try ownedDiscardIdentity(journalURL)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterDiscardFinishJournal)
+            #endif
+            _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            return try executeOwnedDiscard(command, cancellation: cancellation, turn: turn).value()
+        } catch { throw Self.ownedDiscardFailure }
+    }
+
+    /// The native callbacks complete before JSC returns and drains microtasks.
+    /// No invoke, timer pumping, diagnostic or JSC value enters the file queue.
+    private func ownedDiscardTargetHandoff(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                           op: NativeAttachmentDraftStore.Operation,
+                                           coordinator: NativeAttachmentDraftCoordinator,
+                                           cancellation: NativeAttachmentCancellation) throws -> String {
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        guard let host = turn.runtime.objectForKeyedSubscript("MindwtrHost"), !invoking else { throw Self.ownedDiscardFailure }
+        let lease = OwnedDiscardCallbackLease()
+        lease.work = { [weak self] referenced in
+            guard let self else { throw Self.ownedDiscardFailure }
+            _ = try self.requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            let outcome = referenced ? "referenced" : try coordinator.retireOwnedDiscardTarget(op, cancellation: cancellation)
+            _ = try self.requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            return outcome
+        }
+        let keep: @convention(block) () -> String = { [weak lease] in
+            lease?.enter(referenced: true) ?? "!MindwtrNativeError:Attachment Discard callback is unavailable"
+        }
+        let retire: @convention(block) () -> String = { [weak lease] in
+            lease?.enter(referenced: false) ?? "!MindwtrNativeError:Attachment Discard callback is unavailable"
+        }
+        invoking = true
+        defer { lease.invalidate(); invoking = false; scheduleAttachmentIdle(immediate: true) }
+        turn.runtime.exception = nil
+        let input = try Self.ownedJSON(["version": 1, "requestId": op.requestId, "targetURI": op.targetURI])
+        let returned = host.invokeMethod("attachmentDraftDiscardRetire", withArguments: [input, keep, retire])
+        // Never expose arbitrary JS exception content. A callback/outer failure
+        // keeps the journal even if an unlink already completed.
+        let threw = turn.runtime.exception != nil
+        turn.runtime.exception = nil
+        guard !threw, lease.consumed, !lease.failed, let outcome = lease.outcome,
+              let returned, returned.isString, let text = returned.toString(), text.utf8.count <= 1024,
+              let value = try NativeJSON.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              Set(value.keys) == Set(["outcome"]), value["outcome"] as? String == outcome else { throw Self.ownedDiscardFailure }
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        return outcome
+    }
+
+    private func executeOwnedDiscard(_ command: PendingCommand, cancellation: NativeAttachmentCancellation,
+                                     turn supplied: OwnedDiscardTurn? = nil) throws -> TerminalResult {
+        do {
+            let turn = try supplied ?? ownedDiscardTurn(command)
+            // Warm unknown writes are owed; identity guards forbid overwriting
+            // foreign evidence. Historical terminals never start file jobs.
+            if supplied == nil {
+                try persist(command)
+                turn.journalIdentity = try ownedDiscardIdentity(journalURL)
+            }
+            if command.terminal != nil { return try finishOwnedDiscardTerminal(command, turn: turn, cancellation: cancellation) }
+            let captured = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            guard let record = captured.record else { throw Self.ownedDiscardFailure }
+            let coordinator = try ownedSaveCoordinatorForWork()
+            let operations = try coordinator.prepareOwnedDiscardCandidates(record)
+            _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+            var outcomes: [[String: String]] = []
+            for (index, op) in operations.enumerated() {
+                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDiscardTarget(index))
+                #endif
+                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                let target = try ownedDiscardTargetHandoff(command, turn: turn, op: op, coordinator: coordinator, cancellation: cancellation)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDiscardTarget(index))
+                #endif
+                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeDiscardStage(index))
+                #endif
+                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                let stage = try coordinator.retireOwnedDiscardStage(op, cancellation: cancellation)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterDiscardStage(index))
+                #endif
+                _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+                outcomes.append(["requestId": op.requestId, "target": target, "stage": stage])
+            }
+            coordinator.drainOwnedSaveJobs()
+            var finished = command
+            finished.terminal = .success(try ownedDiscardResult(captured, operations: outcomes))
+            pending = finished
+            return try finishOwnedDiscardTerminal(finished, turn: turn, cancellation: cancellation)
+        } catch { throw Self.ownedDiscardFailure }
+    }
+
+    private func finishOwnedDiscardTerminal(_ command: PendingCommand, turn: OwnedDiscardTurn,
+                                            cancellation: NativeAttachmentCancellation) throws -> TerminalResult {
+        guard let terminal = command.terminal, case .success = terminal else { throw Self.ownedDiscardFailure }
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation, terminalPromotion: true)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardTerminal)
+        #endif
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation, terminalPromotion: true)
+        try persist(command)
+        turn.journalIdentity = try ownedDiscardIdentity(journalURL)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardTerminal)
+        #endif
+        let captured = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardRelease)
+        #endif
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation)
+        try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseDiscardedAddsMatching(fingerprint: captured.fingerprint)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardRelease)
+        #endif
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation, sidecarAbsent: true)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeDiscardJournalClear)
+        try faults?.journalRemove?()
+        #endif
+        _ = try requireOwnedDiscardAuthority(command, turn: turn, cancellation: cancellation, sidecarAbsent: true)
+        try DurableFile.remove(journalURL)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterDiscardJournalClear)
+        #endif
+        guard started, !closed, attachmentGeneration == turn.generation, context === turn.runtime,
+              let current = pending, try ownedEncoded(current) == ownedEncoded(command),
+              try ownedDiscardJournal(command).record == nil, try ownedJournalIsAbsent() else { throw Self.ownedDiscardFailure }
+        pending = nil
+        _ = try? invoke("attachmentDraftAcknowledged", arguments: ["discard-finish", "confirmed"])
+        return terminal
     }
 
     func saveAttachmentDraftAdds(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) throws -> String {
@@ -4531,6 +4878,9 @@ private final class Engine: @unchecked Sendable {
     private func resolvePending() throws -> TerminalResult? {
         guard started, !closed else { throw HostFailure("Core host is not ready; retry startup") }
         guard let command = pending else { return nil }
+        if command.method == Self.ownedDiscardMethod {
+            return try executeOwnedDiscard(command, cancellation: NativeAttachmentCancellation())
+        }
         if command.method == Self.ownedSaveMethod {
             if let terminal = command.terminal { return try finishOwnedSave(command, with: terminal) }
             // A failed warm write remains owed. Replay rejection is uncertain.
@@ -11775,15 +12125,20 @@ private final class Engine: @unchecked Sendable {
 
 
     private func persist(_ command: PendingCommand) throws {
-        if command.method == Self.ownedSaveMethod {
+        if command.method == Self.ownedSaveMethod || command.method == Self.ownedDiscardMethod {
             let data = try JSONEncoder().encode(command)
             guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
-            _ = try ownedSaveJournal(command, checkingNative: false)
+            if command.method == Self.ownedDiscardMethod { _ = try ownedDiscardJournal(command, checkingNative: false) }
+            else { _ = try ownedSaveJournal(command, checkingNative: false) }
             try requireOwnedJournalWriteIdentity(command)
+            let discardIdentity = command.method == Self.ownedDiscardMethod ? try ownedDiscardIdentity(journalURL) : nil
             #if DEBUG
             try faults?.journalWrite?()
             #endif
             try requireOwnedJournalWriteIdentity(command)
+            if command.method == Self.ownedDiscardMethod {
+                guard try ownedDiscardIdentity(journalURL) == discardIdentity else { throw Self.ownedDiscardFailure }
+            }
             try DurableFile.write(data, to: journalURL, privateDraft: true)
             return
         }

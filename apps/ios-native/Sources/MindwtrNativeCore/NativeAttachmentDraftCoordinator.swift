@@ -14,6 +14,10 @@ enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeSaveTerminal, afterSaveTerminal, beforeSaveEditorDetach, afterSaveEditorDetach
     case beforeSaveStage(Int), afterSaveStage(Int), beforeSaveRelease, afterSaveRelease
     case beforeSaveJournalClear, afterSaveJournalClear, beforeSaveThaw, afterSaveThaw
+    case beforeDiscardFinishJournal, afterDiscardFinishJournal
+    case beforeDiscardTarget(Int), afterDiscardTarget(Int), beforeDiscardStage(Int), afterDiscardStage(Int)
+    case beforeDiscardTerminal, afterDiscardTerminal, beforeDiscardRelease, afterDiscardRelease
+    case beforeDiscardJournalClear, afterDiscardJournalClear
 }
 final class AttachmentDraftHostHooks: @unchecked Sendable {
     var boundary: ((AttachmentDraftBoundary) throws -> Void)?
@@ -392,6 +396,59 @@ final class NativeAttachmentDraftCoordinator {
               ["removed", "missing"].contains(status) else { throw Self.failure }
     }
     func drainOwnedSaveJobs() { jobs.drain() }
+
+    /// Pure domain candidacy only. The Engine separately binds the detached
+    /// decision, exact journal/editor and native publication proofs for each IO.
+    func prepareOwnedDiscardCandidates(_ record: NativeAttachmentDraftStore.Record) throws -> [NativeAttachmentDraftStore.Operation] {
+        jobs.drain()
+        _ = try Store.ownedDiscardFingerprint(record)
+        guard record.operations.allSatisfy({ [.published, .resultDurable, .checkpointed].contains($0.phase)
+            && $0.stage != nil && $0.published != nil }) else { throw Self.failure }
+        try history(record)
+        let input: [String: Any] = ["version": 1, "historyVersion": record.version,
+            "taskID": record.session.taskID, "managedDirectoryURI": managedURI,
+            "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
+            "checkpointPayloadJSON": record.session.checkpoint.payloadJSON,
+            "operations": record.operations.map { ["phase": $0.phase.rawValue, "preparedJSON": $0.preparedJSON] }]
+        let response = try Self.object(invoke("attachmentDraftDiscardCandidates", [Self.json(input)]), limit: 4 * 1024 * 1024)
+        guard Set(response.keys) == Set(["version", "kind", "historyVersion", "taskID", "candidates"]),
+              Self.integer(response["version"]) == 1, response["kind"] as? String == "owned-add-discard-candidates",
+              Self.integer(response["historyVersion"]) == Int64(record.version),
+              let task = response["taskID"] as? String, Self.equal(task, record.session.taskID),
+              let candidates = response["candidates"] as? [[String: Any]], candidates.count == record.operations.count else { throw Self.failure }
+        for (candidate, op) in zip(candidates, record.operations) {
+            guard Set(candidate.keys) == Set(["requestId", "targetURI", "reason"]),
+                  let id = candidate["requestId"] as? String, Self.equal(id, op.requestId),
+                  let target = candidate["targetURI"] as? String, Self.equal(target, op.targetURI),
+                  candidate["reason"] as? String == "uncommitted-draft" else { throw Self.failure }
+        }
+        return record.operations
+    }
+
+    /// Synchronous typed completion only; this method never enters JSC. Called
+    /// inside the trusted live-reference handoff's native retirement callback.
+    func retireOwnedDiscardTarget(_ op: NativeAttachmentDraftStore.Operation,
+                                  cancellation: NativeAttachmentCancellation) throws -> String {
+        guard let proof = op.published else { throw Self.failure }
+        defer { jobs.drain() }
+        let value = try file(.retirePublished(targetURI: op.targetURI,
+            proof: .init(sha256: proof.sha256, size: proof.size, identity: proof.identity,
+                         directoryIdentity: proof.directoryIdentity)), cancellation: cancellation)
+        guard Set(value.keys) == Set(["status"]), let status = value["status"] as? String,
+              ["removed", "absent"].contains(status) else { throw Self.failure }
+        return status
+    }
+
+    func retireOwnedDiscardStage(_ op: NativeAttachmentDraftStore.Operation,
+                                 cancellation: NativeAttachmentCancellation) throws -> String {
+        guard let reserved = op.stage else { throw Self.failure }
+        defer { jobs.drain() }
+        let value = try file(.retirePrivateStage(stage: stage(reserved), targetURI: op.targetURI,
+            operationID: op.requestId.replacingOccurrences(of: "-", with: "")), cancellation: cancellation)
+        guard Set(value.keys) == Set(["status"]), let status = value["status"] as? String,
+              ["removed", "missing"].contains(status) else { throw Self.failure }
+        return status
+    }
 
     func add(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
         let request = try Self.request(raw, add: true)
