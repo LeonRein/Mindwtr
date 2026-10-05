@@ -397,6 +397,24 @@ describe('mobile sync service behind fake ports', () => {
     expect(performSyncCycle).toHaveBeenCalledTimes(2);
   });
 
+  it('ends a cycle the background run abandons at its deadline as a failure, with no follow-up', async () => {
+    const fake = createFakeHost({ values: WEBDAV_VALUES });
+    const service = createMobileSyncService(fake.host);
+    const performSyncCycle = vi.mocked(fake.host.core!.performSyncCycle!);
+    performSyncCycle.mockImplementationOnce(async () => {
+      expect(service.abortMobileSync('deadline')).toBe(true);
+      throw new Error('aborted');
+    });
+
+    const result = await service.performMobileSync();
+
+    expect(result.success).toBe(false);
+    expect(fake.logs.some((line) => line.message === 'Sync aborted at the background run\'s deadline')).toBe(true);
+    await service.waitForMobileSyncIdle();
+    // The background job retries later (its failure cooldown); no unowned cycle starts after it.
+    expect(performSyncCycle).toHaveBeenCalledTimes(1);
+  });
+
   it('never syncs a location this device holds as partly encrypted, manual or automatic', async () => {
     const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
     const scope = await readSyncLocationScope({ getItem: async (key: string) => fake.values.get(key) ?? null });

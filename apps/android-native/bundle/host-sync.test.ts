@@ -98,4 +98,27 @@ describe('native background sync binding', () => {
         expect((await deadline.fetch('http://a/3')).status).toBe(401);
         expect(fetches).toEqual(['http://a/1', 'http://a/3']);
     });
+
+    // About 35 s: the aborted cycle's WebDAV read retries (core's backoff) before it ends; none of them is sent (the signal is
+    // aborted, so the host's fetch refuses each before it starts).
+    it('a run abandoned at its deadline ends its cycle with no follow-up: the job, not a timer, retries it (review S4a 1)', async () => {
+        const sent: string[] = [];
+        globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_, reject) => {
+            const cancelled = () => reject(Object.assign(new Error('Request cancelled'), { name: 'AbortError' }));
+            if (init?.signal?.aborted) return cancelled();
+            sent.push(String(input));
+            init?.signal?.addEventListener('abort', cancelled);
+        })) as typeof fetch;
+        const { sync, kv, lines } = host({ [SYNC_BACKEND_KEY]: 'webdav', [WEBDAV_URL_KEY]: 'http://127.0.0.1:1/dav' });
+        await sync.backgroundSync('scheduled', 0, 50);
+        expect(lines).toContain('Mobile background sync did not finish before its deadline and was abandoned');
+        expect(JSON.parse(kv.get(BACKGROUND_SYNC_FAILURE_STATE_KEY)!).consecutiveFailures).toBe(1);
+        for (let waited = 0; waited < 50_000 && !lines.includes('Sync aborted at the background run\'s deadline'); waited += 500) {
+            await new Promise((done) => setTimeout(done, 500));
+        }
+        expect(lines).toContain('Sync aborted at the background run\'s deadline');
+        await new Promise((done) => setTimeout(done, 1_000));
+        expect(lines).not.toContain('Sync follow-up scheduled');
+        expect(sent).toHaveLength(1);
+    }, 60_000);
 });

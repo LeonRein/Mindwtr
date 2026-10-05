@@ -400,7 +400,8 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
         sync: {
             getConfigurationStatus: () => service.getMobileSyncConfigurationStatus(),
             performSync: () => performSync(undefined, {}),
-            abort: () => service.abortMobileSync(),
+            // The run's own abort: the cycle ends with no follow-up (a lifecycle abort would queue one that outlives the job).
+            abort: () => service.abortMobileSync('deadline'),
             setRequestDeadline: syncFetch.setDeadline,
         },
         flushPendingSave: () => flushPendingSave(),
