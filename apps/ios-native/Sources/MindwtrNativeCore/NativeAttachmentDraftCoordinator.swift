@@ -186,7 +186,8 @@ final class NativeAttachmentDraftCoordinator {
             : record.session.state == .cleanupPending ? "cleanupPending" : (record.operations.last?.reason == nil ? "active" : "uncertain")
         return try Self.json(["version": record.version, "status": status, "sessionID": record.session.sessionID,
                        "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(record.session.checkpoint), as: UTF8.self)),
-                       "operations": record.operations.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue, "reason": $0.reason.map { $0.rawValue as Any } ?? NSNull()] }])
+                       "operations": record.operations.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue, "reason": $0.reason.map { $0.rawValue as Any } ?? NSNull()] },
+                       "discard": record.discard.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue] as Any } ?? NSNull()])
     }
     private static func summary(_ record: Store.MixedRecord) throws -> String {
         let uncertain = record.operations.last.map { entry in
@@ -204,7 +205,8 @@ final class NativeAttachmentDraftCoordinator {
         }
         return try Self.json(["version": 3, "status": status, "sessionID": record.session.sessionID,
             "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(record.session.checkpoint), as: UTF8.self)),
-            "operations": operations])
+            "operations": operations,
+            "discard": record.discard.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue] as Any } ?? NSNull()])
     }
     func begin(session: String, generation: Int) throws -> String {
         try begin(session: session, generation: generation, version: 1)

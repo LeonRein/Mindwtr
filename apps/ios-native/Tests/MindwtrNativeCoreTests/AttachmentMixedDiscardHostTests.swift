@@ -717,4 +717,30 @@ final class AttachmentMixedDiscardHostTests: XCTestCase {
         XCTAssertEqual(try targets.map { try Data(contentsOf: $0) }, targetBytes)
         XCTAssertEqual(try targets.map { try inode($0) }, targetInodes)
     }
+
+    func testDiscardSummaryExposesExactDecisionAndDetachWithoutMutation() async throws {
+        let host = try await seed(), checkpoint = try latest(), requestID = UUID().uuidString.lowercased()
+        let raw = try discardRequest(checkpoint, id: requestID), beforeRows = try domain()
+        await boundary(.afterDiscardDecision, host: host)
+        await refused { _ = try await host.discardAttachmentDraftV3(requestJSON: raw) }
+        for phase in ["decided", "detached"] {
+            let retained = try Data(contentsOf: store.url), identity = try inode(store.url), editorBytes = try? Data(contentsOf: editor.url)
+            let summaryJSON = try await host.readAttachmentDraft(), summary = try object(summaryJSON)
+            XCTAssertEqual(Set(summary.keys), Set(["version", "status", "sessionID", "checkpoint", "operations", "discard"]))
+            let decision = try XCTUnwrap(summary["discard"] as? [String: Any])
+            XCTAssertEqual(Set(decision.keys), Set(["requestId", "phase"])); XCTAssertEqual(decision["requestId"] as? String, requestID)
+            XCTAssertEqual(decision["phase"] as? String, phase); XCTAssertEqual(summary["version"] as? Int, 3)
+            XCTAssertEqual(try record().session.state, .cleanupPending)
+            XCTAssertEqual(summary["status"] as? String, "cleanupPending")
+            XCTAssertEqual(try Data(contentsOf: store.url), retained); XCTAssertEqual(try inode(store.url), identity)
+            XCTAssertEqual(try? Data(contentsOf: editor.url), editorBytes); XCTAssertEqual(try domain(), beforeRows)
+            XCTAssertLessThanOrEqual(summaryJSON.utf8.count, 8 * 1024 * 1024)
+            if phase == "decided" {
+                await host.configureAttachmentDraftHost(AttachmentDraftHostHooks())
+                _ = try await host.discardAttachmentDraftV3(requestJSON: raw); XCTAssertEqual(try record().discard?.phase, .detached)
+            }
+        }
+        let decision = try record(); _ = try await finish(host, decision); try released()
+        let absent = try await host.readAttachmentDraft(); XCTAssertEqual(absent, "null"); XCTAssertEqual(try domain(), beforeRows)
+    }
 }

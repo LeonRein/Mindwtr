@@ -131,6 +131,16 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         let success = try XCTUnwrap((journalObject()["terminal"] as? [String: Any])?["success"] as? [String: Any])
         return try object(XCTUnwrap(success["_0"] as? String))
     }
+    private func recovery(_ raw: String, requestId: String? = nil) throws -> [String: Any] {
+        let window = try object(raw), value = try XCTUnwrap(window["recovery"] as? [String: Any])
+        XCTAssertEqual(Set(value.keys), Set(requestId == nil ? ["method", "result"] : ["method", "result", "requestId"]))
+        XCTAssertEqual(value["method"] as? String, "attachmentFileEditSaveCommit")
+        XCTAssertEqual(value["requestId"] as? String, requestId)
+        let result = try XCTUnwrap(value["result"] as? [String: Any])
+        XCTAssertEqual(result["id"] as? String, taskID); XCTAssertNotNil(result["draft"] as? [String: Any])
+        XCTAssertNil(result["phase"]); XCTAssertNil(result["targets"]); XCTAssertNil(result["stages"])
+        return value
+    }
     private func noWrites() -> HostIOFaults {
         let result = HostIOFaults(); result.beforeSQL = { statement in
             if ["INSERT INTO tasks", "UPDATE tasks", "DELETE FROM tasks"].contains(where: { statement.hasPrefix($0) }) { XCTFail("Terminal replay must not write tasks"); throw HostFailure("Unexpected write") }
@@ -211,7 +221,8 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         XCTAssertEqual(try rows(), before); XCTAssertEqual(try editor.read()?.snapshot, snapshot)
         XCTAssertEqual(try editor.read()?.attempt?.argumentsJSON, try json([raw])); XCTAssertNil(try journalObject()["terminal"])
         await host.close(); try probe("MindwtrHost.attachmentFileEditSavePrepare=function(){throw Error('Must not prepare replay')};")
-        let cold = core(); _ = try await cold.start(); try released()
+        let cold = core(); let recovered = try recovery(await cold.start()); try released()
+        XCTAssertEqual(((recovered["result"] as? [String: Any])?["draft"] as? [String: Any])?["title"] as? String, title)
         XCTAssertEqual(try task()["title"] as? String, title); XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(URL(string: added.targetURI)).path))
     }
     func testLostCommitAcknowledgementReplaysExactFullProofWithoutWritingAfterRows() async throws {
@@ -219,14 +230,18 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         faults.afterSQL = { if $0 == "COMMIT" { throw HostFailure("Injected lost complete ACK") } }
         await refused({ _ = try await self.save(host) }, saved: false)
         XCTAssertNil(try journalObject()["terminal"]); XCTAssertEqual(try task()["title"] as? String, title)
-        let saved = try rows(); await host.close(); let cold = core(noWrites()); _ = try await cold.start()
+        let saved = try rows(); await host.close(); let cold = core(noWrites()); let recovered = try recovery(await cold.start())
+        XCTAssertEqual(((recovered["result"] as? [String: Any])?["draft"] as? [String: Any])?["title"] as? String, title)
         XCTAssertEqual(try rows(), saved); try released()
+        let ordinary = try object(await cold.start()); XCTAssertNil(ordinary["recovery"])
     }
     func testDomainSavedColdCleanupAfterTaskCDoesNotReplayDomainEffect() async throws {
         let host = try await seed(); try await remove(host); await boundary(.afterSaveTerminal, host: host)
-        await refused({ _ = try await self.save(host) }, saved: true); XCTAssertEqual(try settlement()["phase"] as? String, "domainSaved")
+        let known = await refused({ _ = try await self.save(host) }, saved: true); XCTAssertEqual(try settlement()["phase"] as? String, "domainSaved")
+        let acknowledged = try object(XCTUnwrap(known?.resultJSON))
         await host.close(); _ = try sql("UPDATE tasks SET title='Task C',rev=rev+1 WHERE id=?", [taskID])
-        let c = try rows(), cold = core(noWrites()); _ = try await cold.start(); XCTAssertEqual(try rows(), c); try released()
+        let c = try rows(), cold = core(noWrites()); let recovered = try recovery(await cold.start())
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(acknowledged)); XCTAssertEqual(try rows(), c); try released()
         XCTAssertTrue(FileManager.default.fileExists(atPath: target().path), "Changed source keeps its referenced baseline file")
     }
     func testCompleteCancellationCleanupGateAndColdConfirmedUndoPreserveLaterAttachmentEdits() async throws {
@@ -237,13 +252,16 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         let result = try object(XCTUnwrap(pending?.resultJSON)); XCTAssertNotNil(result["cancellation"])
         let undo = try json([json(["requestId": UUID().uuidString.lowercased(), "cancelRequestId": cancelID])])
         await refused { _ = try await host.call("taskCancellationUndo", argumentsJSON: undo) }
-        await host.close(); let cold = core(); _ = try await cold.start(); try released()
+        await host.close(); let cold = core(); let recovered = try recovery(await cold.start(), requestId: cancelID); try released()
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(result))
+        let exposedID = try XCTUnwrap(recovered["requestId"] as? String)
+        let recoveredUndo = try json([json(["requestId": UUID().uuidString.lowercased(), "cancelRequestId": exposedID])])
         let cancelled = try task(); XCTAssertEqual(cancelled["status"] as? String, "archived")
         // After terminal release, unrelated later file metadata remains exact.
         let live = try XCTUnwrap(NativeJSON.jsonObject(with: Data(XCTUnwrap(cancelled["attachments"] as? String).utf8)) as? [[String: Any]])
         var later = live; var foreign = baseline(9); foreign["uri"] = "content://later/file"; later.append(foreign)
         _ = try sql("UPDATE tasks SET attachments=?,rev=rev+1 WHERE id=?", [json(later), taskID])
-        let value = try object(await cold.call("taskCancellationUndo", argumentsJSON: undo))
+        let value = try object(await cold.call("taskCancellationUndo", argumentsJSON: recoveredUndo))
         XCTAssertEqual(value["id"] as? String, taskID); XCTAssertEqual(try task()["status"] as? String, "next")
         XCTAssertEqual(try json(NativeJSON.jsonObject(with: Data(XCTUnwrap(task()["attachments"] as? String).utf8))), try json(later))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(URL(string: added.targetURI)).path))
@@ -271,7 +289,7 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
             let before = try latest(), sidecar = try Data(contentsOf: store.url), rowsBefore = try rows(), raw = try request()
             await boundary(.afterSaveFreeze, host: host); await refused({ _ = try await self.save(host, raw: raw) }, saved: false)
             XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path)); XCTAssertNotNil(try editor.read()?.attempt)
-            await host.close(); let cold = core(noWrites()); _ = try await cold.start()
+            await host.close(); let cold = core(noWrites()); let ordinary = try object(await cold.start()); XCTAssertNil(ordinary["recovery"])
             _ = try await cold.readEditorDraft()
             XCTAssertEqual(try latest(), before); XCTAssertNil(try editor.read()?.attempt)
             XCTAssertEqual(try Data(contentsOf: store.url), sidecar); XCTAssertEqual(try rows(), rowsBefore)
@@ -286,7 +304,7 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         XCTAssertNil(try journalObject()["terminal"]); XCTAssertEqual(try task()["title"] as? String, title)
         let sidecar = try Data(contentsOf: store.url), checkpoint = try Data(contentsOf: editor.url), pending = try Data(contentsOf: journal)
         await host.close(); _ = try sql("UPDATE tasks SET title='Task C',rev=rev+1 WHERE id=?", [taskID])
-        let c = try rows(), cold = core(noWrites()); await refused { _ = try await cold.start() }
+        let c = try rows(), cold = core(noWrites()); await refused({ _ = try await cold.start() }, saved: false)
         XCTAssertEqual(try rows(), c); XCTAssertEqual(try Data(contentsOf: journal), pending)
         XCTAssertEqual(try Data(contentsOf: editor.url), checkpoint); XCTAssertEqual(try Data(contentsOf: store.url), sidecar)
         XCTAssertTrue(FileManager.default.fileExists(atPath: target().path))
@@ -443,4 +461,76 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         }
     }
 
+
+    func testStartupCleanupFailureRetainsTypedSavedAckAndRetriesWithoutDomainWrite() async throws {
+        let host = try await seed(); try await remove(host); await boundary(.afterSaveTerminal, host: host)
+        let known = await refused({ _ = try await self.save(host) }, saved: true), actual = try object(XCTUnwrap(known?.resultJSON))
+        let rowsAfter = try rows(); await host.close()
+        let cold = core(noWrites()); await boundary(.beforeSaveEditorDetach, host: cold)
+        let failedStartup = await refused({ _ = try await cold.start() }, saved: true)
+        XCTAssertEqual(try json(object(XCTUnwrap(failedStartup?.resultJSON))), try json(actual))
+        await refused { _ = try await cold.readAttachmentDraft() }
+        XCTAssertEqual(try rows(), rowsAfter); XCTAssertNotNil(try editor.read()?.attempt); XCTAssertNotNil(try store.readMixed())
+        await cold.configureAttachmentDraftHost(AttachmentDraftHostHooks())
+        let surfaced = try recovery(await cold.start())
+        XCTAssertEqual(try json(XCTUnwrap(surfaced["result"])), try json(actual)); XCTAssertEqual(try rows(), rowsAfter); try released()
+        let ordinary = try object(await cold.start()); XCTAssertNil(ordinary["recovery"])
+    }
+    func testStartupWindowFailurePreservesCancellationAckUntilOnePresentation() async throws {
+        let cancelID = UUID().uuidString.lowercased(), host = try await seed(); try await remove(host)
+        await boundary(.afterSaveTerminal, host: host)
+        let known = await refused({ _ = try await self.save(host, raw: self.request(intent: "cancel", requestID: cancelID)) }, saved: true)
+        let actual = try object(XCTUnwrap(known?.resultJSON)), rowsAfter = try rows(); await host.close()
+        try probe("""
+        const original=MindwtrHost.window;
+        MindwtrHost.window=(...args)=>{
+          const guardResult=__mindwtrNative.sqlRun('SELECT 271 AS after_settled_startup','[]');
+          if(typeof guardResult==='string'&&guardResult.startsWith('!MindwtrNativeError:')) throw Error('Injected startup window failure');
+          return original(...args);
+        };
+        """)
+        let faults = HostIOFaults(); var failed = false
+        faults.beforeSQL = { statement in
+            if ["INSERT INTO tasks", "UPDATE tasks", "DELETE FROM tasks"].contains(where: { statement.hasPrefix($0) }) {
+                XCTFail("Startup presentation retry must not replay the saved domain effect"); throw HostFailure("Unexpected domain write")
+            }
+            if statement == "SELECT 271 AS after_settled_startup" && !failed {
+                failed = true; XCTAssertNil(try self.editor.read()); XCTAssertNil(try self.store.readMixed())
+                XCTAssertFalse(FileManager.default.fileExists(atPath: self.journal.path))
+                throw HostFailure("Injected startup window failure")
+            }
+        }
+        let cold = core(faults); await refused({ _ = try await cold.start() }, saved: false)
+        XCTAssertTrue(failed); XCTAssertEqual(try rows(), rowsAfter); try released()
+        await refused { _ = try await cold.readAttachmentDraft() }
+        let surfaced = try recovery(await cold.start(), requestId: cancelID)
+        XCTAssertEqual(try json(XCTUnwrap(surfaced["result"])), try json(actual)); XCTAssertEqual(try rows(), rowsAfter)
+        let ordinary = try object(await cold.start()); XCTAssertNil(ordinary["recovery"])
+        faults.beforeSQL = nil
+        let exposedID = try XCTUnwrap(surfaced["requestId"] as? String)
+        _ = try await cold.call("taskCancellationUndo", argumentsJSON: json([json(["requestId": UUID().uuidString.lowercased(), "cancelRequestId": exposedID])]))
+        XCTAssertEqual(try task()["status"] as? String, "next")
+        await cold.close(); await refused { _ = try await cold.start() }
+    }
+
+    func testDefinitiveRejectedCompleteSaveStartupNeverReportsSavedRecovery() async throws {
+        let host = try await seed(); try await remove(host); let snapshot = try latest(), sidecar = try Data(contentsOf: store.url)
+        let hooks = AttachmentDraftHostHooks(); var changed = false
+        hooks.boundary = { point in
+            if point == .beforeSaveCommit && !changed {
+                changed = true; _ = try self.sql("UPDATE tasks SET title='Changed before commit',rev=rev+1 WHERE id=?", [self.taskID])
+            }
+            if point == .beforeSaveThaw { throw HostFailure("Retain the actual definitive rejection") }
+        }
+        await host.configureAttachmentDraftHost(hooks)
+        await refused({ _ = try await self.save(host) }, saved: false)
+        XCTAssertTrue(changed)
+        let terminal = try XCTUnwrap(journalObject()["terminal"] as? [String: Any])
+        XCTAssertNotNil(terminal["rejected"]); XCTAssertNil(terminal["success"])
+        let rowsAfter = try rows(); await host.close()
+        let cold = core(noWrites()), startup = try object(await cold.start())
+        XCTAssertNil(startup["recovery"]); XCTAssertEqual(try rows(), rowsAfter)
+        XCTAssertEqual(try latest(), snapshot); XCTAssertNil(try editor.read()?.attempt)
+        XCTAssertEqual(try Data(contentsOf: store.url), sidecar); XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+    }
 }

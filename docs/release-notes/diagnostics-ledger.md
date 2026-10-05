@@ -30,6 +30,8 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 ## v1.3.5 (add before tagging, trim in the release after)
 
+- **`v1.3.5/ios-attachment-recovery`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift`, when startup returns the validated result of a recovered attachment Save. `Native iOS attachment recovery returned`, `outcome=saved` proves the domain acknowledgment was surfaced to the app. It does not claim the editor displayed it or verify current file existence. No task identifiers, contents, paths, proofs, or raw errors are logged.
+
 - **`v1.3.5/ios-owned-editor-resume`** — `apps/android-native/bundle/host-entry.ts`, after the native owner validates the retained editor checkpoint and V3 attachment lineage against current task state. `Native iOS attachment draft acknowledged` with `operation=owned-resume`, `outcome=validated` proves this read-only validation ran. It does not claim editor hydration, current file existence, task Save, or cleanup. No task text, identifiers, paths, URLs, payloads, or raw errors are logged.
 
 - **`v1.3.5/ios-attachment-link-lineage`** — `apps/android-native/bundle/host-entry.ts`, after V3 Begin passes the shared link-compatible lineage validator. `Native iOS link-compatible attachment lineage validated`, `outcome=validated` proves this validation path ran; it does not claim native ownership, task Save, or picker completion. No IDs, links, paths, contents, or raw errors are logged.

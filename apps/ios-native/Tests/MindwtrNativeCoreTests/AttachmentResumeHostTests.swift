@@ -361,4 +361,30 @@ final class AttachmentResumeHostTests: XCTestCase {
         let cold = core(); await cold.configureAttachmentHost(hooks); _ = try await cold.start(); let retained = try evidence()
         _ = try await resume(cold); XCTAssertEqual(jobs, 0); XCTAssertEqual(try latest(), padded); try unchanged(retained)
     }
+
+    func testSummaryNullActiveAndLegacyDiscardRemainInformationalAndSealed() async throws {
+        let ordinary = core(), startup = try object(await ordinary.start()), absent = try await ordinary.readAttachmentDraft()
+        XCTAssertNil(startup["recovery"]); XCTAssertEqual(absent, "null"); await ordinary.close()
+        for version in [1, 2, 3] {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await seed(version: version), before = try evidence(), snapshot = try latest()
+            let summary = try object(await host.readAttachmentDraft())
+            XCTAssertEqual(Set(summary.keys), Set(["version", "status", "sessionID", "checkpoint", "operations", "discard"]))
+            XCTAssertEqual(summary["version"] as? Int, version); XCTAssertTrue(summary["discard"] is NSNull); try unchanged(before)
+            // Typed V3 methods are public; generic string routing stays sealed.
+            await refused { _ = try await host.call("checkAttachmentDraftResumeV3", argumentsJSON: "[]") }
+            await refused { _ = try await host.call("addProviderAttachmentV3", argumentsJSON: "[]") }; try unchanged(before)
+            if version < 3 {
+                let requestID = UUID().uuidString.lowercased(), raw = try json(["version": 1, "requestId": requestID, "sessionID": snapshot.sessionID, "generation": snapshot.generation])
+                await boundary(.afterDiscardDecision, host: host)
+                await refused { _ = try await host.discardAttachmentDraft(requestJSON: raw) }
+                let retained = try evidence(), legacySummary = try object(await host.readAttachmentDraft())
+                let decision = try XCTUnwrap(legacySummary["discard"] as? [String: Any])
+                XCTAssertEqual(Set(decision.keys), Set(["requestId", "phase"])); XCTAssertEqual(decision["requestId"] as? String, requestID)
+                XCTAssertEqual(decision["phase"] as? String, "decided"); XCTAssertEqual(legacySummary["version"] as? Int, version); try unchanged(retained)
+                await refused { _ = try await self.resume(host) }; try unchanged(retained)
+            }
+            await host.close()
+        }
+    }
 }

@@ -82,8 +82,8 @@ public final class CoreHost: @unchecked Sendable {
     public func beginAttachmentDraftV2(expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.beginAttachmentDraftV2(expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
-    // Internal foundation only; mixed settlement/UI admission remains unbound.
-    func beginAttachmentDraftV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
+    /// Begins or validates the V3 attachment owner for the exact unfrozen editor checkpoint.
+    public func beginAttachmentDraftV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -93,7 +93,8 @@ public final class CoreHost: @unchecked Sendable {
                 expectedGeneration: expectedGeneration, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func removeAttachmentDraftV3(requestJSON: String) async throws -> String {
+    /// Records a V3 metadata removal; retained interrupted work requires exact recovery.
+    public func removeAttachmentDraftV3(requestJSON: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -111,7 +112,8 @@ public final class CoreHost: @unchecked Sendable {
             try await perform { try $0.addAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func addProviderAttachmentV3(selectedURL: URL, expectedSession: String, expectedGeneration: Int,
+    /// Copies one provider selection and runs the existing V3 Add owner with the supplied exact request UUID.
+    public func addProviderAttachmentV3(selectedURL: URL, expectedSession: String, expectedGeneration: Int,
                                  requestId: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
@@ -122,7 +124,8 @@ public final class CoreHost: @unchecked Sendable {
                 expectedGeneration: expectedGeneration, requestId: requestId, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
+    /// Finishes only the retained V3 Add, Remove or checkpoint advance for this session.
+    public func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -146,7 +149,8 @@ public final class CoreHost: @unchecked Sendable {
                 expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func saveAttachmentDraftComplete(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
+    /// Saves the full editor request and settles attachments through the existing durable V3 owner.
+    public func saveAttachmentDraftComplete(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -156,7 +160,8 @@ public final class CoreHost: @unchecked Sendable {
                 expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func checkAttachmentDraftResumeV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
+    /// Checks the exact V3 editor owner and fresh opening fields without rewriting buffers or proving file existence.
+    public func checkAttachmentDraftResumeV3(expectedSession: String, expectedGeneration: Int) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -172,7 +177,8 @@ public final class CoreHost: @unchecked Sendable {
     public func discardAttachmentDraft(requestJSON: String) async throws -> String {
         try await perform { try $0.discardAttachmentDraft(requestJSON: requestJSON) }
     }
-    func discardAttachmentDraftV3(requestJSON: String) async throws -> String {
+    /// Records and finishes the exact V3 Discard decision under the existing native owner.
+    public func discardAttachmentDraftV3(requestJSON: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -181,7 +187,8 @@ public final class CoreHost: @unchecked Sendable {
             try await perform { try $0.discardAttachmentDraftV3(requestJSON: requestJSON, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
-    func finishAttachmentDraftDiscardV3(expectedSession: String, requestId: String) async throws -> String {
+    /// Retries the retained V3 Discard decision identified by its original session and request UUID.
+    public func finishAttachmentDraftDiscardV3(expectedSession: String, requestId: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
         localAttachmentRequests.register(token, id: id)
         defer { localAttachmentRequests.remove(id) }
@@ -563,6 +570,9 @@ private final class Engine: @unchecked Sendable {
     private var confirmedSomedaySectionUndoEnvelope: String?
     private var boardReadLogged = false
     private var boardActionLogged = false
+    // Only an unpresented validated acknowledgment survives automatic runtime
+    // teardown; this CoreHost's databaseURL is immutable. Shutdown clears it.
+    private var startupAttachmentSaveResult: (method: String, resultJSON: String, requestId: String?)?
     private var startupBoardResult: String?
     private var startupTaskDeleteResult: String?
     private var startupArchivedTaskRestoreResult: String?
@@ -1168,6 +1178,19 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func startupWindow() throws -> String {
+        let recoveringAttachmentSaveMethod: String? = pending.flatMap { command in
+            [Self.ownedSaveMethod, Self.mixedSaveMethod].contains(command.method) ? command.method : nil
+        }
+        var recoveringAttachmentCancelRequestId: String?
+        if let command = pending, command.method == Self.mixedSaveMethod {
+            let captured = try mixedSaveJournal(command, checkingNative: false)
+            if captured.selection == .complete {
+                let original = try Self.completeOriginalRequest(captured.attempt)
+                if original["intent"] as? String == "cancel" {
+                    recoveringAttachmentCancelRequestId = Self.ownedDiscardUUID(original["requestId"])
+                }
+            }
+        }
         let recoveringBackupDocument = pending?.method == "backupDocumentCommit"
         if pending == nil, let backupUnreturnedReply { startupBackupDocumentResult = backupUnreturnedReply }
         let recoveringBoard = pending?.method == "boardCommit"
@@ -1254,6 +1277,13 @@ private final class Engine: @unchecked Sendable {
         let recoveringSomedaySectionMove = pending?.method == "somedaySectionMoveCommit"
         let recoveringSomedaySectionUndo = pending?.method == "somedaySectionMoveUndoCommit"
         let terminal = try resolvePending()
+        if let method = recoveringAttachmentSaveMethod, let terminal, case .success(let result) = terminal {
+            // Both existing owners return only their validated domain result,
+            // after durable recovery/cleanup; never expose a settlement journal.
+            let actual = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any]
+            startupAttachmentSaveResult = (method, result,
+                actual?["cancellation"] is [String: Any] ? recoveringAttachmentCancelRequestId : nil)
+        }
         if recoveringBackupDocument, let terminal, case .success(let value) = terminal { startupBackupDocumentResult = value }
         if let recoveringTaskDeleteCommand, let terminal, case .success = terminal {
             rememberConfirmedTaskDelete(recoveringTaskDeleteCommand)
@@ -1385,7 +1415,7 @@ private final class Engine: @unchecked Sendable {
             ?? startupTrashTaskRestoreResult ?? startupTrashProjectRestoreResult
         let recoveredTaskActions = recoveredDeleteRestore ?? startupTaskPromoteResult ?? startupBoardResult
             ?? startupCalendarResult ?? startupMindSweepResult
-        guard let recovered = recoveredTaskActions
+        guard let recovered = startupAttachmentSaveResult?.resultJSON ?? recoveredTaskActions
             ?? recoveredProjects ?? recoveredFocus ?? recoveredLists else { return value }
         guard var window = try NativeJSON.jsonObject(with: Data(value.utf8)) as? [String: Any] else {
             throw HostFailure("Malformed startup window")
@@ -1505,7 +1535,16 @@ private final class Engine: @unchecked Sendable {
             recovery["source"] = "reference"
             window["recovery"] = recovery
         }
+        if let saved = startupAttachmentSaveResult {
+            var recovery: [String: Any] = ["method": saved.method, "result": try NativeJSON.jsonObject(with: Data(saved.resultJSON.utf8))]
+            if let requestId = saved.requestId { recovery["requestId"] = requestId }
+            window["recovery"] = recovery
+        }
         let encoded = String(decoding: try JSONSerialization.data(withJSONObject: window, options: [.sortedKeys]), as: UTF8.self)
+        if startupAttachmentSaveResult != nil {
+            NSLog("Native iOS attachment recovery returned releaseCheck=v1.3.5/ios-attachment-recovery outcome=saved")
+        }
+        startupAttachmentSaveResult = nil
         startupBoardResult = nil
         startupArchivedTaskRestoreResult = nil
         startupArchivedTasksRestoreResult = nil
@@ -14236,6 +14275,7 @@ private final class Engine: @unchecked Sendable {
     func shutdown() {
         dispatchPrecondition(condition: .onQueue(queue))
         closed = true
+        startupAttachmentSaveResult = nil
         releaseRuntime()
     }
 
