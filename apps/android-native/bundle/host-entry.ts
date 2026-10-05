@@ -3302,14 +3302,16 @@ globalThis.MindwtrHost = {
             const finishedDiscard = operation === 'discard-finish' && outcome === 'confirmed';
             const unstartedDiscard = operation === 'discard-unstarted' && outcome === 'confirmed';
             const removedDraft = operation === 'remove' && ['confirmed', 'replayed'].includes(outcome);
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft
+            const mixedSave = operation === 'mixed-save' && ['domainSaved', 'settled'].includes(outcome);
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
+                    context: { ...(mixedSave ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-save' }
+                        : removedDraft ? { releaseCheck: 'v1.3.5/ios-attachment-draft-remove' }
                         : operation === 'save' ? { releaseCheck: 'v1.3.5/ios-attachment-owned-save' }
                         : finishedDiscard ? { releaseCheck: 'v1.3.5/ios-owned-discard-finish' }
                             : unstartedDiscard ? { releaseCheck: 'v1.3.5/ios-unstarted-add-discard' }

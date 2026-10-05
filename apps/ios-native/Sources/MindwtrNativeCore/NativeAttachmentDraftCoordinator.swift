@@ -2,7 +2,6 @@ import Foundation
 import CoreFoundation
 import Darwin
 
-#if DEBUG
 enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeIntent, afterIntent, afterReservation, beforeStageProof, afterStageProof
     case beforeFilled, afterFilled, beforePublication, afterPublication, afterPublicationProof
@@ -14,6 +13,8 @@ enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeSaveTerminal, afterSaveTerminal, beforeSaveEditorDetach, afterSaveEditorDetach
     case beforeSaveStage(Int), afterSaveStage(Int), beforeSaveRelease, afterSaveRelease
     case beforeSaveJournalClear, afterSaveJournalClear, beforeSaveThaw, afterSaveThaw
+    case beforeSaveTarget(Int), afterSaveTarget(Int), beforeSaveProgress, afterSaveProgress
+    case beforeSaveSettled, afterSaveSettled
     case beforeDiscardFinishJournal, afterDiscardFinishJournal
     case beforeDiscardFilledObservation, afterDiscardFilledObservation
     case beforeDiscardPublicationReproof, afterDiscardPublicationReproof
@@ -22,6 +23,7 @@ enum AttachmentDraftBoundary: Sendable, Equatable {
     case beforeDiscardTerminal, afterDiscardTerminal, beforeDiscardRelease, afterDiscardRelease
     case beforeDiscardJournalClear, afterDiscardJournalClear
 }
+#if DEBUG
 final class AttachmentDraftHostHooks: @unchecked Sendable {
     var boundary: ((AttachmentDraftBoundary) throws -> Void)?
 }
@@ -30,7 +32,7 @@ final class AttachmentDraftHostHooks: @unchecked Sendable {
 /// Serialized by CoreHost's existing library owner. Descriptor proofs remain
 /// native; editor projection and task authority remain in shared core.
 final class NativeAttachmentDraftCoordinator {
-    private typealias Store = NativeAttachmentDraftStore
+    typealias Store = NativeAttachmentDraftStore
     private let store: Store
     private let editor: EditorDraftStore
     private let jobs: NativeAttachmentFileJobs
@@ -700,6 +702,240 @@ final class NativeAttachmentDraftCoordinator {
         let snapshot: EditorDraftSnapshot
         let envelopeJSON: String
         let resultJSON: String
+    }
+
+    struct MixedSaveObservation {
+        let json: String
+        let targetURI: String
+        let kind: String
+        let proof: NativeAttachmentFiles.BaselineAttachmentProof?
+        static func read(_ value: [String: Any]) throws -> MixedSaveObservation {
+            guard let kind = value["kind"] as? String, let uri = value["targetURI"] as? String,
+                  !uri.isEmpty, uri.utf8.count <= 16 * 1024 else { throw failure }
+            func token(_ value: Any?) -> String? {
+                guard let text = value as? String else { return nil }
+                let pieces = text.split(separator: ":", omittingEmptySubsequences: false)
+                guard pieces.count == 2, pieces.allSatisfy({ part in
+                    !part.isEmpty && part.utf8.count <= 20 && part.utf8.allSatisfy { (48...57).contains($0) }
+                        && UInt64(part) != nil
+                }) else { return nil }
+                return text
+            }
+            var proof: NativeAttachmentFiles.BaselineAttachmentProof?
+            switch kind {
+            case "present":
+                guard Set(value.keys) == Set(["kind", "targetURI", "sha256", "size", "identity", "directoryIdentity"]),
+                      let digest = value["sha256"] as? String, digest.utf8.count == 64,
+                      digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                      let size = integer(value["size"]), let identity = token(value["identity"]),
+                      let directory = token(value["directoryIdentity"]) else { throw failure }
+                proof = .init(targetURI: uri, sha256: digest, size: size, identity: identity, directoryIdentity: directory)
+            case "noOwnedGeneration":
+                guard Set(value.keys) == Set(["kind", "targetURI", "absence"]),
+                      let absence = value["absence"] as? [String: Any], let type = absence["kind"] as? String else { throw failure }
+                let field: String
+                switch type {
+                case "leafAbsent": field = "directoryIdentity"
+                case "managedDirectoryAbsent": field = "documentsIdentity"
+                default: throw failure
+                }
+                guard Set(absence.keys) == Set(["kind", field]), token(absence[field]) != nil else { throw failure }
+            case "unmanaged", "unsafeEntry":
+                guard Set(value.keys) == Set(["kind", "targetURI"]) else { throw failure }
+            default: throw failure
+            }
+            return .init(json: try NativeAttachmentDraftCoordinator.json(value), targetURI: uri, kind: kind, proof: proof)
+        }
+    }
+    enum MixedSaveAuthority {
+        case ownedAdd(String)
+        case baseline(MixedSaveObservation)
+        func object() throws -> [String: Any] {
+            switch self {
+            case .ownedAdd(let id): return ["kind": "ownedAdd", "requestId": id]
+            case .baseline(let observation): return ["kind": "baseline", "observation": try NativeAttachmentDraftCoordinator.object(observation.json)]
+            }
+        }
+        static func read(_ value: [String: Any]) throws -> MixedSaveAuthority {
+            switch value["kind"] as? String {
+            case "ownedAdd":
+                guard Set(value.keys) == Set(["kind", "requestId"]), let id = uuid(value["requestId"]), id.utf8.count == 36 else { throw failure }
+                return .ownedAdd(id)
+            case "baseline":
+                guard Set(value.keys) == Set(["kind", "observation"]), let raw = value["observation"] as? [String: Any] else { throw failure }
+                return .baseline(try MixedSaveObservation.read(raw))
+            default: throw failure
+            }
+        }
+    }
+    struct MixedSaveCandidate {
+        let index: Int
+        let attachmentID: String
+        let targetURI: String
+        let reason: String
+        let authority: MixedSaveAuthority
+        var outcomes: Set<String> {
+            let keeps: Set<String> = reason == "uncommitted-draft" ? ["referenced"] : ["referenced", "taskChanged"]
+            switch authority {
+            case .ownedAdd: return keeps.union(["removed", "absent"])
+            case .baseline(let observation):
+                return keeps.union(observation.kind == "present" ? ["removed", "absent", "generationChanged", "unsafeEntry"] : [observation.kind])
+            }
+        }
+    }
+    struct MixedSavePreparation {
+        let binding: Store.VersionedSnapshot
+        let snapshot: EditorDraftSnapshot
+        let fingerprint: String
+        let envelopeJSON: String
+        let resultJSON: String
+        let candidates: [MixedSaveCandidate]
+        let stages: [String]
+    }
+    static func mixedSaveLineageJSON(_ record: Store.MixedRecord, managedDirectoryURI: String) throws -> String {
+        _ = try Store.mixedFingerprint(record)
+        guard record.session.state == .active, !record.operations.isEmpty, record.discard == nil,
+              record.checkpointAdvance == nil, record.operations.allSatisfy({ entry in
+                  if case .add(let op) = entry { return op.phase == .checkpointed && op.reason == nil }
+                  return entry.checkpointed
+              }) else { throw failure }
+        let operations: [[String: Any]] = try record.operations.map { entry in
+            switch entry {
+            case .add(let op): return ["kind": "add", "operation": try object(op.preparedJSON, limit: 2 * 1024 * 1024)]
+            case .remove(let op): return ["kind": "remove", "operation": try object(op.preparedJSON, limit: 2 * 1024 * 1024)]
+            }
+        }
+        return try json(["version": 3, "taskID": record.session.taskID,
+            "initialPayloadJSON": record.operations[0].before.payloadJSON,
+            "beforePayloadJSON": record.session.checkpoint.payloadJSON, "priorOperations": operations, "managedDirectoryURI": managedDirectoryURI])
+    }
+    static func mixedSaveAdds(_ record: Store.MixedRecord) -> [Store.Operation] {
+        record.operations.compactMap { if case .add(let op) = $0 { return op }; return nil }
+    }
+    /// The shared validator supplies the complete ordered plan; Swift binds
+    /// each tuple to existing private Add evidence or an opening baseline.
+    static func mixedSaveCandidates(plan: [[String: Any]], envelopeJSON: String,
+                                    authorities: [MixedSaveAuthority], record: Store.MixedRecord?) throws -> [MixedSaveCandidate] {
+        let envelope = try object(envelopeJSON)
+        guard let request = envelope["request"] as? [String: Any],
+              let save = request["saveRequest"] as? [String: Any], let half = save["attachments"] as? [String: Any],
+              let baseline = half["base"] as? [[String: Any]], let owned = request["ownedDraft"] as? [String: Any],
+              let history = owned["priorOperations"] as? [[String: Any]], authorities.count == plan.count else { throw failure }
+        let additions = history.filter { $0["kind"] as? String == "add" }.compactMap { $0["operation"] as? [String: Any] }
+        return try plan.enumerated().map { index, value in
+            guard Set(value.keys) == Set(["attachment", "reason"]), let attachment = value["attachment"] as? [String: Any],
+                  attachment["kind"] as? String == "file", let id = attachment["id"] as? String,
+                  let uri = attachment["uri"] as? String, !uri.isEmpty,
+                  let reason = value["reason"] as? String, ["uncommitted-draft", "replaced-baseline", "deleted-after-save"].contains(reason) else { throw failure }
+            let adds = additions.filter { ($0["requestId"] as? String).map { equal($0, id) } == true
+                && ($0["targetURI"] as? String).map { equal($0, uri) } == true }
+            let originals = baseline.filter { ($0["id"] as? String).map { equal($0, id) } == true
+                && ($0["uri"] as? String).map { equal($0, uri) } == true && $0["kind"] as? String == "file" }
+            switch authorities[index] {
+            case .ownedAdd(let requestID):
+                guard adds.count == 1, originals.isEmpty, equal(requestID, id), reason == "uncommitted-draft" else { throw failure }
+                if let record {
+                    let retained = mixedSaveAdds(record).filter { equal($0.requestId, requestID) && equal($0.targetURI, uri) }
+                    guard retained.count == 1, retained[0].stage != nil, retained[0].published != nil else { throw failure }
+                }
+            case .baseline(let observed):
+                guard originals.count == 1, adds.isEmpty, reason != "uncommitted-draft", equal(observed.targetURI, uri) else { throw failure }
+            }
+            return .init(index: index, attachmentID: id, targetURI: uri, reason: reason, authority: authorities[index])
+        }
+    }
+    func prepareMixedSave(_ raw: String, session: String, generation: Int,
+                          cancellation: NativeAttachmentCancellation) throws -> MixedSavePreparation {
+        jobs.drain()
+        let loaded = try mixedRead(cancellation), record = loaded.record
+        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI)
+        guard let current = try editor.read(), current.attempt == nil, Self.equal(current.snapshot, record.session.checkpoint),
+              Self.equal(session, current.snapshot.sessionID), session.utf8.count == 36, generation == current.snapshot.generation else { throw Self.failure }
+        try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
+        let request: [String: Any] = ["version": 1, "kind": "owned-editor-file-edit-save",
+            "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(current.snapshot), as: UTF8.self)),
+            "ownedDraft": try Self.object(lineage), "saveRequest": try Self.object(raw, limit: 2_000_000)]
+        let response = try mixedInvoke("attachmentFileEditSavePrepare", request, binding: loaded.binding, cancellation: cancellation)
+        guard Set(response.keys) == Set(["kind", "prepared"]), response["kind"] as? String == "prepared",
+              let prepared = response["prepared"] as? [String: Any], let repeated = prepared["request"] as? [String: Any],
+              Self.equal(try Self.json(repeated), try Self.json(request)) else { throw Self.failure }
+        let envelope = try Self.json(["request": request, "prepared": prepared])
+        let validation = try mixedInvoke("attachmentFileEditSaveValidate", try Self.object(envelope), binding: loaded.binding, cancellation: cancellation)
+        guard Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.integer(validation["version"]) == 1,
+              validation["kind"] as? String == "owned-editor-file-edit-save", let result = validation["result"] as? [String: Any],
+              let plan = validation["settlementPlan"] as? [[String: Any]] else { throw Self.failure }
+        let adds = Self.mixedSaveAdds(record), baseline = ((request["saveRequest"] as? [String: Any])?["attachments"] as? [String: Any])?["base"] as? [[String: Any]] ?? []
+        var authorities: [MixedSaveAuthority] = []
+        for candidate in plan {
+            guard let attachment = candidate["attachment"] as? [String: Any], let id = attachment["id"] as? String,
+                  let uri = attachment["uri"] as? String else { throw Self.failure }
+            let owned = adds.filter { Self.equal($0.requestId, id) && Self.equal($0.targetURI, uri) }
+            let originals = baseline.filter { ($0["id"] as? String).map { Self.equal($0, id) } == true
+                && ($0["uri"] as? String).map { Self.equal($0, uri) } == true }
+            if owned.count == 1 && originals.isEmpty { authorities.append(.ownedAdd(owned[0].requestId)) }
+            else if owned.isEmpty && originals.count == 1 {
+                try requireMixed(loaded.binding, cancellation); try self.current(current.snapshot)
+                let observation = try MixedSaveObservation.read(file(.snapshotBaseline(attachmentID: id, targetURI: uri), cancellation: cancellation))
+                try requireMixed(loaded.binding, cancellation); try self.current(current.snapshot)
+                authorities.append(.baseline(observation))
+            } else { throw Self.failure }
+        }
+        let candidates = try Self.mixedSaveCandidates(plan: plan, envelopeJSON: envelope, authorities: authorities, record: record)
+        try verifyMixedSavePublished(record, envelopeJSON: envelope, cancellation: cancellation)
+        try requireMixed(loaded.binding, cancellation); try self.current(current.snapshot)
+        return .init(binding: loaded.binding, snapshot: current.snapshot, fingerprint: try Store.mixedFingerprint(record),
+            envelopeJSON: envelope, resultJSON: try Self.json(result), candidates: candidates, stages: adds.map(\.requestId))
+    }
+    func verifyMixedSavePublished(_ record: Store.MixedRecord, envelopeJSON: String,
+                                  cancellation: NativeAttachmentCancellation) throws {
+        jobs.drain(); try requireOwner(); try cancellation.check()
+        _ = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI)
+        for entry in record.operations { _ = try mixedPrepared(entry) }
+        let envelope = try Self.object(envelopeJSON)
+        guard let prepared = envelope["prepared"] as? [String: Any], let decision = prepared["decision"] as? [String: Any],
+              let effect = (decision["kind"] as? String == "changed" ? (decision["prepared"] as? [String: Any])?["effect"] : decision["effect"]) as? [String: Any],
+              let task = effect["task"] as? [String: Any], let after = task["after"] as? [String: Any],
+              let attachments = after["attachments"] as? [[String: Any]] else { throw Self.failure }
+        for op in Self.mixedSaveAdds(record) where attachments.contains(where: {
+            ($0["id"] as? String).map { Self.equal($0, op.requestId) } == true
+                && ($0["uri"] as? String).map { Self.equal($0, op.targetURI) } == true && $0["kind"] as? String == "file"
+                && ($0["deletedAt"] == nil || $0["deletedAt"] is NSNull)
+        }) {
+            try requireOwner(); try cancellation.check()
+            guard let reserved = op.stage, let expected = op.published else { throw Self.failure }
+            let raw = try file(.verifyPublication(targetURI: op.targetURI, stage: stage(reserved), sha256: op.source.sha256, size: op.source.size), cancellation: cancellation)
+            let actual = try JSONDecoder().decode(Store.Published.self, from: Data(Self.json(raw).utf8))
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            guard try encoder.encode(actual) == encoder.encode(expected) else { throw Self.failure }
+            try requireOwner(); try cancellation.check()
+        }
+    }
+    /// Typed synchronous jobs only, under the caller's journal-bound closure.
+    func retireMixedSaveTarget(_ candidate: MixedSaveCandidate, record: Store.MixedRecord,
+                               cancellation: NativeAttachmentCancellation) throws -> String {
+        try requireOwner(); try cancellation.check()
+        let outcome: String
+        switch candidate.authority {
+        case .ownedAdd(let id):
+            guard let op = Self.mixedSaveAdds(record).first(where: { Self.equal($0.requestId, id) }) else { throw Self.failure }
+            outcome = try retireOwnedDiscardTarget(op, cancellation: cancellation)
+        case .baseline(let observation):
+            if let proof = observation.proof {
+                let value = try file(.retireBaseline(attachmentID: candidate.attachmentID, proof: proof), cancellation: cancellation)
+                guard Set(value.keys) == Set(["status"]), let status = value["status"] as? String,
+                      ["removed", "absent", "generationChanged", "unsafeEntry"].contains(status) else { throw Self.failure }
+                outcome = status
+            } else { outcome = observation.kind }
+        }
+        jobs.drain(); try requireOwner(); try cancellation.check()
+        guard candidate.outcomes.contains(outcome) else { throw Self.failure }
+        return outcome
+    }
+    func retireMixedSaveStage(_ op: Store.Operation, cancellation: NativeAttachmentCancellation) throws -> String {
+        try requireOwner(); try cancellation.check()
+        let outcome = try retireOwnedDiscardStage(op, cancellation: cancellation)
+        try requireOwner(); try cancellation.check()
+        return outcome
     }
 
     /// Native structural correspondence for pre-runtime journal admission.

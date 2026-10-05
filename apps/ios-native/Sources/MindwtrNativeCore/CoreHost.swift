@@ -115,6 +115,17 @@ public final class CoreHost: @unchecked Sendable {
         try await perform { try $0.saveAttachmentDraftAdds(saveRequestJSON: saveRequestJSON,
             expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
+    // Internal until the real mixed Add producer and editor UI are admitted.
+    func saveAttachmentDraftMixed(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.saveAttachmentDraftMixed(saveRequestJSON: saveRequestJSON,
+                expectedSession: expectedSession, expectedGeneration: expectedGeneration, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
     public func readAttachmentDraft() async throws -> String {
         try await perform { try $0.readAttachmentDraft() }
     }
@@ -335,6 +346,7 @@ private final class Engine: @unchecked Sendable {
         func invalidate() { active = false; work = nil }
     }
     private static let ownedSaveMethod = "attachmentOwnedSaveCommit"
+    private static let mixedSaveMethod = "attachmentFileEditSaveCommit"
     private static let ownedSaveMaximumBytes = 8 * 1024 * 1024
     private static let ownedSaveRejectionBytes = 64 * 1024
     private static let ownedSaveFailure = HostFailure("SAVE_FAILED: Owned attachment Save could not be confirmed; retry the exact pending change")
@@ -344,6 +356,59 @@ private final class Engine: @unchecked Sendable {
         let snapshot: EditorDraftSnapshot
         let attempt: EditorDraftAttempt
         let record: NativeAttachmentDraftStore.Record?
+    }
+    private struct MixedSaveSettlement {
+        var phase: String
+        let resultJSON: String
+        var targets: [String?]
+        var stages: [String?]
+    }
+    private struct MixedSaveJournal {
+        let fingerprint: String
+        let envelopeJSON: String
+        let snapshot: EditorDraftSnapshot
+        let attempt: EditorDraftAttempt
+        let authorities: [NativeAttachmentDraftCoordinator.MixedSaveAuthority]
+        let stages: [String]
+        let binding: NativeAttachmentDraftStore.VersionedSnapshot?
+        let settlement: MixedSaveSettlement?
+    }
+    private struct MixedSaveFileBinding: Equatable {
+        let bytes: Data
+        let identity: OwnedDiscardIdentity
+    }
+    private final class MixedSaveTurn {
+        let generation: UInt64
+        let runtime: JSContext
+        let jobs: NativeAttachmentFileJobs
+        let record: NativeAttachmentDraftStore.VersionedSnapshot?
+        var editor: MixedSaveFileBinding?
+        var journal: MixedSaveFileBinding?
+        var validated: MixedSaveJournal?
+        var acknowledged: PendingCommand?
+        var acknowledgedState: MixedSaveSettlement?
+        init(generation: UInt64, runtime: JSContext, jobs: NativeAttachmentFileJobs,
+             record: NativeAttachmentDraftStore.VersionedSnapshot?, editor: MixedSaveFileBinding?) {
+            self.generation = generation; self.runtime = runtime; self.jobs = jobs; self.record = record; self.editor = editor
+        }
+    }
+    private final class MixedSaveCallbackLease {
+        var active = true, consumed = false, failed = false
+        var outcome: String?
+        var work: ((String) throws -> String)?
+        func enter(_ branch: String) -> String {
+            guard active, !consumed, let work else {
+                failed = true; return "!MindwtrNativeError:Attachment Save callback is unavailable"
+            }
+            consumed = true
+            do {
+                let value = try work(branch); outcome = value
+                return "{\"outcome\":\"" + value + "\"}"
+            } catch {
+                failed = true; return "!MindwtrNativeError:Attachment Save callback is unavailable"
+            }
+        }
+        func invalidate() { active = false; work = nil }
     }
     private let queue: DispatchQueue
     private let databaseURL: URL
@@ -620,6 +685,9 @@ private final class Engine: @unchecked Sendable {
         guard saved.version == 2 else { throw HostFailure("Unsupported pending command journal; raw captures cannot be safely replanned") }
         if saved.method == Self.ownedDiscardMethod {
             _ = try decodeOwnedDiscardJournal(journalData, checkingNative: true)
+        } else if saved.method == Self.mixedSaveMethod {
+            guard try ownedJournalBytes() == journalData else { throw Self.ownedSaveFailure }
+            _ = try decodeMixedSaveJournal(journalData, checkingNative: true)
         } else if saved.method == Self.ownedSaveMethod {
             _ = try decodeOwnedSaveJournal(journalData, checkingNative: true)
         } else if saved.method == "projectLifecycleCommit" {
@@ -695,6 +763,7 @@ private final class Engine: @unchecked Sendable {
                 if case .success(let value) = command.terminal { _ = try validateOwnedSaveAcknowledgement(command, value: value) }
                 else { _ = try validateOwnedSaveAcknowledgement(command) }
             }
+            if let command = pending, command.method == Self.mixedSaveMethod { _ = try validateMixedSave(command) }
             if let command = pending, command.method == "draftCommit" {
                 if case .success(let value) = command.terminal { try validateDraftAcknowledgment(command, value: value) }
                 else { try validateDraftAcknowledgment(command) }
@@ -1484,7 +1553,7 @@ private final class Engine: @unchecked Sendable {
         try attachmentDraftOperation { try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation) }
     }
 
-    private static func ownedEqual(_ lhs: String, _ rhs: String) -> Bool { lhs.utf8.elementsEqual(rhs.utf8) }
+    private static func ownedEqual(_ lhs: String, _ rhs: String) -> Bool { Data(lhs.utf8) == Data(rhs.utf8) }
     private static func ownedEqual(_ lhs: EditorDraftSnapshot, _ rhs: EditorDraftSnapshot) -> Bool {
         lhs.version == rhs.version && ownedEqual(lhs.sessionID, rhs.sessionID) && ownedEqual(lhs.taskID, rhs.taskID)
             && lhs.generation == rhs.generation && ownedEqual(lhs.payloadJSON, rhs.payloadJSON)
@@ -1597,8 +1666,9 @@ private final class Engine: @unchecked Sendable {
     private func ownedJournalBytes() throws -> Data? {
         try readJournalBytes(maximumBytes: Self.ownedSaveMaximumBytes, failure: Self.ownedSaveFailure, singleLink: true)
     }
-    private func readJournalBytes(maximumBytes: Int?, failure: HostFailure, singleLink: Bool) throws -> Data? {
-        let fd = open(journalURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    private func readJournalBytes(maximumBytes: Int?, failure: HostFailure, singleLink: Bool, url: URL? = nil) throws -> Data? {
+        let target = url ?? journalURL
+        let fd = open(target.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0 {
             if errno == ENOENT { return nil }
             throw failure
@@ -1623,7 +1693,7 @@ private final class Engine: @unchecked Sendable {
                 && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
                 && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
         }
-        guard result.count == Int(before.st_size), fstat(fd, &after) == 0, lstat(journalURL.path, &named) == 0,
+        guard result.count == Int(before.st_size), fstat(fd, &after) == 0, lstat(target.path, &named) == 0,
               same(before, after), same(after, named) else { throw failure }
         return result
     }
@@ -1631,6 +1701,7 @@ private final class Engine: @unchecked Sendable {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]; return try encoder.encode(value)
     }
     private func decodeOwnedJournal(_ data: Data, method: String) throws -> PendingCommand {
+        if method == Self.mixedSaveMethod { return try decodeMixedSaveJournal(data, checkingNative: false) }
         if method == Self.ownedDiscardMethod { return try decodeOwnedDiscardJournal(data, checkingNative: false) }
         return try decodeOwnedSaveJournal(data, checkingNative: false)
     }
@@ -1645,8 +1716,625 @@ private final class Engine: @unchecked Sendable {
         var before = actual, after = command; before.terminal = nil; after.terminal = nil
         guard try ownedEncoded(before) == ownedEncoded(after) else { throw Self.ownedSaveFailure }
         if let terminal = actual.terminal {
+            if command.method == Self.mixedSaveMethod {
+                try requireMixedSaveTransition(actual, command)
+                return
+            }
             guard let incoming = command.terminal, try ownedEncoded(terminal) == ownedEncoded(incoming) else { throw Self.ownedSaveFailure }
         }
+        if actual.terminal == nil, command.method == Self.mixedSaveMethod, case .success = command.terminal {
+            guard let state = try mixedSaveJournal(command, checkingNative: false).settlement,
+                  state.phase == "domainSaved", state.targets.allSatisfy({ $0 == nil }), state.stages.allSatisfy({ $0 == nil }) else {
+                throw Self.ownedSaveFailure
+            }
+        }
+    }
+
+    private func mixedSaveStateJSON(_ state: MixedSaveSettlement, stages: [String]) throws -> String {
+        try Self.ownedJSON(["version": 1, "kind": "owned-editor-file-edit-settlement", "phase": state.phase,
+            "resultJSON": state.resultJSON,
+            "targets": state.targets.enumerated().map { ["index": $0.offset, "outcome": $0.element.map { $0 as Any } ?? NSNull()] },
+            "stages": zip(stages, state.stages).map { ["requestId": $0.0, "outcome": $0.1.map { $0 as Any } ?? NSNull()] }] as [String: Any])
+    }
+    private func mixedSaveState(_ raw: String, authorities: [NativeAttachmentDraftCoordinator.MixedSaveAuthority],
+                                stages: [String]) throws -> MixedSaveSettlement {
+        guard raw.utf8.count <= Self.ownedSaveMaximumBytes,
+              let value = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              Set(value.keys) == Set(["version", "kind", "phase", "resultJSON", "targets", "stages"]),
+              Self.isInteger(value["version"], equalTo: 1), value["kind"] as? String == "owned-editor-file-edit-settlement",
+              let phase = value["phase"] as? String, ["domainSaved", "settled"].contains(phase),
+              let result = value["resultJSON"] as? String, let resultValue = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any],
+              Set(resultValue.keys) == Set(["id", "draft"]), resultValue["id"] is String, resultValue["draft"] is [String: Any],
+              let targets = value["targets"] as? [[String: Any]], targets.count == authorities.count,
+              let privateStages = value["stages"] as? [[String: Any]], privateStages.count == stages.count else { throw Self.ownedSaveFailure }
+        var outcomes: [String?] = [], stageOutcomes: [String?] = [], unresolved = false
+        for (index, target) in targets.enumerated() {
+            guard Set(target.keys) == Set(["index", "outcome"]), Self.isInteger(target["index"], equalTo: index) else { throw Self.ownedSaveFailure }
+            if target["outcome"] is NSNull { unresolved = true; outcomes.append(nil); continue }
+            guard !unresolved, let outcome = target["outcome"] as? String else { throw Self.ownedSaveFailure }
+            let permitted: Set<String>
+            switch authorities[index] {
+            case .ownedAdd: permitted = ["removed", "absent", "referenced"]
+            case .baseline(let observation):
+                permitted = Set<String>(["referenced", "taskChanged"]).union(observation.kind == "present"
+                    ? ["removed", "absent", "generationChanged", "unsafeEntry"] : [observation.kind])
+            }
+            guard permitted.contains(outcome) else { throw Self.ownedSaveFailure }
+            outcomes.append(outcome)
+        }
+        for (index, stage) in privateStages.enumerated() {
+            guard Set(stage.keys) == Set(["requestId", "outcome"]), let id = stage["requestId"] as? String,
+                  Self.ownedEqual(id, stages[index]) else { throw Self.ownedSaveFailure }
+            if stage["outcome"] is NSNull { unresolved = true; stageOutcomes.append(nil); continue }
+            guard !unresolved, let outcome = stage["outcome"] as? String, ["removed", "missing"].contains(outcome) else { throw Self.ownedSaveFailure }
+            stageOutcomes.append(outcome)
+        }
+        guard phase != "settled" || !unresolved else { throw Self.ownedSaveFailure }
+        return .init(phase: phase, resultJSON: result, targets: outcomes, stages: stageOutcomes)
+    }
+    private func mixedSaveManagedURI() throws -> String {
+        guard let jobs = attachmentJobs,
+              let directories = try NativeJSON.jsonObject(with: Data(jobs.directoriesJSON.utf8)) as? [String: Any],
+              let document = directories["document"] as? String, let root = URL(string: document) else { throw Self.ownedSaveFailure }
+        return root.appendingPathComponent("attachments", isDirectory: true).absoluteString
+    }
+    private func mixedSaveJournal(_ command: PendingCommand, checkingNative: Bool = true) throws -> MixedSaveJournal {
+        guard command.version == 2, command.method == Self.mixedSaveMethod,
+              try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes, let attempt = command.editorDraft,
+              Self.ownedDiscardUUID(attempt.id)?.utf8.count == 36, Self.ownedDiscardUUID(attempt.sessionID)?.utf8.count == 36,
+              let args = try NativeJSON.jsonObject(with: Data(command.argumentsJSON.utf8)) as? [String], args.count == 1,
+              let wrapper = try NativeJSON.jsonObject(with: Data(args[0].utf8)) as? [String: Any],
+              Set(wrapper.keys) == Set(["version", "recordSHA256", "envelope", "candidates", "stages"]),
+              Self.isInteger(wrapper["version"], equalTo: 2), let fingerprint = wrapper["recordSHA256"] as? String,
+              fingerprint.utf8.count == 64, fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              let envelope = wrapper["envelope"] as? [String: Any], Set(envelope.keys) == Set(["request", "prepared"]),
+              let request = envelope["request"] as? [String: Any], Set(request.keys) == Set(["version", "kind", "checkpoint", "ownedDraft", "saveRequest"]),
+              Self.isInteger(request["version"], equalTo: 1), request["kind"] as? String == "owned-editor-file-edit-save",
+              let checkpoint = request["checkpoint"] as? [String: Any], Set(checkpoint.keys) == Set(["version", "sessionID", "taskID", "generation", "payloadJSON"]),
+              Self.isInteger(checkpoint["version"], equalTo: 1), let snapshot = try? JSONDecoder().decode(EditorDraftSnapshot.self, from: Data(Self.ownedJSON(checkpoint).utf8)),
+              let owned = request["ownedDraft"] as? [String: Any],
+              Set(owned.keys) == Set(["version", "taskID", "initialPayloadJSON", "beforePayloadJSON", "priorOperations", "managedDirectoryURI"]),
+              Self.isInteger(owned["version"], equalTo: 3), let task = owned["taskID"] as? String, Self.ownedEqual(task, snapshot.taskID),
+              let payload = owned["beforePayloadJSON"] as? String, Self.ownedEqual(payload, snapshot.payloadJSON),
+              owned["initialPayloadJSON"] is String, owned["managedDirectoryURI"] is String,
+              let history = owned["priorOperations"] as? [[String: Any]], (1...128).contains(history.count),
+              let save = request["saveRequest"] as? [String: Any], Self.equalJSON(try Self.ownedOriginalRequest(attempt), save),
+              let prepared = envelope["prepared"] as? [String: Any], Set(prepared.keys) == Set(["version", "kind", "request", "decision"]),
+              Self.isInteger(prepared["version"], equalTo: 1), prepared["kind"] as? String == "owned-editor-file-edit-save",
+              Self.equalJSON(prepared["request"], request), let decision = prepared["decision"] as? [String: Any],
+              let entries = wrapper["candidates"] as? [[String: Any]], let stages = wrapper["stages"] as? [String] else { throw Self.ownedSaveFailure }
+        switch decision["kind"] as? String {
+        case "changed": guard Set(decision.keys) == Set(["kind", "prepared"]), decision["prepared"] is [String: Any] else { throw Self.ownedSaveFailure }
+        case "noop": guard Set(decision.keys) == Set(["kind", "preparedAt", "deviceIdBefore", "scope", "effect"]) else { throw Self.ownedSaveFailure }
+        default: throw Self.ownedSaveFailure
+        }
+        try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
+        var addIDs: [String] = []
+        for entry in history {
+            guard Set(entry.keys) == Set(["kind", "operation"]), let operation = entry["operation"] as? [String: Any],
+                  let id = Self.ownedDiscardUUID(operation["requestId"]), id.utf8.count == 36 else { throw Self.ownedSaveFailure }
+            switch entry["kind"] as? String {
+            case "add": addIDs.append(id)
+            case "remove": break
+            default: throw Self.ownedSaveFailure
+            }
+        }
+        guard stages.count == addIDs.count, zip(stages, addIDs).allSatisfy({ Self.ownedEqual($0.0, $0.1) }), Set(stages).count == stages.count else { throw Self.ownedSaveFailure }
+        let authorities = try entries.enumerated().map { index, entry -> NativeAttachmentDraftCoordinator.MixedSaveAuthority in
+            guard Set(entry.keys) == Set(["index", "authority"]), Self.isInteger(entry["index"], equalTo: index),
+                  let raw = entry["authority"] as? [String: Any] else { throw Self.ownedSaveFailure }
+            let authority = try NativeAttachmentDraftCoordinator.MixedSaveAuthority.read(raw)
+            if case .ownedAdd(let id) = authority { guard stages.contains(where: { Self.ownedEqual($0, id) }) else { throw Self.ownedSaveFailure } }
+            return authority
+        }
+        let settlement: MixedSaveSettlement?
+        switch command.terminal {
+        case .success(let raw): settlement = try mixedSaveState(raw, authorities: authorities, stages: stages)
+        case .rejected(let message):
+            guard isDefiniteRejection(message, method: command.method) else { throw Self.ownedSaveFailure }
+            settlement = nil
+        case nil: settlement = nil
+        }
+        var binding: NativeAttachmentDraftStore.VersionedSnapshot?
+        if checkingNative {
+            binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned()
+            if let binding {
+                guard case .mixed(let record) = binding.record,
+                      Self.ownedEqual(try NativeAttachmentDraftStore.mixedFingerprint(record), fingerprint),
+                      Self.ownedEqual(record.session.checkpoint, snapshot),
+                      Self.equalJSON(try NativeJSON.jsonObject(with: Data(NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record,
+                        managedDirectoryURI: mixedSaveManagedURI()).utf8)), owned) else { throw Self.ownedSaveFailure }
+            } else { guard settlement?.phase == "settled" else { throw Self.ownedSaveFailure } }
+            let retainedEditor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+            if let current = try editorDrafts.read() {
+                guard settlement?.phase != "settled" else { throw Self.ownedSaveFailure }
+                guard Self.ownedEqual(current.snapshot, snapshot) else { throw Self.ownedSaveFailure }
+                if let frozen = current.attempt { guard Self.ownedEqual(frozen, attempt) else { throw Self.ownedSaveFailure } }
+                else { guard case .rejected = command.terminal else { throw Self.ownedSaveFailure } }
+            } else { guard settlement != nil else { throw Self.ownedSaveFailure } }
+            guard try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == retainedEditor else { throw Self.ownedSaveFailure }
+        }
+        return .init(fingerprint: fingerprint, envelopeJSON: try Self.ownedJSON(envelope), snapshot: snapshot, attempt: attempt,
+            authorities: authorities, stages: stages, binding: binding, settlement: settlement)
+    }
+    private func decodeMixedSaveJournal(_ data: Data, checkingNative: Bool) throws -> PendingCommand {
+        guard data.count <= Self.ownedSaveMaximumBytes, let raw = try NativeJSON.jsonObject(with: data) as? [String: Any],
+              Set(raw.keys) == Set(["version", "method", "argumentsJSON", "editorDraft"] + (raw["terminal"] == nil ? [] : ["terminal"])),
+              let draft = raw["editorDraft"] as? [String: Any], Set(draft.keys) == Set(["id", "sessionID", "taskID", "generation", "method", "argumentsJSON"]),
+              let command = try? JSONDecoder().decode(PendingCommand.self, from: data), command.method == Self.mixedSaveMethod else { throw Self.ownedSaveFailure }
+        if let terminal = raw["terminal"] {
+            guard let value = terminal as? [String: Any], value.count == 1, let kind = value.keys.first,
+                  ["success", "rejected"].contains(kind), let body = value[kind] as? [String: Any],
+                  Set(body.keys) == Set(["_0"]), body["_0"] is String else { throw Self.ownedSaveFailure }
+        }
+        _ = try mixedSaveJournal(command, checkingNative: checkingNative)
+        return command
+    }
+    private func validateMixedSave(_ command: PendingCommand, result: String? = nil) throws -> (String, [NativeAttachmentDraftCoordinator.MixedSaveCandidate]) {
+        let captured = try mixedSaveJournal(command, checkingNative: false)
+        let raw = try invoke("attachmentFileEditSaveValidate", arguments: [captured.envelopeJSON])
+        guard let validation = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              Set(validation.keys) == Set(["version", "kind", "result", "settlementPlan"]), Self.isInteger(validation["version"], equalTo: 1),
+              validation["kind"] as? String == "owned-editor-file-edit-save", let expected = validation["result"] as? [String: Any],
+              Set(expected.keys) == Set(["id", "draft"]), let id = expected["id"] as? String, Self.ownedEqual(id, captured.snapshot.taskID),
+              expected["draft"] is [String: Any], let plan = validation["settlementPlan"] as? [[String: Any]] else { throw Self.ownedSaveFailure }
+        let acknowledged = result ?? captured.settlement?.resultJSON
+        if let acknowledged {
+            guard let value = try NativeJSON.jsonObject(with: Data(acknowledged.utf8)) as? [String: Any], Self.equalJSON(expected, value) else { throw Self.ownedSaveFailure }
+        }
+        let native = try mixedSaveJournal(command)
+        let record: NativeAttachmentDraftStore.MixedRecord?
+        if let binding = native.binding, case .mixed(let value) = binding.record { record = value } else { record = nil }
+        let candidates = try NativeAttachmentDraftCoordinator.mixedSaveCandidates(plan: plan, envelopeJSON: captured.envelopeJSON,
+            authorities: captured.authorities, record: record)
+        if let state = captured.settlement {
+            for (candidate, outcome) in zip(candidates, state.targets) {
+                if let outcome { guard candidate.outcomes.contains(outcome) else { throw Self.ownedSaveFailure } }
+            }
+        }
+        return (try Self.ownedJSON(expected), candidates)
+    }
+    private func requireMixedSaveTransition(_ before: PendingCommand, _ after: PendingCommand) throws {
+        if case .rejected = before.terminal {
+            guard try ownedEncoded(before.terminal) == ownedEncoded(after.terminal) else { throw Self.ownedSaveFailure }
+            return
+        }
+        guard case .success = before.terminal, case .success = after.terminal,
+              let old = try mixedSaveJournal(before, checkingNative: false).settlement,
+              let next = try mixedSaveJournal(after, checkingNative: false).settlement,
+              Self.ownedEqual(old.resultJSON, next.resultJSON) else { throw Self.ownedSaveFailure }
+        try requireMixedSaveStateTransition(old, next)
+    }
+    private func requireMixedSaveStateTransition(_ old: MixedSaveSettlement, _ next: MixedSaveSettlement) throws {
+        guard Self.ownedEqual(old.resultJSON, next.resultJSON), old.targets.count == next.targets.count,
+              old.stages.count == next.stages.count else { throw Self.ownedSaveFailure }
+        let a = old.targets + old.stages, b = next.targets + next.stages
+        var additions = 0
+        for (prior, incoming) in zip(a, b) {
+            if let prior { guard incoming.map({ Self.ownedEqual(prior, $0) }) == true else { throw Self.ownedSaveFailure } }
+            else if incoming != nil { additions += 1 }
+        }
+        guard additions <= 1, old.phase != "settled" || next.phase == "settled",
+              old.phase == next.phase || (old.phase == "domainSaved" && next.phase == "settled" && additions == 0
+                && a.allSatisfy({ $0 != nil })) else { throw Self.ownedSaveFailure }
+    }
+
+    private static func mixedSaveCommandEqual(_ lhs: PendingCommand, _ rhs: PendingCommand, terminal: Bool = true) -> Bool {
+        guard lhs.version == rhs.version, ownedEqual(lhs.method, rhs.method), ownedEqual(lhs.argumentsJSON, rhs.argumentsJSON),
+              let a = lhs.editorDraft, let b = rhs.editorDraft, ownedEqual(a, b) else { return false }
+        if !terminal { return true }
+        switch (lhs.terminal, rhs.terminal) {
+        case (nil, nil): return true
+        case (.success(let a), .success(let b)), (.rejected(let a), .rejected(let b)): return ownedEqual(a, b)
+        default: return false
+        }
+    }
+    private func requireMixedSaveBoundTransition(_ command: PendingCommand, turn: MixedSaveTurn,
+                                                state: MixedSaveSettlement?) throws {
+        guard let before = turn.acknowledged, Self.mixedSaveCommandEqual(before, command, terminal: false) else { throw Self.ownedSaveFailure }
+        switch (before.terminal, command.terminal) {
+        case (nil, nil): break
+        case (nil, .rejected(let message)):
+            guard state == nil, isDefiniteRejection(message, method: Self.mixedSaveMethod) else { throw Self.ownedSaveFailure }
+        case (nil, .success):
+            guard let state, state.phase == "domainSaved", state.targets.allSatisfy({ $0 == nil }), state.stages.allSatisfy({ $0 == nil }) else { throw Self.ownedSaveFailure }
+        case (.rejected, .rejected):
+            guard Self.mixedSaveCommandEqual(before, command) else { throw Self.ownedSaveFailure }
+        case (.success, .success):
+            guard let old = turn.acknowledgedState, let state else { throw Self.ownedSaveFailure }
+            try requireMixedSaveStateTransition(old, state)
+        default: throw Self.ownedSaveFailure
+        }
+    }
+
+    private func mixedSaveFileBinding(_ url: URL, maximumBytes: Int) throws -> MixedSaveFileBinding? {
+        let before = try ownedDiscardIdentity(url)
+        let bytes = try readJournalBytes(maximumBytes: maximumBytes, failure: Self.ownedSaveFailure, singleLink: true, url: url)
+        let after = try ownedDiscardIdentity(url)
+        guard before == after, (bytes == nil) == (after == nil) else { throw Self.ownedSaveFailure }
+        guard let bytes, let after else { return nil }
+        return .init(bytes: bytes, identity: after)
+    }
+    private func mixedSaveTurn(_ command: PendingCommand) throws -> MixedSaveTurn {
+        guard started, !closed, lockFD >= 0, let runtime = context, let jobs = attachmentJobs else { throw Self.ownedSaveFailure }
+        let captured = try mixedSaveJournal(command)
+        let turn = MixedSaveTurn(generation: attachmentGeneration, runtime: runtime, jobs: jobs, record: captured.binding,
+            editor: try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000))
+        turn.journal = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes)
+        turn.validated = captured
+        if let journal = turn.journal {
+            let actual = try decodeMixedSaveJournal(journal.bytes, checkingNative: true)
+            guard Self.mixedSaveCommandEqual(actual, command, terminal: false) else { throw Self.ownedSaveFailure }
+            turn.acknowledged = actual
+            turn.acknowledgedState = try mixedSaveJournal(actual, checkingNative: false).settlement
+        }
+        return turn
+    }
+    private func requireMixedSaveOwner(_ turn: MixedSaveTurn, cancellation: NativeAttachmentCancellation) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        try cancellation.check()
+        guard started, !closed, lockFD >= 0, context === turn.runtime, attachmentGeneration == turn.generation,
+              attachmentJobs === turn.jobs else { throw Self.ownedSaveFailure }
+    }
+    private func requireMixedSaveEvidence(_ command: PendingCommand, turn: MixedSaveTurn,
+                                          cancellation: NativeAttachmentCancellation,
+                                          state: MixedSaveSettlement?) throws -> Bool {
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        guard let current = pending, Self.mixedSaveCommandEqual(current, command),
+              try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == turn.journal,
+              try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == turn.editor else { throw Self.ownedSaveFailure }
+        let sidecar = try mixedSaveFileBinding(NativeAttachmentDraftStore(databaseURL: databaseURL).url, maximumBytes: Self.ownedSaveMaximumBytes)
+        if let sidecar {
+            guard let original = turn.record, sidecar.bytes == original.bytes,
+                  UInt64(sidecar.identity.device) == original.device, UInt64(sidecar.identity.inode) == original.inode else { throw Self.ownedSaveFailure }
+        } else { guard state?.phase == "settled" else { throw Self.ownedSaveFailure } }
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        return sidecar != nil
+    }
+    private func requireMixedSaveAuthority(_ command: PendingCommand, turn: MixedSaveTurn,
+                                           cancellation: NativeAttachmentCancellation, promotion: Bool = false,
+                                           editorAbsent: Bool = false, sidecarAbsent: Bool = false,
+                                           proposedState: MixedSaveSettlement? = nil) throws -> MixedSaveJournal {
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        guard let captured = turn.validated, let acknowledged = turn.acknowledged,
+              let current = pending, Self.mixedSaveCommandEqual(current, command),
+              Self.mixedSaveCommandEqual(acknowledged, command, terminal: false),
+              turn.journal != nil else { throw Self.ownedSaveFailure }
+        if promotion { try requireMixedSaveBoundTransition(command, turn: turn, state: proposedState) }
+        else { guard Self.mixedSaveCommandEqual(acknowledged, command) else { throw Self.ownedSaveFailure } }
+        let state = promotion ? proposedState : turn.acknowledgedState
+        let present = try requireMixedSaveEvidence(command, turn: turn, cancellation: cancellation, state: state)
+        if editorAbsent { guard turn.editor == nil else { throw Self.ownedSaveFailure } }
+        if sidecarAbsent { guard !present else { throw Self.ownedSaveFailure } }
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        return .init(fingerprint: captured.fingerprint, envelopeJSON: captured.envelopeJSON, snapshot: captured.snapshot,
+            attempt: captured.attempt, authorities: captured.authorities, stages: captured.stages,
+            binding: present ? turn.record : nil, settlement: state)
+    }
+    private func mixedSaveCoordinator(_ command: PendingCommand, turn: MixedSaveTurn,
+                                      cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentDraftCoordinator {
+        let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: turn.jobs, requireOwner: { [unowned self] in
+            _ = try self.requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+        }) { [unowned self] name, args in try self.invoke(name, arguments: args) }
+        #if DEBUG
+        coordinator.hooks = attachmentDraftHooks
+        #endif
+        return coordinator
+    }
+    private func preflightMixedSave(_ command: PendingCommand, snapshot: EditorDraftSnapshot, result: String,
+                                    candidates: [NativeAttachmentDraftCoordinator.MixedSaveCandidate]) throws {
+        let captured = try mixedSaveJournal(command, checkingNative: false)
+        try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: captured.attempt)
+        var reserved = command
+        reserved.terminal = .rejected(String(repeating: "\u{0000}", count: Self.ownedSaveRejectionBytes))
+        guard try JSONEncoder().encode(reserved).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        var state = MixedSaveSettlement(phase: "domainSaved", resultJSON: result,
+            targets: Array(repeating: nil, count: candidates.count), stages: Array(repeating: nil, count: captured.stages.count))
+        func reserve(_ state: MixedSaveSettlement) throws {
+            var representation = command
+            representation.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages))
+            guard try JSONEncoder().encode(representation).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        }
+        guard try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        try reserve(state)
+        for candidate in candidates {
+            // The actual Foundation encoder includes both nested escaping
+            // layers; the longest permitted ASCII outcome bounds every prefix.
+            state.targets[candidate.index] = candidate.outcomes.max(by: { $0.utf8.count < $1.utf8.count })!
+            try reserve(state)
+            let frame = try Self.ownedJSON(["version": 1, "envelopeJSON": captured.envelopeJSON, "candidateIndex": candidate.index])
+            guard frame.utf8.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        }
+        for index in captured.stages.indices { state.stages[index] = "removed"; try reserve(state) }
+        state.phase = "settled"; try reserve(state)
+    }
+    private func requireUnjournaledMixedSave(_ prepared: NativeAttachmentDraftCoordinator.MixedSavePreparation,
+                                            turn: MixedSaveTurn, attempt: EditorDraftAttempt?,
+                                            cancellation: NativeAttachmentCancellation) throws {
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        guard pending == nil, !recoveryActivationPending, try ownedJournalIsAbsent(),
+              let current = try editorDrafts.read(), Self.ownedEqual(current.snapshot, prepared.snapshot),
+              (current.attempt == nil && attempt == nil) || (current.attempt.flatMap { actual in attempt.map { Self.ownedEqual(actual, $0) } } == true),
+              let actual = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(), prepared.binding.matches(actual),
+              try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == turn.editor else { throw Self.ownedSaveFailure }
+    }
+    func saveAttachmentDraftMixed(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int,
+                                  cancellation: NativeAttachmentCancellation) throws -> String {
+        do {
+            let prepared = try attachmentDraftCoordinatorV3(cancellation: cancellation).prepareMixedSave(saveRequestJSON,
+                session: expectedSession, generation: expectedGeneration, cancellation: cancellation)
+            let attempt = EditorDraftAttempt(id: UUID().uuidString.lowercased(), sessionID: prepared.snapshot.sessionID,
+                taskID: prepared.snapshot.taskID, generation: prepared.snapshot.generation, method: "attachmentDraftSave",
+                argumentsJSON: try Self.ownedJSON([saveRequestJSON]))
+            let wrapper = try Self.ownedJSON(["version": 2, "recordSHA256": prepared.fingerprint,
+                "envelope": try NativeJSON.jsonObject(with: Data(prepared.envelopeJSON.utf8)),
+                "candidates": try prepared.candidates.map { ["index": $0.index, "authority": try $0.authority.object()] as [String: Any] },
+                "stages": prepared.stages] as [String: Any])
+            let command = PendingCommand(version: 2, method: Self.mixedSaveMethod, argumentsJSON: try Self.ownedJSON([wrapper]), editorDraft: attempt)
+            try preflightMixedSave(command, snapshot: prepared.snapshot, result: prepared.resultJSON, candidates: prepared.candidates)
+            guard let runtime = context, let jobs = attachmentJobs else { throw Self.ownedSaveFailure }
+            let turn = MixedSaveTurn(generation: attachmentGeneration, runtime: runtime, jobs: jobs, record: prepared.binding,
+                editor: try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000))
+            turn.validated = try mixedSaveJournal(command, checkingNative: false)
+            try requireUnjournaledMixedSave(prepared, turn: turn, attempt: nil, cancellation: cancellation)
+            try editorDrafts.freezeOwnedSaveMatching(expected: prepared.snapshot, attempt: attempt)
+            turn.editor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveFreeze)
+            #endif
+            try requireUnjournaledMixedSave(prepared, turn: turn, attempt: attempt, cancellation: cancellation)
+            pending = command
+            try persist(command, mixedGuard: { [unowned self] in
+                _ = try self.requireMixedSaveEvidence(command, turn: turn, cancellation: cancellation, state: nil)
+            })
+            guard let written = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes),
+                  written.bytes == (try ownedEncoded(command)) else { throw Self.ownedSaveFailure }
+            turn.journal = written
+            turn.acknowledged = command
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveJournal)
+            #endif
+            return try executeMixedSave(command, cancellation: cancellation, turn: turn, firstInvocation: true).value()
+        } catch let known as CoreHostAttachmentCleanupPending { throw known }
+        catch let rejected as CoreHostRejection { throw rejected }
+        catch { throw Self.ownedSaveFailure }
+    }
+    private func persistMixedSaveProgress(_ command: PendingCommand, turn: MixedSaveTurn,
+                                          cancellation: NativeAttachmentCancellation,
+                                          before: AttachmentDraftBoundary, after: AttachmentDraftBoundary) throws {
+        guard let captured = turn.validated else { throw Self.ownedSaveFailure }
+        let state: MixedSaveSettlement?
+        if case .success(let raw) = command.terminal { state = try mixedSaveState(raw, authorities: captured.authorities, stages: captured.stages) }
+        else { state = nil }
+        pending = command
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, promotion: true, proposedState: state)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(before)
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, promotion: true, proposedState: state)
+        let data = try JSONEncoder().encode(command)
+        guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        #if DEBUG
+        try faults?.journalWrite?()
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, promotion: true, proposedState: state)
+        try DurableFile.write(data, to: journalURL, privateDraft: true)
+        guard let written = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes), written.bytes == data else { throw Self.ownedSaveFailure }
+        // Only a confirmed write advances the acknowledged progress and inode.
+        turn.journal = written; turn.acknowledged = command; turn.acknowledgedState = state
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(after)
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+    }
+    /// Exactly one native-held branch completes synchronously. No JSC work,
+    /// pump or logging occurs between shared policy selection and typed IO.
+    private func mixedSaveTargetHandoff(_ command: PendingCommand, turn: MixedSaveTurn,
+                                        candidate: NativeAttachmentDraftCoordinator.MixedSaveCandidate,
+                                        cancellation: NativeAttachmentCancellation) throws -> String {
+        let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+        guard let binding = captured.binding, case .mixed(let record) = binding.record,
+              let host = turn.runtime.objectForKeyedSubscript("MindwtrHost"), !invoking else { throw Self.ownedSaveFailure }
+        let coordinator = try mixedSaveCoordinator(command, turn: turn, cancellation: cancellation)
+        let lease = MixedSaveCallbackLease()
+        lease.work = { [weak self] branch in
+            guard let self else { throw Self.ownedSaveFailure }
+            _ = try self.requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            let outcome: String
+            switch branch {
+            case "referenced": outcome = "referenced"
+            case "taskChanged": guard candidate.reason != "uncommitted-draft" else { throw Self.ownedSaveFailure }; outcome = "taskChanged"
+            case "retire": outcome = try coordinator.retireMixedSaveTarget(candidate, record: record, cancellation: cancellation)
+            default: throw Self.ownedSaveFailure
+            }
+            guard candidate.outcomes.contains(outcome) else { throw Self.ownedSaveFailure }
+            _ = try self.requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            return outcome
+        }
+        let referenced: @convention(block) () -> String = { [weak lease] in lease?.enter("referenced") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
+        let changed: @convention(block) () -> String = { [weak lease] in lease?.enter("taskChanged") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
+        let retire: @convention(block) () -> String = { [weak lease] in lease?.enter("retire") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
+        let input = try Self.ownedJSON(["version": 1, "envelopeJSON": captured.envelopeJSON, "candidateIndex": candidate.index])
+        guard input.utf8.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+        invoking = true
+        defer { lease.invalidate(); invoking = false; scheduleAttachmentIdle(immediate: true) }
+        turn.runtime.exception = nil
+        let returned = host.invokeMethod("attachmentFileEditSaveRetire", withArguments: [input, referenced, changed, retire])
+        let threw = turn.runtime.exception != nil; turn.runtime.exception = nil
+        guard !threw, lease.consumed, !lease.failed, let outcome = lease.outcome,
+              let returned, returned.isString, let text = returned.toString(), text.utf8.count <= 1024,
+              let value = try NativeJSON.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              Set(value.keys) == Set(["outcome"]), value["outcome"] as? String == outcome else { throw Self.ownedSaveFailure }
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+        return outcome
+    }
+    private func clearMixedSave(_ command: PendingCommand, turn: MixedSaveTurn,
+                                cancellation: NativeAttachmentCancellation, settled: Bool) throws {
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: settled, sidecarAbsent: settled)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeSaveJournalClear)
+        try faults?.journalRemove?()
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: settled, sidecarAbsent: settled)
+        try DurableFile.remove(journalURL)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterSaveJournalClear)
+        #endif
+        try requireMixedSaveOwner(turn, cancellation: cancellation)
+        guard let current = pending, try ownedEncoded(current) == ownedEncoded(command), try ownedJournalIsAbsent(),
+              try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == turn.editor else { throw Self.ownedSaveFailure }
+        let captured = try mixedSaveJournal(command)
+        if settled { guard captured.binding == nil else { throw Self.ownedSaveFailure } }
+        else { guard let actual = captured.binding, turn.record?.matches(actual) == true else { throw Self.ownedSaveFailure } }
+        pending = nil
+    }
+    private func executeMixedSave(_ original: PendingCommand, cancellation: NativeAttachmentCancellation,
+                                  turn supplied: MixedSaveTurn? = nil, firstInvocation: Bool = false) throws -> TerminalResult {
+        var command = original
+        var savedResult = try mixedSaveJournal(command, checkingNative: false).settlement?.resultJSON
+        do {
+            let turn = try supplied ?? mixedSaveTurn(command)
+            if supplied == nil {
+                // A warm uncertain progress write is owed before another action.
+                if turn.journal == nil {
+                    // A lost clear acknowledgment has only a warm retained
+                    // settled owner. Recreate its exact journal before release.
+                    try requireMixedSaveOwner(turn, cancellation: cancellation)
+                    let captured = try mixedSaveJournal(command)
+                    let settled = captured.settlement?.phase == "settled" && captured.binding == nil && turn.editor == nil
+                    let unwrittenIntent = command.terminal == nil && captured.binding != nil && turn.editor != nil
+                    guard settled || unwrittenIntent, try ownedJournalIsAbsent(), let current = pending,
+                          try ownedEncoded(current) == ownedEncoded(command) else { throw Self.ownedSaveFailure }
+                } else {
+                    _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, promotion: true,
+                        proposedState: turn.validated?.settlement)
+                }
+                try persist(command, mixedGuard: { [unowned self] in
+                    _ = try self.requireMixedSaveEvidence(command, turn: turn, cancellation: cancellation, state: turn.validated?.settlement)
+                })
+                guard let written = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes),
+                      written.bytes == (try ownedEncoded(command)) else { throw Self.ownedSaveFailure }
+                turn.journal = written
+                turn.acknowledged = command; turn.acknowledgedState = turn.validated?.settlement
+            }
+            _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+            let validated = try validateMixedSave(command)
+            _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+            if command.terminal == nil {
+                let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+                guard let binding = captured.binding, case .mixed(let record) = binding.record else { throw Self.ownedSaveFailure }
+                try mixedSaveCoordinator(command, turn: turn, cancellation: cancellation).verifyMixedSavePublished(record,
+                    envelopeJSON: captured.envelopeJSON, cancellation: cancellation)
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeSaveCommit)
+                #endif
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+                let result: String
+                do { result = try invoke(Self.mixedSaveMethod, arguments: [captured.envelopeJSON]) }
+                catch let failure as HostFailure {
+                    guard firstInvocation, isDefiniteRejection(failure.message, method: Self.mixedSaveMethod) else { throw failure }
+                    command.terminal = .rejected(failure.message)
+                    try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveTerminal, after: .afterSaveTerminal)
+                    return try finishMixedSaveRejection(command, turn: turn, cancellation: cancellation)
+                }
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterSaveCommit)
+                #endif
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+                _ = try validateMixedSave(command, result: result)
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+                let state = MixedSaveSettlement(phase: "domainSaved", resultJSON: result,
+                    targets: Array(repeating: nil, count: validated.1.count), stages: Array(repeating: nil, count: captured.stages.count))
+                command.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages)); savedResult = result
+                try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveTerminal, after: .afterSaveTerminal)
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["mixed-save", "domainSaved"])
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+            }
+            if case .rejected = command.terminal { return try finishMixedSaveRejection(command, turn: turn, cancellation: cancellation) }
+            guard var state = try mixedSaveJournal(command).settlement else { throw Self.ownedSaveFailure }
+            let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+            if state.phase != "settled" {
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.beforeSaveEditorDetach)
+                try faults?.editorDraftRemove?()
+                #endif
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+                try editorDrafts.removeOwnedSaveMatching(expected: captured.snapshot, attempt: captured.attempt)
+                turn.editor = nil
+                #if DEBUG
+                try attachmentDraftHooks?.boundary?(.afterSaveEditorDetach)
+                #endif
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                for candidate in validated.1 where state.targets[candidate.index] == nil {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeSaveTarget(candidate.index))
+                    #endif
+                    _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                    let outcome = try mixedSaveTargetHandoff(command, turn: turn, candidate: candidate, cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterSaveTarget(candidate.index))
+                    #endif
+                    _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                    state.targets[candidate.index] = outcome
+                    command.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages))
+                    try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveProgress, after: .afterSaveProgress)
+                }
+                guard let binding = captured.binding, case .mixed(let record) = binding.record else { throw Self.ownedSaveFailure }
+                let adds = NativeAttachmentDraftCoordinator.mixedSaveAdds(record)
+                for index in adds.indices where state.stages[index] == nil {
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.beforeSaveStage(index))
+                    #endif
+                    _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                    let outcome = try mixedSaveCoordinator(command, turn: turn, cancellation: cancellation).retireMixedSaveStage(adds[index], cancellation: cancellation)
+                    #if DEBUG
+                    try attachmentDraftHooks?.boundary?(.afterSaveStage(index))
+                    #endif
+                    _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                    state.stages[index] = outcome
+                    command.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages))
+                    try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveProgress, after: .afterSaveProgress)
+                }
+                state.phase = "settled"
+                command.terminal = .success(try mixedSaveStateJSON(state, stages: captured.stages))
+                try persistMixedSaveProgress(command, turn: turn, cancellation: cancellation, before: .beforeSaveSettled, after: .afterSaveSettled)
+            }
+            // A settled replay performs no file jobs, including private stages.
+            _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.beforeSaveRelease)
+            #endif
+            _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            try NativeAttachmentDraftStore(databaseURL: databaseURL).releaseSavedMixedMatching(fingerprint: captured.fingerprint)
+            #if DEBUG
+            try attachmentDraftHooks?.boundary?(.afterSaveRelease)
+            #endif
+            _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true, sidecarAbsent: true)
+            try clearMixedSave(command, turn: turn, cancellation: cancellation, settled: true)
+            _ = try? invoke("attachmentDraftAcknowledged", arguments: ["mixed-save", "settled"])
+            return .success(state.resultJSON)
+        } catch let rejected as CoreHostRejection { throw rejected }
+        catch {
+            if let savedResult { throw CoreHostAttachmentCleanupPending(resultJSON: savedResult) }
+            throw Self.ownedSaveFailure
+        }
+    }
+    private func finishMixedSaveRejection(_ command: PendingCommand, turn: MixedSaveTurn,
+                                          cancellation: NativeAttachmentCancellation) throws -> TerminalResult {
+        guard let terminal = command.terminal, case .rejected = terminal else { throw Self.ownedSaveFailure }
+        let captured = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.beforeSaveThaw)
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+        try editorDrafts.thawOwnedSaveMatching(expected: captured.snapshot, attempt: captured.attempt)
+        turn.editor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+        #if DEBUG
+        try attachmentDraftHooks?.boundary?(.afterSaveThaw)
+        #endif
+        _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation)
+        try clearMixedSave(command, turn: turn, cancellation: cancellation, settled: false)
+        return terminal
     }
 
     private func validateOwnedSaveAcknowledgement(_ command: PendingCommand, value: String? = nil) throws -> String {
@@ -2142,9 +2830,34 @@ private final class Engine: @unchecked Sendable {
     /// only through demonstrable journal absence, never through a read error.
     private func reconcileUnjournaledOwnedSave(snapshot: EditorDraftSnapshot, attempt: EditorDraftAttempt) throws {
         guard pending == nil, try ownedJournalIsAbsent(),
-              let record = try NativeAttachmentDraftStore(databaseURL: databaseURL).read(),
-              Self.ownedEqual(record.session.checkpoint, snapshot) else { throw Self.ownedSaveFailure }
-        _ = try NativeAttachmentDraftStore.ownedSaveFingerprint(record)
+              let binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else { throw Self.ownedSaveFailure }
+        switch binding.record {
+        case .legacy(let record):
+            guard Self.ownedEqual(record.session.checkpoint, snapshot) else { throw Self.ownedSaveFailure }
+            _ = try NativeAttachmentDraftStore.ownedSaveFingerprint(record)
+        case .mixed(let record):
+            guard Self.ownedEqual(record.session.checkpoint, snapshot) else { throw Self.ownedSaveFailure }
+            guard let runtime = context, let jobs = attachmentJobs else { throw Self.ownedSaveFailure }
+            let cancellation = NativeAttachmentCancellation()
+            let turn = MixedSaveTurn(generation: attachmentGeneration, runtime: runtime, jobs: jobs, record: binding,
+                editor: try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000))
+            func requireExactOwner() throws {
+                try requireMixedSaveOwner(turn, cancellation: cancellation)
+                guard pending == nil, !recoveryActivationPending, try ownedJournalIsAbsent(),
+                      let actual = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(), binding.matches(actual),
+                      try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == turn.editor,
+                      let current = try editorDrafts.read(), Self.ownedEqual(current.snapshot, snapshot),
+                      current.attempt.map({ Self.ownedEqual($0, attempt) }) == true else { throw Self.ownedSaveFailure }
+            }
+            try requireExactOwner()
+            let lineage = try NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record, managedDirectoryURI: mixedSaveManagedURI())
+            _ = try invoke("attachmentDraftValidateLineageV3", arguments: [lineage])
+            _ = try Self.ownedOriginalRequest(attempt)
+            try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
+            try requireExactOwner()
+            try editorDrafts.thawOwnedSaveMatching(expected: snapshot, attempt: attempt)
+            return
+        }
         _ = try Self.ownedOriginalRequest(attempt)
         try editorDrafts.preflightOwnedSave(expected: snapshot, attempt: attempt)
         try editorDrafts.thawOwnedSaveMatching(expected: snapshot, attempt: attempt)
@@ -5049,6 +5762,7 @@ private final class Engine: @unchecked Sendable {
     private func resolvePending() throws -> TerminalResult? {
         guard started, !closed else { throw HostFailure("Core host is not ready; retry startup") }
         guard let command = pending else { return nil }
+        if command.method == Self.mixedSaveMethod { return try executeMixedSave(command, cancellation: NativeAttachmentCancellation()) }
         if command.method == Self.ownedDiscardMethod {
             return try executeOwnedDiscard(command, cancellation: NativeAttachmentCancellation())
         }
@@ -6098,7 +6812,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func isDefiniteRejection(_ message: String, method: String) -> Bool {
-        if method == Self.ownedSaveMethod {
+        if method == Self.ownedSaveMethod || method == Self.mixedSaveMethod {
             return message.utf8.count <= Self.ownedSaveRejectionBytes
                 && ["INVALID_INPUT:", "TASK_NOT_FOUND:", "NOT_READY:", "STALE_REVISION:"].contains(where: { message.hasPrefix($0) })
         }
@@ -8987,6 +9701,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     private func journalArguments(_ command: PendingCommand, checkingEditorSnapshot: Bool = true) throws -> [Any] {
+        if command.method == Self.mixedSaveMethod { return [try mixedSaveJournal(command).envelopeJSON] }
         if command.method == Self.ownedSaveMethod { return [try ownedSaveJournal(command).envelopeJSON] }
         if command.method == "backupDocumentCommit" {
             _ = try backupOperationReference(command)
@@ -12295,7 +13010,23 @@ private final class Engine: @unchecked Sendable {
     }
 
 
-    private func persist(_ command: PendingCommand) throws {
+    private func persist(_ command: PendingCommand, mixedGuard: (() throws -> Void)? = nil) throws {
+        if command.method == Self.mixedSaveMethod {
+            let data = try ownedEncoded(command)
+            guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
+            _ = try mixedSaveJournal(command, checkingNative: false)
+            try requireOwnedJournalWriteIdentity(command)
+            try mixedGuard?()
+            let previous = try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes)
+            #if DEBUG
+            try faults?.journalWrite?()
+            #endif
+            guard try mixedSaveFileBinding(journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == previous else { throw Self.ownedSaveFailure }
+            try requireOwnedJournalWriteIdentity(command)
+            try mixedGuard?()
+            try DurableFile.write(data, to: journalURL, privateDraft: true)
+            return
+        }
         if command.method == Self.ownedSaveMethod || command.method == Self.ownedDiscardMethod {
             let data = try JSONEncoder().encode(command)
             guard data.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
