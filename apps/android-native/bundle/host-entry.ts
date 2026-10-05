@@ -1077,38 +1077,57 @@ const settledAttachmentSaveState = () => {
     try { return settledAttachmentDiscardState(); }
     catch { throw attachmentSaveNotReady(); }
 };
+type AttachmentSavePlan = Readonly<{
+    envelopeJSON: string;
+    taskID: string;
+    afterRevision: ReturnType<typeof taskRevisionOf>;
+    settlementPlan: ReadonlyArray<Readonly<(ReturnType<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>
+        & { ok: true })['value']['settlementPlan'][number]>>;
+}>;
+// One detached historical plan only; current storage and references are never retained.
+let attachmentSavePlan: AttachmentSavePlan | null = null;
 /** Private same-turn Save settlement fence; callbacks carry native-held proofs. */
 const retireAttachmentFileEditSave = (json: string, referencedCallback: () => string,
     taskChangedCallback: () => string, retireCallback: () => string): string => {
     if ([referencedCallback, taskChangedCallback, retireCallback].some((callback) => typeof callback !== 'function')) {
         throw attachmentSaveInvalid();
     }
-    let envelope: Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
-    let candidate: ReturnType<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave> & { ok: true };
+    let plan: AttachmentSavePlan;
     let index: number;
     try {
         const input = attachmentDraftJson(json) as Record<string, unknown> | null;
         if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 3
-            || input.version !== 1 || typeof input.envelopeJSON !== 'string'
+            || input.version !== 1 || typeof input.envelopeJSON !== 'string' || input.envelopeJSON.length > 8 * 1024 * 1024
+            || new TextEncoder().encode(input.envelopeJSON).byteLength > 8 * 1024 * 1024
             || !Number.isSafeInteger(input.candidateIndex) || (input.candidateIndex as number) < 0) throw attachmentSaveInvalid();
-        envelope = attachmentDraftJson(input.envelopeJSON) as typeof envelope;
-        const checked = contract.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope);
-        if (!checked.ok || (input.candidateIndex as number) >= checked.value.settlementPlan.length) throw attachmentSaveInvalid();
-        candidate = checked;
         index = input.candidateIndex as number;
+        if (attachmentSavePlan?.envelopeJSON === input.envelopeJSON) plan = attachmentSavePlan;
+        else {
+            const envelope = attachmentDraftJson(input.envelopeJSON) as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
+            const checked = contract.validatePreparedOwnedEditorFileEditTaskDraftSave(envelope);
+            if (!checked.ok || index >= checked.value.settlementPlan.length) throw attachmentSaveInvalid();
+            const decision = envelope.prepared.decision;
+            const afterTask = decision.kind === 'changed' ? decision.prepared.effect.task.after : decision.effect.task.after;
+            plan = Object.freeze({ envelopeJSON: input.envelopeJSON, taskID: envelope.request.saveRequest.id,
+                afterRevision: taskRevisionOf(afterTask),
+                settlementPlan: Object.freeze(checked.value.settlementPlan.map((value) => Object.freeze({ ...value,
+                    attachment: Object.freeze({ ...value.attachment }) }))) });
+            attachmentSavePlan = plan;
+        }
+        if (index >= plan.settlementPlan.length) throw attachmentSaveInvalid();
     } catch { throw attachmentSaveInvalid(); }
-    const selected = candidate.value.settlementPlan[index];
-    const decision = envelope.prepared.decision;
-    const afterTask = decision.kind === 'changed' ? decision.prepared.effect.task.after : decision.effect.task.after;
+    const selected = plan.settlementPlan[index];
+    // Out-of-order and failed last calls safely revalidate on a later retry.
+    if (index === plan.settlementPlan.length - 1) attachmentSavePlan = null;
     const before = settledAttachmentSaveState();
     const tasks = before.state._allTasks, projects = before.state._allProjects, taskMap = before.state._tasksById;
     const generation = before.status.generation;
     let referenced: boolean, moved: boolean;
     try {
         referenced = isAttachmentFileInUse(selected.attachment.uri, [...tasks, ...projects]);
-        const currentTask = taskMap.get(envelope.request.saveRequest.id);
+        const currentTask = taskMap.get(plan.taskID);
         moved = selected.reason !== 'uncommitted-draft'
-            && (!currentTask || taskRevisionOf(currentTask) !== taskRevisionOf(afterTask));
+            && (!currentTask || taskRevisionOf(currentTask) !== plan.afterRevision);
     } catch { throw attachmentSaveNotReady(); }
     const after = settledAttachmentSaveState();
     if (after.state._allTasks !== tasks || after.state._allProjects !== projects || after.state._tasksById !== taskMap

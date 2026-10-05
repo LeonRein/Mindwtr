@@ -4155,6 +4155,95 @@ const poll = async (state, id) => {
         assert.deepEqual(invoke(state, input(f, f.plan.length - 1)), { value: { outcome: 'removed' }, seen: ['retire'] });
         assert.equal(state.fileEditSaveInputs.length - before, 1, 'full frozen envelope is validated once before candidate selection');
     });
+    // Task263: reuse only the exact immutable envelope/plan, with current gates
+    // and branch selection exercised again on each cache hit.
+    const reuse = await fixture(3), validations = (state) => state.fileEditSaveInputs.filter(([method]) => method === 'validate').length;
+    let memoCases = 0;
+    const checkMemo = async (work) => { await check(work); memoCases++; };
+    await checkMemo(async () => {
+        const state = await make(many);
+        for (let index = 0; index < many.plan.length; index++) {
+            assert.deepEqual(invoke(state, input(many, index)), { value: { outcome: 'removed' }, seen: ['retire'] });
+        }
+        assert.equal(validations(state), 1, 'all 257 candidates share one complete pure validation');
+        invoke(state, input(many));
+        assert.equal(validations(state), 2, 'the last candidate released the historical memo');
+    });
+    await checkMemo(async () => {
+        const state = await make(reuse);
+        for (const index of [1, 0, 1]) invoke(state, input(reuse, index));
+        assert.equal(validations(state), 1, 'nonlast reordering retains only one immutable plan');
+        invoke(state, input(reuse, 2)); invoke(state, input(reuse));
+        assert.equal(validations(state), 2, 'a call after the last index fully revalidates');
+    });
+    await checkMemo(async () => {
+        const state = await make(reuse), raw = JSON.stringify(reuse.envelope);
+        for (const envelopeJSON of [raw, ` ${raw}\n`, raw.replaceAll('task259', 't\\u0061sk259'), raw]) {
+            assert.deepEqual(invoke(state, JSON.stringify({ version: 1, envelopeJSON, candidateIndex: 0 })),
+                { value: { outcome: 'removed' }, seen: ['retire'] });
+        }
+        assert.equal(validations(state), 4, 'whitespace and equivalent Unicode escaping are different exact envelope bytes');
+    });
+    await checkMemo(async () => {
+        const state = await make(reuse); invoke(state, input(reuse));
+        const forged = JSON.parse(JSON.stringify(reuse.envelope));
+        forged.request.ownedDraft.priorOperations[0].operation.requestId += '\n'; forged.prepared.request = forged.request;
+        assert.throws(() => invoke(state, JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(forged), candidateIndex: 1 })),
+            /INVALID_INPUT: Invalid attachment Save handoff/);
+        assert.equal(validations(state), 2, 'a different history reaches full validation and cannot borrow the previous plan');
+        for (const json of [JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(reuse.envelope), candidateIndex: 3 }),
+            JSON.stringify({ version: 1, envelopeJSON: JSON.stringify(reuse.envelope), candidateIndex: 1, permission: true }),
+            JSON.stringify({ version: 1, envelopeJSON: '界'.repeat(3 * 1024 * 1024), candidateIndex: 1 }), '{private']) {
+            assert.throws(() => invoke(state, json), /INVALID_INPUT: Invalid attachment Save handoff/);
+        }
+        assert.deepEqual(invoke(state, input(reuse, 1)), { value: { outcome: 'removed' }, seen: ['retire'] });
+        assert.equal(validations(state), 2, 'invalid frames/indexes do not replace the previously validated exact plan');
+    });
+    await checkMemo(async () => {
+        const state = await make(reuse); invoke(state, input(reuse));
+        state.ownerProjects = [{ attachments: [{ kind: 'file', uri: reuse.plan[1].attachment.uri }] }];
+        assert.deepEqual(invoke(state, input(reuse, 1)), { value: { outcome: 'referenced' }, seen: ['referenced'] });
+        state.ownerProjects = []; state.ownerTaskMap = new Map([['task259', { ...reuse.after, rev: reuse.after.rev + 1 }]]);
+        assert.deepEqual(invoke(state, input(reuse, 1)), { value: { outcome: 'taskChanged' }, seen: ['taskChanged'] });
+        state.ownerTaskMap = new Map([['task259', reuse.after]]);
+        assert.deepEqual(invoke(state, input(reuse, 1)), { value: { outcome: 'removed' }, seen: ['retire'] });
+        assert.equal(validations(state), 1, 'references/current revision and callback choice stay fresh on hits');
+    });
+    for (const field of ['queued', 'inFlight', 'immediate', 'retrying', 'failed']) await checkMemo(async () => {
+        const state = await make(reuse); invoke(state, input(reuse)); state.persistenceStatus[field] = true;
+        assert.throws(() => invoke(state, input(reuse, 1)), /NOT_READY: Attachment Save requires settled native storage/);
+        state.persistenceStatus[field] = false; invoke(state, input(reuse, 1));
+        assert.equal(validations(state), 1, 'readiness refusal never turns the immutable memo into a permission');
+    });
+    for (const field of ['tasks', 'projects', 'map', 'generation', 'queued', 'sandbox', 'adapter']) await checkMemo(async () => {
+        const state = await make(reuse); invoke(state, input(reuse));
+        const row = { id: 'cache-hit-inert' };
+        Object.defineProperty(row, 'attachments', { get() {
+            if (field === 'tasks') state.lastLoaded.tasks = [...state.lastLoaded.tasks];
+            if (field === 'projects') state.ownerProjects = [];
+            if (field === 'map') state.ownerTaskMap = new Map(state.ownerTaskMap);
+            if (field === 'generation') state.persistenceStatus.generation++;
+            if (field === 'queued') state.persistenceStatus.queued = true;
+            if (field === 'sandbox') state.sandbox = true;
+            if (field === 'adapter') state.adapter = {};
+            return [];
+        } });
+        state.lastLoaded.tasks.push(row);
+        assert.throws(() => invoke(state, input(reuse, 1)), /NOT_READY: Attachment Save requires settled native storage/);
+        assert.equal(validations(state), 1, 'collection/map/generation fences are still checked on hits');
+    });
+    await checkMemo(async () => {
+        const state = await make(reuse); invoke(state, input(reuse)); const json = input(reuse, 1);
+        assert.throws(() => state.MindwtrHost.attachmentFileEditSaveRetire(json, () => '{}', () => '{}', () => '{}'),
+            /INVALID_INPUT: Invalid attachment Save handoff/);
+        assert.deepEqual(invoke(state, json), { value: { outcome: 'removed' }, seen: ['retire'] });
+        assert.equal(validations(state), 1, 'a refused callback caches neither callback nor outcome');
+        assert.throws(() => state.MindwtrHost.attachmentFileEditSaveRetire(input(reuse, 2), () => '{}', () => '{}', () => { throw Error('private'); }),
+            /NOT_READY: Attachment Save requires settled native storage/);
+        invoke(state, input(reuse, 2));
+        assert.equal(validations(state), 2, 'a failed last callback still releases the memo before retry');
+    });
+    console.log(`Task263: ${memoCases} immutable Save-plan reuse checks (real254 complete plan; fresh mutable fences on cache hits)`);
     for (const outcome of ['removed', 'absent', 'generationChanged', 'unsafeEntry', 'noOwnedGeneration', 'unmanaged']) await check(async () => {
         assert.deepEqual(invoke(await make(), input(), outcome), { value: { outcome }, seen: ['retire'] });
     });
