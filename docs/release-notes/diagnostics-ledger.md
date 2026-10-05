@@ -83,6 +83,8 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 - **`v1.3.5/ios-attachment-owned-save`** — `apps/android-native/bundle/host-entry.ts`, after the native owner completes ordinary editor/file Add Save. `Native iOS attachment draft acknowledged` with `operation=save`, `outcome=confirmed` proves durable task acknowledgment, private-stage retirement, and exact draft/journal release. Published task files and picker source copies remain untouched. This internal path does not establish file Remove, Discard cleanup, picker/viewer UI, or sync acceptance. No task identifiers, content, filenames, paths, URLs, hashes, or raw errors are logged.
 
+- **`v1.3.5/reminder-startup-subscribe`** — `apps/mobile/lib/notification-service-local.ts`, in the store listener `startLocalMobileNotifications` now attaches before its first reschedule cycle. `[Local Notifications] Store changed during the startup cycle; reschedule queued` proves a task or settings change that landed while the startup cycle ran (a capture-queue import, a sync) queued a second cycle, so that task gets its alarm. Before, the listener attached only after the first cycle and the change got no alarm until a later store change. No task titles or identifiers are logged.
+
 ## v1.3.4 (add before tagging, trim in the release after)
 
 - **`v1.3.4/android-detailed-capture`** — `apps/mobile/app/(drawer)/(tabs)/capture-quick.tsx`. `Android detailed capture opened` proves the text capture route requested the existing in-app sheet. Launch **Add task…**, select Focus and save once; separately confirm the task appears in the ordinary Focus widget. This line alone does not prove saving or widget publication. No task content or identifiers are logged. (#1333)
