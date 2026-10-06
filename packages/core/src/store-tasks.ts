@@ -996,15 +996,15 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
         // adapter, yield once as the module load did, then retain every guard after the await.
         await Promise.resolve();
         const shared = referenceBatchModules.shared;
+        try {
+            logInfo('Reference bulk action validators read', {
+                scope: 'store', category: 'storage',
+                context: { releaseCheck: 'v1.3.5/reference-batch-registry', outcome: family && shared ? 'registered' : 'missing' },
+            });
+        } catch { /* Diagnostics must not affect the guarded action. */ }
         if (!family || !shared) return result;
         const { validateEnvelope, authorityMatches } = family(input);
         const { historyRowLoadProjection, NativeReceiptSqliteAdapter } = shared;
-        try {
-            logInfo('Reference bulk action module loaded', {
-                scope: 'store', category: 'storage',
-                context: { releaseCheck: 'v1.3.4/ios-reference-bulk-init', outcome: 'loaded' },
-            });
-        } catch { /* Diagnostics must not affect the guarded action. */ }
         if (getStorage() !== adapter || !(adapter instanceof NativeReceiptSqliteAdapter) || !adapter.concurrentWritesGuarded
             || !validateEnvelope()) return result;
         set((memory) => {
