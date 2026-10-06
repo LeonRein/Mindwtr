@@ -638,6 +638,10 @@ export const faOverrides: Record<string, string> = {
 
         'contexts.title': 'زمینه‌ها',
         'contexts.filter': 'فیلتر کارها بر اساس زمینه',
+        'contexts.dropAdd': 'افزودن {context}',
+        'contexts.dropAdded': '{context} افزوده شد',
+        'contexts.dropFailed': 'ذخیرهٔ تخصیص زمینه ممکن نشد.',
+        'contexts.dropUndoFailed': 'واگردِ تخصیص زمینه ممکن نشد.',
         'filters.label': 'فیلترها',
         'filters.active': 'فیلترهای فعال',
         'filters.clear': 'پاک کردن',

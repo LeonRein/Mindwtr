@@ -663,6 +663,10 @@ export const jaOverrides: Record<string, string> = {
         // Contact / Contexts (Mobile updates)
         'contexts.title': 'コンテキスト',
         'contexts.filter': 'コンテキストでタスクを絞り込む',
+        'contexts.dropAdd': '{context} を追加',
+        'contexts.dropAdded': '{context} を追加しました',
+        'contexts.dropFailed': 'コンテキストの割り当てを保存できませんでした。',
+        'contexts.dropUndoFailed': 'コンテキストの割り当てを元に戻せませんでした。',
         'filters.label': '絞り込み',
         'filters.active': '適用中の絞り込み',
         'filters.clear': 'クリア',

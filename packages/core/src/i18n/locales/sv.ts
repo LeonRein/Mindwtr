@@ -638,6 +638,10 @@ export const svOverrides: Record<string, string> = {
 
         'contexts.title': 'Kontexter',
         'contexts.filter': 'Filtrera uppgifter efter kontext',
+        'contexts.dropAdd': 'Lägg till {context}',
+        'contexts.dropAdded': 'Lade till {context}',
+        'contexts.dropFailed': 'Det gick inte att spara kontexttilldelningen.',
+        'contexts.dropUndoFailed': 'Det gick inte att ångra kontexttilldelningen.',
         'filters.label': 'Filter',
         'filters.active': 'Aktiva filter',
         'filters.clear': 'Rensa',
