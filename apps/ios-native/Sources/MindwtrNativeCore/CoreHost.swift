@@ -15310,6 +15310,61 @@ private final class Engine: @unchecked Sendable {
         try requireRetainedOrdinaryTurn()
     }
 
+    /// A settled read may resolve one container UUID, but never gains ownership
+    /// of old paths or rewrites the attachment/journal which names them.
+    private func relocatedFileOpenURI(_ selected: [String: Any]) throws -> String? {
+        guard let uri = selected["uri"] as? String else { throw Self.ownedSaveFailure }
+        let managed = try mixedSaveManagedURI(), prefix = Data(managed.utf8), target = Data(uri.utf8)
+        let leaf = target.dropFirst(prefix.count)
+        if target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) { return nil }
+        guard let id = selected["id"] as? String, id.utf8.count == 36,
+              UUID(uuidString: id)?.uuidString.lowercased() == id,
+              let hash = selected["fileHash"] as? String, hash.utf8.count == 64,
+              hash.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
+              let slash = uri.lastIndex(of: "/"), slash < uri.index(before: uri.endIndex) else { throw Self.ownedSaveFailure }
+        let oldPath = try Self.mixedSaveCanonicalPath(uri, directory: false)
+        let original = String(uri[...slash])
+        let mapping = try Self.mixedSaveRelocation(original: original, current: managed)
+        guard mapping.containerComponentIndex != nil else { throw Self.ownedSaveFailure }
+        let current = try Self.mixedSaveCanonicalPath(managed, directory: true)
+        return URL(fileURLWithPath: current + "/" + (oldPath as NSString).lastPathComponent, isDirectory: false).absoluteString
+    }
+    private func relocatedFileOpenProof(_ proof: NativeAttachmentFiles.BaselineAttachmentProof?, selected: [String: Any]) throws {
+        guard let proof else { return }
+        guard let hash = selected["fileHash"] as? String, Self.ownedEqual(proof.sha256, hash.lowercased()) else { throw Self.ownedSaveFailure }
+        if let size = selected["size"] {
+            guard Self.isInteger(size), let number = size as? NSNumber,
+                  number.doubleValue >= 0, number.doubleValue <= 9_007_199_254_740_991,
+                  number.int64Value == proof.size else { throw Self.ownedSaveFailure }
+        }
+    }
+    /// Capture actual persisted attachment cells, not an editor or cached store
+    /// projection. The same raw row is checked after every asynchronous boundary.
+    private func relocatedFileOpenRow(table: String, id: String, selected: [String: Any]) throws -> [String: Any] {
+        guard ["tasks", "projects"].contains(table), let selectedID = selected["id"] as? String else { throw Self.ownedSaveFailure }
+        let raw = try requireDatabase().execute("SELECT attachments,deletedAt,purgedAt,rev,updatedAt FROM \(table) WHERE id=? AND length(CAST(attachments AS BLOB))<=6400000",
+            parametersJSON: Self.ownedJSON([id]))
+        guard let rows = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [[String: Any]], rows.count == 1,
+              let row = rows.first, row["deletedAt"] is NSNull, row["purgedAt"] is NSNull,
+              let encoded = row["attachments"] as? String,
+              let items = try NativeJSON.jsonObject(with: Data(encoded.utf8)) as? [[String: Any]] else { throw Self.ownedSaveFailure }
+        let matches = items.filter { ($0["id"] as? String).map { Self.ownedEqual($0, selectedID) } == true }
+        guard matches.count == 1, let saved = matches.first, Self.equalJSON(saved, selected) else { throw Self.ownedSaveFailure }
+        return row
+    }
+    private func relocatedFileOpenResult(_ result: String, originalURI: String, currentURI: String) throws -> String {
+        guard var answer = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any] else { throw Self.ownedSaveFailure }
+        guard answer["status"] as? String == "available" else { return result }
+        guard var plan = answer["open"] as? [String: Any] else { throw Self.ownedSaveFailure }
+        if plan["kind"] as? String == "file" { plan["uri"] = currentURI }
+        else {
+            guard var item = plan["attachment"] as? [String: Any] else { throw Self.ownedSaveFailure }
+            item["uri"] = currentURI; plan["attachment"] = item
+        }
+        answer["open"] = plan; answer["relocatedFrom"] = originalURI
+        return try Self.ownedJSON(answer)
+    }
+
     func prepareTaskFileOpen(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
         dispatchPrecondition(condition: .onQueue(queue))
         let failure = HostFailure("Attachment file could not be opened")
@@ -15317,10 +15372,23 @@ private final class Engine: @unchecked Sendable {
             guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0,
                   let runtime = context, let jobs = attachmentJobs else { throw failure }
             let generation = attachmentGeneration
+            var relocatedURI: String?
+            var relocatedEditor: MixedSaveFileBinding?
+            var relocatedRow: [String: Any]?
+            var relocatedSelected: [String: Any]?
+            var relocatedID: String?
             func owner() throws {
                 try cancellation.check()
                 guard self.started, !self.closed, self.pending == nil, !self.recoveryActivationPending, self.lockFD >= 0,
                       self.context === runtime, self.attachmentJobs === jobs, self.attachmentGeneration == generation else { throw failure }
+                if let selected = relocatedSelected, let id = relocatedID, let row = relocatedRow {
+                    try self.requireNoAttachmentDraft()
+                    guard try self.mixedSaveFileBinding(self.journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == nil,
+                          try self.mixedSaveFileBinding(self.editorDrafts.url, maximumBytes: 3_000_000) == relocatedEditor,
+                          try self.editorDrafts.read()?.attempt == nil,
+                          Self.ownedEqual(try self.relocatedFileOpenURI(selected) ?? "", relocatedURI ?? ""),
+                          Self.equalJSON(try self.relocatedFileOpenRow(table: "tasks", id: id, selected: selected), row) else { throw failure }
+                }
             }
             try owner()
             guard requestJSON.utf8.count <= 6_400_000,
@@ -15332,11 +15400,15 @@ private final class Engine: @unchecked Sendable {
                   let selected = attachments.first(where: { ($0["id"] as? String).map { Self.ownedEqual($0, selectedID) } == true }),
                   selected["kind"] as? String == "file", selected["deletedAt"] == nil,
                   let uri = selected["uri"] as? String else { throw failure }
-            // The shared availability path may cache an external URI. Admit only
-            // its exact managed spelling, never an alias which could trigger copy.
-            let prefix = Data(try mixedSaveManagedURI().utf8), target = Data(uri.utf8)
-            let leaf = target.dropFirst(prefix.count)
-            guard target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) else { throw failure }
+            relocatedURI = try relocatedFileOpenURI(selected)
+            if relocatedURI != nil {
+                try requireNoAttachmentDraft()
+                relocatedEditor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+                relocatedRow = try relocatedFileOpenRow(table: "tasks", id: taskID, selected: selected)
+                relocatedSelected = selected; relocatedID = taskID
+                try owner()
+            }
+            let observedURI = relocatedURI ?? uri
             let viewRequest = try Self.ownedJSON(["id": taskID, "offset": 0, "limit": 1])
             func liveTask() throws {
                 try owner()
@@ -15348,13 +15420,17 @@ private final class Engine: @unchecked Sendable {
             try liveTask()
             let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs,
                 requireOwner: owner, invoke: { [unowned self] name, args in try self.invoke(name, arguments: args) })
-            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation)
+            if relocatedURI != nil { try relocatedFileOpenProof(before, selected: selected) }
             try owner()
-            let result = try localAttachmentRequest(name: "openAttachment", requestJSON: requestJSON, cancellation: cancellation)
+            let result = try relocatedURI == nil
+                ? localAttachmentRequest(name: "openAttachment", requestJSON: requestJSON, cancellation: cancellation)
+                : invoke("taskLocalFileOpenPlan", arguments: [requestJSON, before != nil], localCancellation: cancellation)
             try owner()
             guard let answer = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any],
                   Set(answer.keys) == Set(["status", "message", "update", "open"]), answer["update"] is NSNull,
-                  let status = answer["status"] as? String else { throw failure }
+                  let status = answer["status"] as? String,
+                  relocatedURI == nil || status == (before == nil ? "unavailable" : "available") else { throw failure }
             if status == "available" {
                 guard answer["message"] is NSNull, let plan = answer["open"] as? [String: Any],
                       let kind = plan["kind"] as? String else { throw failure }
@@ -15375,12 +15451,21 @@ private final class Engine: @unchecked Sendable {
                 guard ["unavailable", "unrecoverable", "generation-conflict", "stale"].contains(status),
                       answer["open"] is NSNull, answer["message"] is NSNull || answer["message"] is String else { throw failure }
             }
-            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation)
+            if relocatedURI != nil { try relocatedFileOpenProof(after, selected: selected) }
             guard before == after else { throw failure }
             try liveTask(); try owner()
             if status == "available" {
                 _ = try? invoke("attachmentDraftAcknowledged", arguments: ["file-open", "prepared"])
                 try owner()
+            }
+            if let relocatedURI, status == "available" {
+                let resolved = try relocatedFileOpenResult(result, originalURI: uri, currentURI: relocatedURI)
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["relocated-task-file-open", "prepared"])
+                try liveTask(); try owner()
+                guard try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation) == before else { throw failure }
+                try owner()
+                return resolved
             }
             return result
         } catch {
@@ -15396,10 +15481,23 @@ private final class Engine: @unchecked Sendable {
             guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0,
                   let runtime = context, let jobs = attachmentJobs else { throw failure }
             let generation = attachmentGeneration
+            var relocatedURI: String?
+            var relocatedEditor: MixedSaveFileBinding?
+            var relocatedRow: [String: Any]?
+            var relocatedSelected: [String: Any]?
+            var relocatedID: String?
             func owner() throws {
                 try cancellation.check()
                 guard self.started, !self.closed, self.pending == nil, !self.recoveryActivationPending, self.lockFD >= 0,
                       self.context === runtime, self.attachmentJobs === jobs, self.attachmentGeneration == generation else { throw failure }
+                if let selected = relocatedSelected, let id = relocatedID, let row = relocatedRow {
+                    try self.requireNoAttachmentDraft()
+                    guard try self.mixedSaveFileBinding(self.journalURL, maximumBytes: Self.ownedSaveMaximumBytes) == nil,
+                          try self.mixedSaveFileBinding(self.editorDrafts.url, maximumBytes: 3_000_000) == relocatedEditor,
+                          try self.editorDrafts.read()?.attempt == nil,
+                          Self.ownedEqual(try self.relocatedFileOpenURI(selected) ?? "", relocatedURI ?? ""),
+                          Self.equalJSON(try self.relocatedFileOpenRow(table: "projects", id: id, selected: selected), row) else { throw failure }
+                }
             }
             try owner()
             guard requestJSON.utf8.count <= 2_000,
@@ -15427,13 +15525,19 @@ private final class Engine: @unchecked Sendable {
             let matches = attachments.filter { ($0["id"] as? String).map { Self.ownedEqual($0, selectedID) } == true }
             guard matches.count == 1, let selected = matches.first, selected["kind"] as? String == "file",
                   selected["deletedAt"] == nil, let uri = selected["uri"] as? String, !uri.isEmpty else { throw failure }
-            // Only this installation's exact flat managed spelling grants byte authority.
-            let prefix = Data(try mixedSaveManagedURI().utf8), target = Data(uri.utf8)
-            let leaf = target.dropFirst(prefix.count)
-            guard target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) else { throw failure }
+            relocatedURI = try relocatedFileOpenURI(selected)
+            if relocatedURI != nil {
+                try requireNoAttachmentDraft()
+                relocatedEditor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
+                relocatedRow = try relocatedFileOpenRow(table: "projects", id: projectID, selected: selected)
+                relocatedSelected = selected; relocatedID = projectID
+                try owner()
+            }
+            let observedURI = relocatedURI ?? uri
             let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs,
                 requireOwner: owner, invoke: { [unowned self] name, args in try self.invoke(name, arguments: args) })
-            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation)
+            if relocatedURI != nil { try relocatedFileOpenProof(before, selected: selected) }
             try liveProject()
             let result = try invoke("projectLocalFileOpenPlan", arguments: [requestJSON, before != nil], localCancellation: cancellation)
             try liveProject()
@@ -15460,7 +15564,8 @@ private final class Engine: @unchecked Sendable {
             } else {
                 guard answer["open"] is NSNull, answer["message"] is String else { throw failure }
             }
-            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation)
+            if relocatedURI != nil { try relocatedFileOpenProof(after, selected: selected) }
             guard before == after else { throw failure }
             try liveProject()
             if status == "available" {
@@ -15468,6 +15573,14 @@ private final class Engine: @unchecked Sendable {
                 try liveProject()
             }
             try owner()
+            if let relocatedURI, status == "available" {
+                let resolved = try relocatedFileOpenResult(result, originalURI: uri, currentURI: relocatedURI)
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["relocated-project-file-open", "prepared"])
+                try liveProject(); try owner()
+                guard try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: observedURI, cancellation: cancellation) == before else { throw failure }
+                try owner()
+                return resolved
+            }
             return result
         } catch {
             if cancellation.isCancelled || error is CancellationError { throw CancellationError() }

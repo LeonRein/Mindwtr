@@ -3421,6 +3421,8 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
 }
 
 const fakeCore = `
+import { mapSqliteTaskRow as hydrateTask285 } from ${JSON.stringify(resolve(app, '../../packages/core/src/sqlite-adapter.ts'))};
+globalThis.hydrateTaskAttachments285 = (attachments) => hydrateTask285({ id: 'task285', attachments: JSON.stringify(attachments) }).attachments;
 export { planAttachmentOpen, getAttachmentResolutionMessage } from ${JSON.stringify(resolve(app, '../../packages/core/src/attachment-editor-model.ts'))};
 import { logInfo as realLogInfo, setLogger as setRealLogger } from ${JSON.stringify(resolve(app, '../../packages/core/src/logger.ts'))};
 export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLoggingEnabled } from ${JSON.stringify(resolve(app, '../../packages/core/src/diagnostics-log.ts'))};
@@ -5398,6 +5400,83 @@ const poll = async (state, id) => {
         assert.deepEqual(local.attachmentInputs, []); assert.deepEqual(local.fileCalls, []);
         assert.equal(local.saveCount, 0);
         assert.equal((await plan(makeState(0), request('document'), true)).ok, false);
+    });
+    await check('Task settled local planning preserves original metadata and never resolves availability', async () => {
+        const local = makeState(0, [], 'ios');
+        const attachments = [
+            { id: 'document', kind: 'file', title: 'Document', uri: 'file:///old/document.txt', mimeType: 'text/plain', fileHash: 'a'.repeat(64) },
+            { id: 'image', kind: 'file', title: 'Image', uri: 'file:///old/image.png', mimeType: 'image/png' },
+            { id: 'audio', kind: 'file', title: 'Audio', uri: 'file:///old/audio.wav', mimeType: 'audio/wav' },
+        ];
+        for (const item of attachments) { item.createdAt = '2026-10-06T00:00:00Z'; item.updatedAt = item.createdAt; }
+        const saved = { id: 'task285', attachments };
+        local.ownerTaskMap = new Map([['task285', saved]]);
+        const request = (id, rows = attachments) => JSON.stringify({ owner: { kind: 'task', taskId: 'task285', attachments: rows }, attachmentId: id });
+        const plan = (state, json, available) => poll(state, state.MindwtrHost.taskLocalFileOpenPlan(json, available));
+        const before = JSON.stringify(saved);
+        for (const readOnly of [false, true]) {
+            local.localTaskReadOnly = readOnly;
+            for (const [id, kind] of [['document', 'file'], ['image', 'image'], ['audio', 'audio']]) {
+                const result = await plan(local, request(id), true);
+                assert.equal(result.ok, true); assert.equal(result.value.status, 'available');
+                assert.equal(result.value.open.kind, kind); assert.equal(result.value.update, null);
+                const selected = attachments.find((item) => item.id === id);
+                assert.equal(kind === 'file' ? result.value.open.uri : result.value.open.attachment.uri, selected.uri);
+                assert.equal('relocatedFrom' in result.value, false, 'Only Swift may produce resolved result authority');
+            }
+        }
+        const hydrated = local.hydrateTaskAttachments285(attachments);
+        assert.equal(Object.hasOwn(hydrated[0], 'cloudKey'), true); assert.equal(hydrated[0].cloudKey, undefined);
+        assert.deepEqual(JSON.parse(JSON.stringify(hydrated)), attachments, 'Actual SQLite hydration serializes to exactly the original wire metadata');
+        saved.attachments = hydrated;
+        for (const [id, kind] of [['document', 'file'], ['image', 'image'], ['audio', 'audio']]) {
+            const result = await plan(local, request(id), true);
+            assert.equal(result.ok, true, 'Hydrated own-undefined fields must not invalidate an exact original JSON selection');
+            assert.equal(result.value.open.kind, kind);
+        }
+        hydrated[0].cloudKey = null;
+        assert.equal((await plan(local, request('document'), true)).ok, false, 'Defined null remains different from an omitted field');
+        hydrated[0].cloudKey = undefined; hydrated[0].pendingContentUpload = false;
+        assert.equal((await plan(local, request('document'), true)).ok, false, 'Defined false is never discarded as undefined');
+        hydrated[0].pendingContentUpload = undefined;
+        assert.deepEqual((await plan(local, request('document'), false)).value,
+            { status: 'unavailable', message: 'attachments.missing', update: null, open: null });
+        saved.attachments = attachments;
+        for (const rows of [[{ ...attachments[0], uri: 'file:///fabricated/current.txt' }],
+            [{ ...attachments[0], fileHash: 'b'.repeat(64) }], [{ ...attachments[0], title: 'Changed' }],
+            [...attachments, { ...attachments[0] }]]) assert.equal((await plan(local, request('document', rows), true)).ok, false);
+        for (const available of [null, 1, 'true']) assert.equal((await plan(local, request('document'), available)).ok, false);
+        assert.equal((await plan(local, request('missing'), true)).ok, false);
+        assert.equal((await plan(local, JSON.stringify({ owner: { kind: 'task', taskId: 'task285', attachments }, attachmentId: 'document', extra: true }), true)).ok, false);
+        for (const field of ['deletedAt', 'purgedAt']) {
+            saved[field] = '2026-10-06T00:00:00Z'; assert.equal((await plan(local, request('document'), true)).ok, false); delete saved[field];
+        }
+        attachments[0].deletedAt = '2026-10-06T00:00:00Z';
+        assert.equal((await plan(local, request('document'), true)).ok, false); delete attachments[0].deletedAt;
+        local.ownerTaskMap = new Map(); assert.equal((await plan(local, request('document'), true)).ok, false);
+        assert.equal((await plan(makeState(0), request('document'), true)).ok, false);
+        assert.equal(JSON.stringify(saved), before);
+        assert.deepEqual(local.attachmentInputs, []); assert.deepEqual(local.fileCalls, []); assert.equal(local.saveCount, 0);
+    });
+    await check('Relocated Open markers are fixed, exportable, best effort and preserve prior markers', async () => {
+        for (const surface of ['task', 'project']) {
+            const operation = `relocated-${surface}-file-open`, local = makeState(0, [], 'ios');
+            local.settings = { diagnostics: { loggingEnabled: false } };
+            const ack = (state, name = operation, outcome = 'prepared') => poll(state, state.MindwtrHost.attachmentDraftAcknowledged(name, outcome));
+            assert.equal((await ack(local)).ok, true);
+            assert.deepEqual(JSON.parse(local.logText.trim()).context,
+                { releaseCheck: 'v1.3.5/ios-relocated-file-open', operation, outcome: 'prepared', surface });
+            const before = local.logText;
+            for (const name of ['relocated-file-open', `${operation}-extra`, 'relocated-file-open/task']) assert.equal((await ack(local, name)).ok, true);
+            for (const outcome of ['confirmed', 'replayed', '', null]) assert.equal((await ack(local, operation, outcome)).ok, true);
+            assert.equal(local.logText, before);
+            assert.deepEqual((await poll(local, local.MindwtrHost.logShare())).value, { path: 'files/logs/mindwtr.log' });
+            const exported = local.logText;
+            local.logFailure = 'private diagnostics failure'; assert.equal((await ack(local)).ok, true); assert.equal(local.logText, exported);
+            for (const platform of ['android', undefined]) {
+                const other = makeState(0, [], platform); assert.equal((await ack(other)).ok, true); assert.equal(other.logText, null);
+            }
+        }
     });
     await check('owned resume acknowledgment is iOS-only and fixed without claiming Save or UI hydration', async () => {
         const local = makeState(0, [], 'ios');

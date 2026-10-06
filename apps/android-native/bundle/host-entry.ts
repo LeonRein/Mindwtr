@@ -1324,6 +1324,34 @@ globalThis.MindwtrHost = {
             return unwrap(await contract.openAttachment({ owner: { kind: 'project', projectId }, attachmentId: attachmentId!, urlOnly: true }));
         });
     },
+    /** Pure classification of original settled metadata; Swift alone resolves and proves the current URI. */
+    taskLocalFileOpenPlan(json: string, available: boolean): string {
+        return submit(async () => {
+            requireSaved();
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || typeof available !== 'boolean') throw new Error('INVALID_INPUT');
+            const input = taskAttachmentInput(json, ['owner', 'attachmentId']);
+            const owner = input.owner as { taskId: string; attachments: NonNullable<Task['attachments']> };
+            if (!owner.taskId || owner.taskId.length > 500 || typeof input.attachmentId !== 'string'
+                || !input.attachmentId || input.attachmentId.length > 500) throw new Error('INVALID_INPUT');
+            const view = unwrap(contract.getTaskView({ id: owner.taskId }));
+            const task = useTaskStore.getState()._tasksById.get(owner.taskId);
+            const matches = owner.attachments.filter((item) => item?.id === input.attachmentId);
+            const saved = (task?.attachments ?? []).filter((item) => item.id === input.attachmentId);
+            const selected = matches[0], durable = saved[0];
+            // SQLite hydration owns optional undefined fields which JSON omits.
+            // Compare that wire shape; null, false and every defined value remain exact.
+            const storedFields = durable ? Object.entries(durable).filter(([, value]) => value !== undefined) : [];
+            if (view.id !== owner.taskId || !task || task.deletedAt || task.purgedAt
+                || matches.length !== 1 || saved.length !== 1 || selected.kind !== 'file' || selected.deletedAt || !selected.uri
+                || Object.keys(selected).length !== storedFields.length
+                || storedFields.some(([field, value]) => !Object.prototype.hasOwnProperty.call(selected, field)
+                    || (selected as unknown as Record<string, unknown>)[field] !== value)) throw new Error('INVALID_INPUT');
+            const t = (key: string): string => unwrap(contract.getStrings({ keys: [key] })).strings[key] ?? key;
+            return available
+                ? { status: 'available', message: null, update: null, open: planAttachmentOpen(selected, { audio: true, t }) }
+                : { status: 'unavailable', message: getAttachmentResolutionMessage({ status: 'unavailable' }, t), update: null, open: null };
+        });
+    },
     /** Read-only classification after Swift observes the current managed file. */
     projectLocalFileOpenPlan(json: string, available: boolean): string {
         return submit(async () => {
@@ -3468,13 +3496,14 @@ globalThis.MindwtrHost = {
             const containerRecovery = operation === 'container-relocation' && outcome === 'confirmed';
             const fileOpen = operation === 'file-open' && outcome === 'prepared';
             const projectFileOpen = operation === 'project-file-open' && outcome === 'prepared';
+            const relocatedOpen = ['relocated-task-file-open', 'relocated-project-file-open'].includes(operation) && outcome === 'prepared';
             const projectFileRemove = operation === 'project-file-remove' && outcome === 'saved';
             const projectFileAdd = operation === 'project-file-add' && ['saved', 'abandoned'].includes(outcome);
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !projectFileRemove && !projectFileAdd
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !relocatedOpen && !projectFileRemove && !projectFileAdd
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || projectFileRemove || projectFileAdd)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || relocatedOpen || projectFileRemove || projectFileAdd)) return {};
             try {
                 if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
                     ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
@@ -3488,6 +3517,7 @@ globalThis.MindwtrHost = {
                     context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }
                         : fileOpen ? { releaseCheck: 'v1.3.5/ios-local-file-open' }
                         : projectFileOpen ? { releaseCheck: 'v1.3.5/ios-project-local-file-open' }
+                        : relocatedOpen ? { releaseCheck: 'v1.3.5/ios-relocated-file-open', surface: operation === 'relocated-task-file-open' ? 'task' : 'project' }
                         : projectFileRemove ? { releaseCheck: 'v1.3.5/ios-project-file-remove' }
                         : projectFileAdd ? { releaseCheck: 'v1.3.5/ios-project-file-add' }
                         : containerRecovery ? { releaseCheck: 'v1.3.5/ios-attachment-container-recovery' }

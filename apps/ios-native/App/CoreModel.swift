@@ -3527,8 +3527,15 @@ final class CoreModel: ObservableObject {
                     throw CocoaError(.coderReadCorrupt)
                 }
                 let uri = planKind == .file ? plan.text("uri") : plan.object("attachment").text("uri")
-                guard uri.utf8.elementsEqual(attachment.text("uri").utf8),
-                      let url = URL(string: uri), url.isFileURL else { throw CocoaError(.coderReadCorrupt) }
+                if let original = result["relocatedFrom"] {
+                    guard Set(result.keys) == Set(["status", "message", "update", "open", "relocatedFrom"]),
+                          let originalURI = original as? String,
+                          Data(originalURI.utf8) == Data(attachment.text("uri").utf8),
+                          Data(uri.utf8) != Data(originalURI.utf8) else { throw CocoaError(.coderReadCorrupt) }
+                } else {
+                    guard uri.utf8.elementsEqual(attachment.text("uri").utf8) else { throw CocoaError(.coderReadCorrupt) }
+                }
+                guard let url = URL(string: uri), url.isFileURL else { throw CocoaError(.coderReadCorrupt) }
                 guard current() else { return }
                 taskFileOpenPresentation = AttachmentFileOpenPresentation(id: claim, url: url, kind: planKind)
                 if planKind == .audio {
@@ -17797,7 +17804,18 @@ final class CoreModel: ObservableObject {
         do {
             let request = try json(["projectId": id, "attachmentId": attachmentID])
             let result: CoreObject
+            var admittedFileURI: String?
             if kind == "file" {
+                guard current() else { return }
+                let options = try await query("projectAttachmentEditOptions", [try json(["projectId": id])])
+                guard current(), options.text("revision") == revision,
+                      options.object("project").text("id") == id,
+                      let attachments = options.object("project")["attachments"] as? [CoreObject] else { throw CocoaError(.coderReadCorrupt) }
+                let selected = attachments.filter { $0.text("id") == attachmentID }
+                guard selected.count == 1, let item = selected.first,
+                      item.text("kind") == "file", item["deletedAt"] == nil,
+                      let originalURI = item["uri"] as? String, !originalURI.isEmpty else { throw CocoaError(.coderReadCorrupt) }
+                admittedFileURI = originalURI
                 let encoded = try await currentHost.prepareProjectFileOpen(requestJSON: request)
                 result = try decode(encoded)
             } else { result = try await query("projectAttachmentOpen", [request]) }
@@ -17819,6 +17837,14 @@ final class CoreModel: ObservableObject {
                           attachment.text("kind") == "file", attachment["deletedAt"] == nil else { throw CocoaError(.coderReadCorrupt) }
                     uri = attachment.text("uri")
                 } else { uri = plan.text("uri") }
+                if let original = result["relocatedFrom"] {
+                    guard Set(result.keys) == Set(["status", "message", "update", "open", "relocatedFrom"]),
+                          let originalURI = original as? String,
+                          Data(originalURI.utf8) == Data((admittedFileURI ?? "").utf8),
+                          Data(uri.utf8) != Data(originalURI.utf8) else { throw CocoaError(.coderReadCorrupt) }
+                } else {
+                    guard Data(uri.utf8) == Data((admittedFileURI ?? "").utf8) else { throw CocoaError(.coderReadCorrupt) }
+                }
                 guard let url = URL(string: uri), url.isFileURL else { throw CocoaError(.coderReadCorrupt) }
                 guard current() else { return }
                 projectFileOpenPresentation = AttachmentFileOpenPresentation(id: claim, url: url, kind: planKind)
