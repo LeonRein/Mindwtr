@@ -1806,6 +1806,20 @@ final class NativeAttachmentDraftCoordinator {
             guard try JSONEncoder().encode(candidate).count <= Store.maximumBytes else { throw Self.failure }
         }
     }
+    /// Read-only opening observation; no editor, sidecar or durable ownership.
+    func snapshotFileOpen(attachmentID: String, targetURI: String,
+                          cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentFiles.BaselineAttachmentProof? {
+        try requireOwner(); try cancellation.check()
+        let observed = try MixedSaveObservation.read(file(.snapshotBaseline(attachmentID: attachmentID, targetURI: targetURI),
+            cancellation: cancellation))
+        jobs.drain(); try requireOwner(); try cancellation.check()
+        guard Self.equal(observed.targetURI, targetURI) else { throw Self.failure }
+        switch observed.kind {
+        case "present": guard let proof = observed.proof else { throw Self.failure }; return proof
+        case "noOwnedGeneration": return nil
+        default: throw Self.failure
+        }
+    }
     /// Polls one typed ID without entering JSC or taking a raw mailbox frame.
     private func file(_ request: NativeAttachmentDraftFileRequest, cancellation: NativeAttachmentCancellation,
                       ignoringCancellation: Bool = false) throws -> [String: Any] {

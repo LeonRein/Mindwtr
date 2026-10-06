@@ -76,6 +76,17 @@ public final class CoreHost: @unchecked Sendable {
         }, onCancel: { token.cancel() })
     }
 
+    /// Validates a read-only local file plan before the App presents system UI.
+    public func prepareTaskFileOpen(requestJSON: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.prepareTaskFileOpen(requestJSON: requestJSON, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
+
     public func beginAttachmentDraft(expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.beginAttachmentDraft(expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
@@ -14495,6 +14506,85 @@ private final class Engine: @unchecked Sendable {
         retainedOrdinaryTurn?.command = nil
         pending = nil
         try requireRetainedOrdinaryTurn()
+    }
+
+    func prepareTaskFileOpen(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let failure = HostFailure("Attachment file could not be opened")
+        do {
+            guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0,
+                  let runtime = context, let jobs = attachmentJobs else { throw failure }
+            let generation = attachmentGeneration
+            func owner() throws {
+                try cancellation.check()
+                guard self.started, !self.closed, self.pending == nil, !self.recoveryActivationPending, self.lockFD >= 0,
+                      self.context === runtime, self.attachmentJobs === jobs, self.attachmentGeneration == generation else { throw failure }
+            }
+            try owner()
+            guard requestJSON.utf8.count <= 6_400_000,
+                  let request = try NativeJSON.jsonObject(with: Data(requestJSON.utf8)) as? [String: Any],
+                  Set(request.keys) == Set(["owner", "attachmentId"]), Self.validTaskAttachmentOwner(request["owner"]),
+                  let attachmentOwner = request["owner"] as? [String: Any], let taskID = attachmentOwner["taskId"] as? String,
+                  let selectedID = request["attachmentId"] as? String, !selectedID.isEmpty, selectedID.utf16.count <= 500,
+                  let attachments = attachmentOwner["attachments"] as? [[String: Any]],
+                  let selected = attachments.first(where: { ($0["id"] as? String).map { Self.ownedEqual($0, selectedID) } == true }),
+                  selected["kind"] as? String == "file", selected["deletedAt"] == nil,
+                  let uri = selected["uri"] as? String else { throw failure }
+            // The shared availability path may cache an external URI. Admit only
+            // its exact managed spelling, never an alias which could trigger copy.
+            let prefix = Data(try mixedSaveManagedURI().utf8), target = Data(uri.utf8)
+            let leaf = target.dropFirst(prefix.count)
+            guard target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) else { throw failure }
+            let viewRequest = try Self.ownedJSON(["id": taskID, "offset": 0, "limit": 1])
+            func liveTask() throws {
+                try owner()
+                let raw = try self.invoke("taskView", arguments: [viewRequest], localCancellation: cancellation)
+                try owner()
+                guard let view = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+                      let id = view["id"] as? String, Self.ownedEqual(id, taskID) else { throw failure }
+            }
+            try liveTask()
+            let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs,
+                requireOwner: owner, invoke: { [unowned self] name, args in try self.invoke(name, arguments: args) })
+            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            try owner()
+            let result = try localAttachmentRequest(name: "openAttachment", requestJSON: requestJSON, cancellation: cancellation)
+            try owner()
+            guard let answer = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any],
+                  Set(answer.keys) == Set(["status", "message", "update", "open"]), answer["update"] is NSNull,
+                  let status = answer["status"] as? String else { throw failure }
+            if status == "available" {
+                guard answer["message"] is NSNull, let plan = answer["open"] as? [String: Any],
+                      let kind = plan["kind"] as? String else { throw failure }
+                switch kind {
+                case "file":
+                    guard Set(plan.keys) == Set(["kind", "uri", "mimeType", "viewMimeType"]),
+                          let plannedURI = plan["uri"] as? String, Self.ownedEqual(plannedURI, uri),
+                          plan["mimeType"] is NSNull || plan["mimeType"] is String, plan["viewMimeType"] is String else { throw failure }
+                case "image", "audio":
+                    guard Set(plan.keys) == Set(["kind", "attachment"]), let item = plan["attachment"] as? [String: Any],
+                          let id = item["id"] as? String, Self.ownedEqual(id, selectedID), item["kind"] as? String == "file",
+                          item["deletedAt"] == nil, let plannedURI = item["uri"] as? String, Self.ownedEqual(plannedURI, uri),
+                          Self.equalJSON(item, selected) else { throw failure }
+                default: throw failure
+                }
+                guard before != nil else { throw failure }
+            } else {
+                guard ["unavailable", "unrecoverable", "generation-conflict", "stale"].contains(status),
+                      answer["open"] is NSNull, answer["message"] is NSNull || answer["message"] is String else { throw failure }
+            }
+            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            guard before == after else { throw failure }
+            try liveTask(); try owner()
+            if status == "available" {
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["file-open", "prepared"])
+                try owner()
+            }
+            return result
+        } catch {
+            if cancellation.isCancelled || error is CancellationError { throw CancellationError() }
+            throw failure
+        }
     }
 
     func localAttachmentRequest(name: String, requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {

@@ -5356,17 +5356,18 @@ const poll = async (state, id) => {
             assert.equal(absent.logText, null);
         }
     });
-    for (const [operation, releaseCheck] of [
+    for (const [operation, releaseCheck, accepted = 'confirmed'] of [
         ['preexisting-journal-replay', 'v1.3.5/ios-preexisting-attachment-journal-replay'],
         ['container-relocation', 'v1.3.5/ios-attachment-container-recovery'],
+        ['file-open', 'v1.3.5/ios-local-file-open', 'prepared'],
     ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };
-        const acknowledge = (state, outcome = 'confirmed') => poll(state,
+        const acknowledge = (state, outcome = accepted) => poll(state,
             state.MindwtrHost.attachmentDraftAcknowledged(operation, outcome));
         assert.equal((await acknowledge(local)).ok, true);
         assert.deepEqual(JSON.parse(local.logText.trim()).context, {
-            releaseCheck, operation, outcome: 'confirmed',
+            releaseCheck, operation, outcome: accepted,
         });
         const before = local.logText;
         for (const outcome of ['replayed', 'settled', '', null]) assert.equal((await acknowledge(local, outcome)).ok, true);

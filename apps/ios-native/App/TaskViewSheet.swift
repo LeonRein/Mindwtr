@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import LinkPresentation
 import UniformTypeIdentifiers
+import QuickLook
 
 private struct TaskDraftDirection: ViewModifier {
     let direction: LayoutDirection
@@ -40,7 +41,7 @@ struct TaskViewSheet: View {
     private var busy: Bool { model.busy }
     private var error: String? { model.taskError }
     private var readOnly: Bool { model.taskEditor.flag("readOnly") }
-    private var operationFrozen: Bool { busy || model.retryNeeded || model.taskChecklistReadPending || model.taskPersonCreateOwed || model.taskAttachmentOpening || model.taskReferenceOpening || model.taskSharePayload != nil || model.taskAttachmentWorking || model.taskFileImporterPresented }
+    private var operationFrozen: Bool { busy || model.retryNeeded || model.taskChecklistReadPending || model.taskPersonCreateOwed || model.taskAttachmentOpening || model.taskReferenceOpening || model.taskSharePayload != nil || model.taskFileOpenPresentation != nil || model.taskAttachmentWorking || model.taskFileImporterPresented }
     private var attachmentRecoveryFrozen: Bool {
         model.taskAttachmentState == .interrupted || model.taskAttachmentState == .savedCleanup
             || model.taskAttachmentState == .blocked
@@ -59,11 +60,13 @@ struct TaskViewSheet: View {
     private var modalPresented: Bool {
         !model.taskDestinationKind.isEmpty || monthlyCustom != nil || waitingAssignment != nil
             || backdatedCompletion != nil || model.taskLinkSheetActive || model.taskFileImporterPresented
+            || model.taskFileOpenPresentation != nil
             || ownedMenuPromptVisible
     }
 
     var body: some View {
         let pickerID = fileImporterID
+        let fileOpenID = model.taskFileOpenPresentation?.id
         ZStack {
             taskContent
                 .accessibilityElement(children: modalPresented ? .ignore : .contain)
@@ -89,6 +92,31 @@ struct TaskViewSheet: View {
         .sheet(item: Binding(get: { model.taskSharePayload }, set: { if $0 == nil { model.dismissTaskShare() } })) { payload in
             TaskActivitySheet(payload: payload)
         }
+        .sheet(item: Binding(
+            get: { model.taskFileOpenPresentation },
+            set: { presentation in
+                if presentation == nil, let fileOpenID { model.dismissTaskFileOpen(presentationID: fileOpenID) }
+            })) { presentation in
+                Group {
+                    if presentation.kind == .file {
+                        TaskFileActivitySheet(presentation: presentation)
+                    } else {
+                        NavigationStack {
+                            TaskFileQuickLookSheet(presentation: presentation)
+                                .toolbar {
+                                    ToolbarItem(placement: .confirmationAction) {
+                                        Button(strings.text("common.done")) {
+                                            model.dismissTaskFileOpen(presentationID: presentation.id)
+                                        }
+                                        .accessibilityIdentifier("task-attachment-preview-done")
+                                    }
+                                }
+                        }
+                    }
+                }
+                .id(presentation.id)
+                .onDisappear { model.dismissTaskFileOpen(presentationID: presentation.id) }
+            }
         .sheet(item: Binding(
             get: {
                 guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented else { return nil }
@@ -163,7 +191,7 @@ struct TaskViewSheet: View {
                     AppIcon(name: "x", size: 22).frame(width: 44, height: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain).disabled((ownedCloseDecision
-                    ? busy || model.taskAttachmentWorking || model.taskFileImporterPresented || modalPresented
+                    ? busy || model.taskAttachmentOpening || model.taskAttachmentWorking || model.taskFileImporterPresented || modalPresented
                     : frozen) || model.taskScheduleUpdating)
                 .accessibilityLabel(strings.text("common.close")).accessibilityIdentifier("task-view-close")
                 Spacer()
@@ -1104,7 +1132,7 @@ struct TaskViewSheet: View {
                 let entries = item.objects("items")
                 ForEach(entries.indices, id: \.self) { index in
                     let entry = entries[index]
-                    if entry.text("kind") == "link" {
+                    if ["link", "file"].contains(entry.text("kind")) {
                         Button {
                             endEditingBeforeAction()
                             Task { await model.openTaskAttachment(entry.text("id")) }
@@ -1155,7 +1183,7 @@ struct TaskViewSheet: View {
                 HStack(spacing: 8) {
                     Image(systemName: entry.text("kind") == "link" ? "link" : "paperclip")
                         .foregroundStyle(palette.secondary).accessibilityHidden(true)
-                    if entry.text("kind") == "link" {
+                    if ["link", "file"].contains(entry.text("kind")) {
                         Button {
                             endEditingBeforeAction()
                             Task { await model.openTaskAttachment(entry.text("id")) }
@@ -2804,4 +2832,33 @@ private struct TaskActivitySheet: UIViewControllerRepresentable {
         return controller
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+private struct TaskFileActivitySheet: UIViewControllerRepresentable {
+    let presentation: TaskFileOpenPresentation
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [presentation.url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+private struct TaskFileQuickLookSheet: UIViewControllerRepresentable {
+    let presentation: TaskFileOpenPresentation
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: presentation.url) }
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {}
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        let url: URL
+        init(url: URL) { self.url = url }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
 }

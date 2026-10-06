@@ -40,6 +40,13 @@ struct TaskSharePayload: Identifiable {
     let message: String
 }
 
+struct TaskFileOpenPresentation: Identifiable {
+    enum Kind: String { case file, image, audio }
+    let id: UUID
+    let url: URL
+    let kind: Kind
+}
+
 typealias CoreObject = [String: Any]
 
 extension Dictionary where Key == String, Value == Any {
@@ -803,6 +810,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var taskReferenceSection = "description"
     @Published private(set) var taskAttachmentOpening = false
     @Published private(set) var taskAttachmentOpenError: String?
+    @Published private(set) var taskFileOpenPresentation: TaskFileOpenPresentation?
     @Published private(set) var taskSharePayload: TaskSharePayload?
     @Published private(set) var taskShareError: String?
     private var taskAttachmentOpenClaim = UUID()
@@ -830,6 +838,7 @@ final class CoreModel: ObservableObject {
         didSet {
             if oldValue.map({ ObjectIdentifier($0) }) != host.map({ ObjectIdentifier($0) }) {
                 cancelTaskFileImport()
+                invalidateTaskAttachmentOpen()
                 taskStartupSaveReceipt = nil
                 taskStartupSaveReceiptHost = nil
                 taskAttachmentCheckpointFailed = nil
@@ -993,7 +1002,9 @@ final class CoreModel: ObservableObject {
     private var taskRecoveryCorrupt = false
     private var taskRecoveryTouched: Set<String> = []
     private var taskRecoveryChecklistTouched = false
-    private var taskRecoverySession = UUID().uuidString.lowercased()
+    private var taskRecoverySession = UUID().uuidString.lowercased() {
+        didSet { if oldValue != taskRecoverySession { invalidateTaskAttachmentOpen() } }
+    }
     private var taskRecoveryGeneration = 0
     @Published private(set) var taskRecoveryCheckpointedGeneration = 0
     private var taskRecoveryCheckpointTask: Task<Void, Never>?
@@ -2368,6 +2379,7 @@ final class CoreModel: ObservableObject {
         ready && taskPresented && !taskEditor.isEmpty && !taskEditor.flag("readOnly")
             && !appLock.concealed && !busy && !retryNeeded && !taskRecoverySaving
             && !taskAttachmentWorking && taskFileImporterID == nil && !taskFileImporterPresented && !taskLinkSheetActive
+            && !taskAttachmentOpening && taskFileOpenPresentation == nil
             && !taskScheduleUpdating && !taskChecklistReadPending && taskChecklistWriteKind == nil
             && !taskPersonCreateOwed && !taskPersonCreateNeedsReview
             && (taskAttachmentState == .none || (taskHasActiveAttachmentOwner && taskAttachmentState == .active))
@@ -3189,28 +3201,40 @@ final class CoreModel: ObservableObject {
     func dismissTaskShareError() { taskShareError = nil }
 
     func openTaskAttachment(_ attachmentID: String) async {
-        guard taskPresented, !taskEditor.isEmpty, !appLock.concealed,
+        guard ready, taskPresented, !taskEditor.isEmpty, !appLock.concealed, let currentHost = host,
               !busy, !retryNeeded, !taskAttachmentOpening, !taskRecoverySaving, !taskSavePending,
+              !taskAttachmentWorking, taskFileImporterID == nil, !taskFileImporterPresented,
+              taskSharePayload == nil, taskFileOpenPresentation == nil, !taskReferenceOpening,
               !taskPersonCreateOwed, !taskPersonCreateNeedsReview, !taskLinkSubmitting,
               taskLinkSheet.isEmpty, taskDestinationKind.isEmpty,
               taskChecklistWriteKind == nil, !taskChecklistReadPending, !taskScheduleUpdating,
-              taskAttachments.contains(where: { $0.text("id") == attachmentID && $0.text("kind") == "link" && $0["deletedAt"] == nil }) else { return }
+              let attachment = taskAttachments.first(where: {
+                  $0.text("id") == attachmentID && ["link", "file"].contains($0.text("kind")) && $0["deletedAt"] == nil
+              }) else { return }
         let id = viewedTaskID, session = taskRecoverySession
-        guard let raw = try? json(taskAttachments) else { return }
+        let kind = attachment.text("kind")
+        guard let raw = try? json(taskAttachments), let editorRaw = try? json(taskRecoveryPayload()) else { return }
         let claim = UUID()
+        observeDiagnosticsConcealment()
         taskAttachmentOpenClaim = claim
         taskAttachmentOpening = true
         taskAttachmentOpenError = nil
-        defer { if taskAttachmentOpenClaim == claim { taskAttachmentOpening = false } }
+        defer {
+            if taskAttachmentOpenClaim == claim && taskFileOpenPresentation?.id != claim { taskAttachmentOpening = false }
+        }
         let current = { [self] in
-            taskAttachmentOpenClaim == claim && taskAttachmentOpening && taskPresented && viewedTaskID == id
+            host === currentHost && ready && !Task.isCancelled
+                && taskAttachmentOpenClaim == claim && taskAttachmentOpening && taskPresented && viewedTaskID == id
                 && taskRecoverySession == session && !appLock.concealed && !busy && !retryNeeded
+                && !taskAttachmentWorking && taskFileImporterID == nil && !taskFileImporterPresented
+                && taskSharePayload == nil && !taskReferenceOpening
                 && !taskRecoverySaving && !taskSavePending && !taskPersonCreateOwed
                 && !taskPersonCreateNeedsReview && !taskLinkSubmitting && taskLinkSheet.isEmpty
                 && taskDestinationKind.isEmpty && taskChecklistWriteKind == nil
                 && !taskChecklistReadPending && !taskScheduleUpdating
                 && (try? json(taskAttachments)) == raw
-                && taskAttachments.contains(where: { $0.text("id") == attachmentID && $0.text("kind") == "link" && $0["deletedAt"] == nil })
+                && (try? json(taskRecoveryPayload())) == editorRaw
+                && taskAttachments.contains(where: { $0.text("id") == attachmentID && $0.text("kind") == kind && $0["deletedAt"] == nil })
         }
         if taskRecoverySnapshot != nil || (!taskEditor.flag("readOnly") && taskDirty) {
             await flushTaskDraftCheckpoint()
@@ -3221,9 +3245,34 @@ final class CoreModel: ObservableObject {
             }
         }
         do {
-            let result = try await query("taskAttachmentOpen", [try json([
-                "owner": taskAttachmentOwner(), "attachmentId": attachmentID])])
-            guard current() else { return }
+            let request = try json(["owner": taskAttachmentOwner(), "attachmentId": attachmentID])
+            let generation = taskRecoveryGeneration
+            let result: CoreObject
+            if kind == "file" {
+                let encoded = try await currentHost.prepareTaskFileOpen(requestJSON: request)
+                result = try decode(encoded)
+            } else {
+                result = try await query("taskAttachmentOpen", [request])
+            }
+            guard current(), taskRecoveryGeneration == generation else { return }
+            if kind == "file" {
+                guard result["update"] is NSNull else { throw CocoaError(.coderReadCorrupt) }
+                guard result.text("status") == "available" else {
+                    taskAttachmentOpenError = result["message"] as? String ?? "This file could not be opened. Try again."
+                    return
+                }
+                let plan = result.object("open")
+                guard result["message"] is NSNull,
+                      let planKind = TaskFileOpenPresentation.Kind(rawValue: plan.text("kind")) else {
+                    throw CocoaError(.coderReadCorrupt)
+                }
+                let uri = planKind == .file ? plan.text("uri") : plan.object("attachment").text("uri")
+                guard uri.utf8.elementsEqual(attachment.text("uri").utf8),
+                      let url = URL(string: uri), url.isFileURL else { throw CocoaError(.coderReadCorrupt) }
+                guard current() else { return }
+                taskFileOpenPresentation = TaskFileOpenPresentation(id: claim, url: url, kind: planKind)
+                return
+            }
             guard result.text("status") == "available", result["message"] is NSNull,
                   result["update"] is NSNull else { throw CocoaError(.coderReadCorrupt) }
             let plan = result.object("open")
@@ -3250,8 +3299,21 @@ final class CoreModel: ObservableObject {
             if opened { NSLog("Native iOS Task URL opened releaseCheck=v1.3.4/ios-task-link-open outcome=opened") }
             else { taskAttachmentOpenError = failedMessage }
         } catch {
-            if current() { taskAttachmentOpenError = "The link could not be opened. Try again." }
+            if current() {
+                taskAttachmentOpenError = kind == "file" ? "This file could not be opened. Try again." : "The link could not be opened. Try again."
+            }
         }
+    }
+
+    func dismissTaskFileOpen(presentationID: UUID) {
+        guard taskFileOpenPresentation?.id == presentationID, taskAttachmentOpenClaim == presentationID else { return }
+        invalidateTaskAttachmentOpen()
+    }
+
+    private func invalidateTaskAttachmentOpen() {
+        taskAttachmentOpenClaim = UUID()
+        taskFileOpenPresentation = nil
+        taskAttachmentOpening = false
     }
 
     func dismissTaskAttachmentOpenError() { taskAttachmentOpenError = nil }
@@ -4388,7 +4450,10 @@ final class CoreModel: ObservableObject {
     private func observeDiagnosticsConcealment() {
         guard diagnosticsLockObserver == nil else { return }
         diagnosticsLockObserver = appLock.$enabled.combineLatest(appLock.$locked).sink { [weak self] enabled, locked in
-            if enabled == nil || locked { self?.invalidateDiagnostics(dropCache: true) }
+            if enabled == nil || locked {
+                self?.invalidateTaskAttachmentOpen()
+                self?.invalidateDiagnostics(dropCache: true)
+            }
         }
     }
 
@@ -18220,8 +18285,7 @@ final class CoreModel: ObservableObject {
         taskLinkSubmitting = false
         taskSharePayload = nil
         taskShareError = nil
-        taskAttachmentOpenClaim = UUID()
-        taskAttachmentOpening = false
+        invalidateTaskAttachmentOpen()
         taskAttachmentOpenError = nil
         taskTitleDraft = ""
         taskNoteDraft = ""
@@ -18681,8 +18745,7 @@ final class CoreModel: ObservableObject {
         taskLinkSubmitting = false
         taskSharePayload = nil
         taskShareError = nil
-        taskAttachmentOpenClaim = UUID()
-        taskAttachmentOpening = false
+        invalidateTaskAttachmentOpen()
         taskAttachmentOpenError = nil
         viewedTaskID = ""
         taskRecoveryHydrating = false
