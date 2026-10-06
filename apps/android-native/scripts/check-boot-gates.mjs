@@ -5181,6 +5181,30 @@ const poll = async (state, id) => {
             assert.equal(absent.logText, null);
         }
     });
+    await check('preexisting journal replay acknowledgment is fixed, exportable and best effort', async () => {
+        const local = makeState(0, [], 'ios');
+        local.settings = { diagnostics: { loggingEnabled: false } };
+        const acknowledge = (state, outcome = 'confirmed') => poll(state,
+            state.MindwtrHost.attachmentDraftAcknowledged('preexisting-journal-replay', outcome));
+        assert.equal((await acknowledge(local)).ok, true);
+        assert.deepEqual(JSON.parse(local.logText.trim()).context, {
+            releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay',
+            operation: 'preexisting-journal-replay', outcome: 'confirmed',
+        });
+        const before = local.logText;
+        for (const outcome of ['replayed', 'settled', '', null]) assert.equal((await acknowledge(local, outcome)).ok, true);
+        assert.equal(local.logText, before);
+        assert.deepEqual((await poll(local, local.MindwtrHost.logShare())).value, { path: 'files/logs/mindwtr.log' });
+        const exported = local.logText;
+        local.logFailure = 'private diagnostics failure';
+        assert.equal((await acknowledge(local)).ok, true);
+        assert.equal(local.logText, exported);
+        for (const platform of ['android', undefined]) {
+            const other = makeState(0, [], platform);
+            assert.equal((await acknowledge(other)).ok, true);
+            assert.equal(other.logText, null);
+        }
+    });
     await check('editor acceptance acknowledgment forces five fixed file markers with or without local capability', async () => {
         for (const local of [makeState(0, [], 'ios'), makeState(0, [], 'ios', configureLocal)]) {
             local.settings = { diagnostics: { loggingEnabled: false } };

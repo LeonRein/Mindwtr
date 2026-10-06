@@ -133,6 +133,38 @@ final class RetainedAttachmentOrdinaryHostTests: XCTestCase {
         let opened = try object(await host.call("captureOpen"))
         return try json([json(["text": "Ordinary capture", "options": XCTUnwrap(opened["options"]), "captureId": id, "openAfterSave": false])])
     }
+    private func olderCaptureWithActiveOwner() async throws -> (CoreHost, String, String) {
+        let first = try await seed(detach: false, published: true); await first.close()
+        let retained = try evidence(includeStage: false) + [(editor.url, try Data(contentsOf: editor.url), try inode(editor.url))]
+        let parked = root.appendingPathComponent("owner-before-older-capture.json")
+        // Model the already-owed journal arriving alongside a real producer's
+        // active record, preserving that record's original bytes and inode.
+        try FileManager.default.moveItem(at: store.url, to: parked)
+        defer {
+            if FileManager.default.fileExists(atPath: parked.path) {
+                try? FileManager.default.moveItem(at: parked, to: store.url)
+            }
+        }
+        let faults = HostIOFaults(), writer = core(faults); _ = try await writer.start()
+        let id = UUID().uuidString.lowercased(), args = try await capture(writer, id: id), before = try domainRows()
+        var commits = 0
+        faults.beforeSQL = { if $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "COMMIT" {
+            commits += 1; throw HostFailure("Stop older capture COMMIT")
+        } }
+        await refused { _ = try await writer.call("captureSubmit", argumentsJSON: args) }
+        XCTAssertGreaterThan(commits, 0); faults.beforeSQL = nil
+        let pending = try object(String(decoding: Data(contentsOf: journal), as: UTF8.self))
+        XCTAssertEqual(pending["method"] as? String, "captureCommit"); XCTAssertNil(pending["editorDraft"])
+        XCTAssertNil(pending["terminal"]); XCTAssertEqual(try domainRows(), before)
+        let encoded = try XCTUnwrap(pending["argumentsJSON"] as? String)
+        let arguments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(encoded.utf8)) as? [String])
+        let envelope = try object(XCTUnwrap(arguments.first)), request = try XCTUnwrap(envelope["request"] as? [String: Any])
+        XCTAssertEqual(request["captureId"] as? String, id)
+        try FileManager.default.moveItem(at: parked, to: store.url); try preserved(retained)
+        let originalArgs = try XCTUnwrap(NativeJSON.jsonObject(with: Data(args.utf8)) as? [String])
+        var fresh = try object(XCTUnwrap(originalArgs.first)); fresh["captureId"] = UUID().uuidString.lowercased()
+        return (writer, id, try json([json(fresh)]))
+    }
     private func newDraft(_ host: CoreHost) async throws -> (EditorDraftSnapshot, [String: Any]) {
         let opening = try object(await host.call("editorModel", argumentsJSON: json([taskID])))
         let draft = EditorDraftSnapshot(sessionID: UUID().uuidString.lowercased(), taskID: taskID, generation: 1,
@@ -164,6 +196,59 @@ final class RetainedAttachmentOrdinaryHostTests: XCTestCase {
     private func noDomainWrites(_ faults: HostIOFaults, count: @escaping () -> Void) {
         faults.beforeSQL = { statement in
             if statement.range(of: #"(?i)^\s*(?:INSERT(?: OR \w+)? INTO|UPDATE|DELETE FROM)\s+(?:tasks|projects|areas)\b"#, options: .regularExpression) != nil { count() }
+        }
+    }
+
+    func testOlderCaptureReplaysExactlyWithoutReleasingActiveOwnerOrEditor() async throws {
+        let (writer, id, freshArgs) = try await olderCaptureWithActiveOwner()
+        let retained = try evidence(includeStage: false) + [(editor.url, try Data(contentsOf: editor.url), try inode(editor.url))]
+        let checkpoint = try latest(), pendingBytes = try Data(contentsOf: journal), before = try domainRows()
+        await refused { _ = try await writer.call("captureSubmit", argumentsJSON: freshArgs) }
+        XCTAssertEqual(try Data(contentsOf: journal), pendingBytes); XCTAssertEqual(try domainRows(), before)
+        try preserved(retained); await writer.close()
+
+        let faults = HostIOFaults(), cold = core(faults); var removals = 0
+        faults.editorDraftRemove = { removals += 1; throw HostFailure("Older capture must not detach the owned editor") }
+        _ = try await cold.start()
+        XCTAssertEqual(try task(id)["title"] as? String, "Ordinary capture")
+        let rows = try XCTUnwrap(NativeJSON.jsonObject(with: Data(sql("SELECT id FROM tasks ORDER BY id").utf8)) as? [[String: Any]])
+        XCTAssertEqual(rows.count, 2); XCTAssertEqual(Set(rows.compactMap { $0["id"] as? String }), Set([id, taskID]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path)); XCTAssertEqual(removals, 0)
+        XCTAssertEqual(try latest(), checkpoint); XCTAssertNil(try editor.read()?.attempt); try preserved(retained)
+        let settled = try domainRows(); var writes = 0
+        noDomainWrites(faults) { writes += 1 }
+        await refused { _ = try await cold.call("captureSubmit", argumentsJSON: freshArgs) }
+        await refused { try await cold.discardEditorDraft(expectedSession: checkpoint.sessionID) }
+        let independent = EditorDraftSnapshot(sessionID: UUID().uuidString.lowercased(), taskID: taskID, generation: 1, payloadJSON: "{}")
+        await refused { try await cold.checkpointEditorDraft(independent) }
+        XCTAssertEqual(writes, 0); XCTAssertEqual(removals, 0); XCTAssertEqual(try domainRows(), settled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path)); try preserved(retained); await cold.close()
+        let reopened = core(); _ = try await reopened.start()
+        XCTAssertEqual(try task(id)["title"] as? String, "Ordinary capture"); XCTAssertEqual(try domainRows(), settled)
+        XCTAssertEqual(try latest(), checkpoint); try preserved(retained)
+    }
+
+    func testOlderActiveReplayRejectsSameByteOwnerEditorAndJournalReplacement() async throws {
+        for selected in ["owner", "editor", "journal"] {
+            let parent = try isolate(); defer { root = parent }
+            let (writer, _, _) = try await olderCaptureWithActiveOwner(); await writer.close()
+            let target = try XCTUnwrap(URL(string: operation().targetURI))
+            let paths = [store.url, editor.url, journal, source(), baseline(), target]
+            let retained = try paths.map { ($0, try Data(contentsOf: $0), try inode($0)) }, before = try domainRows()
+            let changed = selected == "owner" ? store.url : selected == "editor" ? editor.url : journal
+            let faults = HostIOFaults(), cold = core(faults); var replacements = 0, writes = 0, removals = 0
+            noDomainWrites(faults) { writes += 1 }
+            faults.editorDraftRemove = { removals += 1; throw HostFailure("Older capture must not detach the owned editor") }
+            faults.journalWrite = { if replacements == 0 { replacements += 1; try self.replaceExact(changed) } }
+            await refused { _ = try await cold.start() }
+            XCTAssertEqual(replacements, 1, selected); XCTAssertEqual(writes, 0, selected); XCTAssertEqual(removals, 0, selected)
+            XCTAssertEqual(try domainRows(), before, selected)
+            for (url, bytes, identity) in retained {
+                XCTAssertEqual(try Data(contentsOf: url), bytes, selected)
+                if url == changed { XCTAssertNotEqual(try inode(url), identity, selected) }
+                else { XCTAssertEqual(try inode(url), identity, selected) }
+            }
+            await cold.close()
         }
     }
 

@@ -3387,15 +3387,17 @@ globalThis.MindwtrHost = {
             const completeSave = operation === 'complete-save' && ['domainSaved', 'settled'].includes(outcome);
             const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
             const ownedResume = operation === 'owned-resume' && outcome === 'validated';
+            const preexistingReplay = operation === 'preexisting-journal-replay' && outcome === 'confirmed';
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
                     context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }
+                        : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
                         : completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
                         : providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }

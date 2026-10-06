@@ -546,26 +546,31 @@ private final class Engine: @unchecked Sendable {
     private var unresolvedAppLockRecovery = false
     private var closed = false
     private var pending: PendingCommand?
-    // One Engine turn binds the existing detached owner, independent editor and
-    // normal journal. It never grants attachment cleanup or persists a capability.
+    // One Engine turn binds the retained owner, exact editor and normal journal.
+    // Already-owed active replay grants no new work or editor/file cleanup.
+    private enum RetainedOrdinaryOwnerMode: Equatable {
+        case detached(fingerprint: String)
+        case alreadyOwedActive
+    }
     private final class RetainedOrdinaryTurn {
         let owner: NativeAttachmentDraftStore.VersionedSnapshot
-        let fingerprint: String
+        let mode: RetainedOrdinaryOwnerMode
         let session: String
         let runtime: JSContext
         let jobs: NativeAttachmentFileJobs
         let generation: UInt64
-        let replaying: Bool
+        let replayCommand: PendingCommand?
+        var replaying: Bool { replayCommand != nil }
         var editor: EditorDraftStore.OwnedCheckpoint?
         var journal: MixedSaveFileBinding?
         var command: PendingCommand?
         var preparationAllowed = false
-        init(owner: NativeAttachmentDraftStore.VersionedSnapshot, fingerprint: String, session: String,
+        init(owner: NativeAttachmentDraftStore.VersionedSnapshot, mode: RetainedOrdinaryOwnerMode, session: String,
              runtime: JSContext, jobs: NativeAttachmentFileJobs, generation: UInt64,
              editor: EditorDraftStore.OwnedCheckpoint?, journal: MixedSaveFileBinding?, command: PendingCommand?) {
-            self.owner = owner; self.fingerprint = fingerprint; self.session = session
+            self.owner = owner; self.mode = mode; self.session = session
             self.runtime = runtime; self.jobs = jobs; self.generation = generation
-            self.editor = editor; self.journal = journal; self.command = command; self.replaying = command != nil
+            self.editor = editor; self.journal = journal; self.command = command; self.replayCommand = command
         }
     }
     private var retainedOrdinaryTurn: RetainedOrdinaryTurn?
@@ -1691,15 +1696,48 @@ private final class Engine: @unchecked Sendable {
         a.version == b.version && ownedEqual(a.method, b.method) && ownedEqual(a.argumentsJSON, b.argumentsJSON)
             && retainedAttemptMatches(a.editorDraft, b.editorDraft)
     }
-    private func detachedOrdinaryOwner() throws -> (NativeAttachmentDraftStore.VersionedSnapshot, String, String) {
+    private func retainedOrdinaryOwner(command: PendingCommand? = nil) throws
+        -> (NativeAttachmentDraftStore.VersionedSnapshot, RetainedOrdinaryOwnerMode, NativeAttachmentDraftStore.Session) {
         guard let owner = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned() else {
             throw Self.retainedOrdinaryFailure
         }
         switch owner.record {
         case .legacy(let record):
-            return (owner, try NativeAttachmentDraftStore.ownedDiscardFingerprint(record), record.session.sessionID)
+            if let command, command.editorDraft == nil, record.session.state == .active,
+               record.discard == nil, record.checkpointAdvance == nil,
+               record.operations.allSatisfy({ $0.phase == .checkpointed }) {
+                return (owner, .alreadyOwedActive, record.session)
+            }
+            return (owner, .detached(fingerprint: try NativeAttachmentDraftStore.ownedDiscardFingerprint(record)), record.session)
         case .mixed(let record):
-            return (owner, try NativeAttachmentDraftStore.ownedMixedDiscardFingerprint(record), record.session.sessionID)
+            if let command, command.editorDraft == nil, record.session.state == .active,
+               record.discard == nil, record.checkpointAdvance == nil,
+               record.operations.allSatisfy({ operation in
+                   switch operation {
+                   case .add(let op): return op.phase == .checkpointed
+                   case .remove(let op): return op.phase == .checkpointed
+                   }
+               }) {
+                return (owner, .alreadyOwedActive, record.session)
+            }
+            return (owner, .detached(fingerprint: try NativeAttachmentDraftStore.ownedMixedDiscardFingerprint(record)), record.session)
+        }
+    }
+    private func validateRetainedOrdinaryEditor(_ editor: EditorDraftStore.OwnedCheckpoint?,
+                                               mode: RetainedOrdinaryOwnerMode,
+                                               session: NativeAttachmentDraftStore.Session,
+                                               attempt: EditorDraftAttempt?) throws {
+        guard let editor else { return }
+        switch mode {
+        case .alreadyOwedActive:
+            guard attempt == nil, editor.attempt == nil,
+                  Self.ownedEqual(editor.snapshot, session.checkpoint) else { throw Self.retainedOrdinaryFailure }
+        case .detached:
+            guard !Self.ownedEqual(editor.snapshot.sessionID, session.sessionID) else { throw Self.retainedOrdinaryFailure }
+            if let frozen = editor.attempt {
+                guard frozen == attempt else { throw Self.retainedOrdinaryFailure }
+                try validateOrdinaryEditorAttempt(frozen, editor: editor)
+            }
         }
     }
     private func retainedOrdinaryJournalBinding() throws -> MixedSaveFileBinding? {
@@ -1732,34 +1770,30 @@ private final class Engine: @unchecked Sendable {
     private func validateRetainedOrdinaryCommand(_ command: PendingCommand) throws {
         guard !closed, lockFD >= 0, let jobs = attachmentJobs else { throw Self.retainedOrdinaryFailure }
         jobs.drain()
-        let (_, _, session) = try detachedOrdinaryOwner()
+        let (_, mode, session) = try retainedOrdinaryOwner(command: command)
         let editor = try editorDrafts.readOwnedCheckpoint()
-        if let editor {
-            guard !Self.ownedEqual(editor.snapshot.sessionID, session) else { throw Self.retainedOrdinaryFailure }
-            if let attempt = editor.attempt {
-                guard command.editorDraft == attempt else { throw Self.retainedOrdinaryFailure }
-                try validateOrdinaryEditorAttempt(attempt, editor: editor)
-            }
-        }
+        try validateRetainedOrdinaryEditor(editor, mode: mode, session: session, attempt: command.editorDraft)
         _ = try ordinaryJournalArguments(command)
     }
     @discardableResult
     private func beginRetainedOrdinaryTurn(command: PendingCommand? = nil,
                                            attempt: EditorDraftAttempt? = nil) throws -> Bool {
-        if retainedOrdinaryTurn != nil { try requireRetainedOrdinaryTurn(); return false }
+        if let turn = retainedOrdinaryTurn {
+            if case .alreadyOwedActive = turn.mode {
+                guard let command, let original = turn.replayCommand,
+                      Self.retainedCommandMatches(original, command) else { throw Self.retainedOrdinaryFailure }
+            }
+            try requireRetainedOrdinaryTurn()
+            return false
+        }
         guard attachmentDraftEvidence else { return false }
         guard started, !closed, lockFD >= 0, let runtime = context, let jobs = attachmentJobs,
               command != nil || (pending == nil && !recoveryActivationPending) else { throw Self.retainedOrdinaryFailure }
         jobs.drain()
-        let (owner, fingerprint, session) = try detachedOrdinaryOwner()
+        let (owner, mode, session) = try retainedOrdinaryOwner(command: command)
         let editor = try editorDrafts.readOwnedCheckpoint(), journal = try retainedOrdinaryJournalBinding()
-        if let editor {
-            guard !Self.ownedEqual(editor.snapshot.sessionID, session) else { throw Self.retainedOrdinaryFailure }
-            if let frozen = editor.attempt {
-                guard frozen == (command?.editorDraft ?? attempt) else { throw Self.retainedOrdinaryFailure }
-                try validateOrdinaryEditorAttempt(frozen, editor: editor)
-            }
-        }
+        if case .alreadyOwedActive = mode { guard journal != nil else { throw Self.retainedOrdinaryFailure } }
+        try validateRetainedOrdinaryEditor(editor, mode: mode, session: session, attempt: command?.editorDraft ?? attempt)
         if let command {
             guard let current = pending, Self.retainedCommandMatches(current, command) else { throw Self.retainedOrdinaryFailure }
             _ = try ordinaryJournalArguments(command)
@@ -1768,7 +1802,7 @@ private final class Engine: @unchecked Sendable {
                 guard Self.retainedCommandMatches(actual, command) else { throw Self.retainedOrdinaryFailure }
             }
         } else { guard journal == nil else { throw Self.retainedOrdinaryFailure } }
-        let turn = RetainedOrdinaryTurn(owner: owner, fingerprint: fingerprint, session: session,
+        let turn = RetainedOrdinaryTurn(owner: owner, mode: mode, session: session.sessionID,
             runtime: runtime, jobs: jobs, generation: attachmentGeneration, editor: editor, journal: journal, command: command)
         turn.preparationAllowed = command != nil
         retainedOrdinaryTurn = turn
@@ -1783,15 +1817,22 @@ private final class Engine: @unchecked Sendable {
         guard started, !closed, lockFD >= 0, context === turn.runtime, attachmentJobs === turn.jobs,
               attachmentGeneration == turn.generation, !requirePreparation || turn.preparationAllowed,
               turn.command != nil || (pending == nil && (!recoveryActivationPending || turn.replaying)) else { throw Self.retainedOrdinaryFailure }
-        let (owner, fingerprint, session) = try detachedOrdinaryOwner()
-        guard turn.owner.matches(owner), Self.ownedEqual(fingerprint, turn.fingerprint), Self.ownedEqual(session, turn.session) else { throw Self.retainedOrdinaryFailure }
+        let (owner, mode, session) = try retainedOrdinaryOwner(command: turn.replayCommand)
+        guard turn.owner.matches(owner), mode == turn.mode,
+              Self.ownedEqual(session.sessionID, turn.session) else { throw Self.retainedOrdinaryFailure }
         if checkingJournal { guard try retainedOrdinaryJournalBinding() == turn.journal else { throw Self.retainedOrdinaryFailure } }
         let editor = try editorDrafts.readOwnedCheckpoint()
         if let expected = turn.editor {
-            guard let editor, expected.matches(editor), !Self.ownedEqual(editor.snapshot.sessionID, turn.session) else {
-                throw Self.retainedOrdinaryFailure
-            }
+            guard let editor, expected.matches(editor) else { throw Self.retainedOrdinaryFailure }
         } else { guard editor == nil else { throw Self.retainedOrdinaryFailure } }
+        switch mode {
+        case .alreadyOwedActive:
+            try validateRetainedOrdinaryEditor(editor, mode: mode, session: session, attempt: nil)
+        case .detached:
+            if let editor {
+                guard !Self.ownedEqual(editor.snapshot.sessionID, turn.session) else { throw Self.retainedOrdinaryFailure }
+            }
+        }
         if let command = turn.command {
             guard let current = pending, current.version == command.version,
                   Self.ownedEqual(current.method, command.method), Self.ownedEqual(current.argumentsJSON, command.argumentsJSON),
@@ -1803,8 +1844,10 @@ private final class Engine: @unchecked Sendable {
         retainedOrdinaryTurn?.preparationAllowed = true
     }
     private func requireOrdinaryEditorMutation() throws {
-        if retainedOrdinaryTurn != nil { try requireRetainedOrdinaryTurn() }
-        else { try requireNoAttachmentDraft() }
+        if let turn = retainedOrdinaryTurn {
+            guard case .detached = turn.mode else { throw Self.retainedOrdinaryFailure }
+            try requireRetainedOrdinaryTurn()
+        } else { try requireNoAttachmentDraft() }
     }
     private func refreshOrdinaryEditor(snapshot: EditorDraftSnapshot?, attempt: EditorDraftAttempt?) throws {
         guard let turn = retainedOrdinaryTurn else { return }
@@ -4000,7 +4043,7 @@ private final class Engine: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft recovery is not settled") }
         guard let current = try editorDrafts.read() else { return nil }
-        if attachmentDraftEvidence, (try? detachedOrdinaryOwner()) != nil {
+        if attachmentDraftEvidence, (try? retainedOrdinaryOwner()) != nil {
             let owns = try beginRetainedOrdinaryTurn(attempt: current.attempt)
             defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
             try requireRetainedOrdinaryTurn()
@@ -4043,7 +4086,7 @@ private final class Engine: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft is not ready") }
         if attachmentDraftEvidence {
-            if (try? detachedOrdinaryOwner()) != nil {
+            if (try? retainedOrdinaryOwner()) != nil {
                 let owns = try beginRetainedOrdinaryTurn()
                 defer { if owns && pending == nil { retainedOrdinaryTurn = nil } }
                 guard let turn = retainedOrdinaryTurn, !Self.ownedEqual(snapshot.sessionID, turn.session) else {
@@ -6889,7 +6932,11 @@ private final class Engine: @unchecked Sendable {
     private func resumeActivationIfNeeded() throws {
         guard recoveryActivationPending else { return }
         _ = try invoke("resumeActivation", arguments: [])
-        recoveryActivationPending = false
+        if let turn = retainedOrdinaryTurn, case .alreadyOwedActive = turn.mode, pending == nil {
+            try requireRetainedOrdinaryTurn()
+            recoveryActivationPending = false
+            retainedOrdinaryTurn = nil
+        } else { recoveryActivationPending = false }
         NSLog("Native iOS journal recovery releaseCheck=v1.3.3/native-ios-journal-recovery outcome=recovered")
     }
 
@@ -6918,9 +6965,13 @@ private final class Engine: @unchecked Sendable {
         ordinaryMutationDepth += 1
         defer {
             ordinaryMutationDepth -= 1
-            // A retry may reuse the original warm binding. Settlement releases
-            // it only after terminal/editor/journal cleanup finishes.
-            if pending == nil { retainedOrdinaryTurn = nil }
+            // Active replay retains its exact binding through owed activation,
+            // or until runtime teardown; detached settlement keeps its old lifetime.
+            if pending == nil {
+                if let turn = retainedOrdinaryTurn, case .alreadyOwedActive = turn.mode,
+                   recoveryActivationPending { /* Activation still owns this turn. */ }
+                else { retainedOrdinaryTurn = nil }
+            }
         }
         if let terminal = command.terminal {
             if command.method == "referenceTasksMoveCommit", case .success(let value) = terminal {
@@ -7359,12 +7410,20 @@ private final class Engine: @unchecked Sendable {
         // Once persisted, restart can clean up without entering core again.
         pending = finished
         try persist(finished)
-        if retainedOrdinaryTurn != nil, case .success = terminal {
+        if let turn = retainedOrdinaryTurn, case .success = terminal {
             try requireRetainedOrdinaryTurn(requirePreparation: true)
-            NSLog("Native iOS retained attachment cleanup preserved during ordinary write releaseCheck=v1.3.5/ios-retained-cleanup-ordinary-work outcome=confirmed")
-            #if DEBUG
-            faults?.commandDiagnostic?("retainedCleanupOrdinaryApplied")
-            #endif
+            switch turn.mode {
+            case .detached:
+                NSLog("Native iOS retained attachment cleanup preserved during ordinary write releaseCheck=v1.3.5/ios-retained-cleanup-ordinary-work outcome=confirmed")
+                #if DEBUG
+                faults?.commandDiagnostic?("retainedCleanupOrdinaryApplied")
+                #endif
+            case .alreadyOwedActive:
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["preexisting-journal-replay", "confirmed"])
+                #if DEBUG
+                faults?.commandDiagnostic?("preexistingAttachmentJournalApplied")
+                #endif
+            }
             try requireRetainedOrdinaryTurn()
         }
         // Both removal after success and thaw after definite refusal belong to
