@@ -28,7 +28,7 @@ import { taskEditValuesEqual } from '../json-value-equality';
 import { planAttachmentLinkBatch, softDeleteAttachment } from '../attachment-editor-model';
 import type { Area, TaskSortBy } from '../types';
 import type { Project, ProjectCoreActions, ProjectActionContext, Section, Task, TaskStatus } from './shared';
-import type { PreparedProjectArea, PreparedProjectAttachmentWrite, PreparedProjectCreate, PreparedProjectDate, PreparedProjectDelete, PreparedProjectDeleteUndo, PreparedProjectDuplicate, PreparedProjectLifecycle, PreparedProjectFlow, PreparedProjectTaskSort, PreparedProjectFocus, PreparedProjectNotesWrite, PreparedProjectTagsWrite, PreparedProjectRename, PreparedProjectStatus, PreparedTaskEditResult, PreparedTrashProjectRestore, ProjectAttachmentIntent, ProjectFlowAction, TaskStore } from '../store-types';
+import type { PreparedProjectArea, PreparedProjectAttachmentWrite, PreparedProjectFileRemoveWrite, PreparedProjectCreate, PreparedProjectDate, PreparedProjectDelete, PreparedProjectDeleteUndo, PreparedProjectDuplicate, PreparedProjectLifecycle, PreparedProjectFlow, PreparedProjectTaskSort, PreparedProjectFocus, PreparedProjectNotesWrite, PreparedProjectTagsWrite, PreparedProjectRename, PreparedProjectStatus, PreparedTaskEditResult, PreparedTrashProjectRestore, ProjectAttachmentIntent, ProjectFileRemoveIntent, ProjectFlowAction, TaskStore } from '../store-types';
 import { projectTagsForIntent, type ProjectTagsIntent } from '../project-tags';
 import { settingsWithPurgedParentAttachmentDeletes } from '../attachment-cleanup';
 import {
@@ -358,6 +358,20 @@ export const projectAttachmentWriteEffect = (project: Project, intent: ProjectAt
         if (ids.length !== 1 || ids[0] !== intent.attachmentId || target?.kind !== 'link' || target.deletedAt) return null;
         attachments = softDeleteAttachment(project.attachments ?? [], intent.attachmentId, now);
     }
+    const transition = applyProjectLifecycleTransition(project, { attachments }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN Remove tombstones file metadata; file bytes belong to the later sync cleanup policy. */
+export const projectFileRemoveWriteEffect = (project: Project, intent: ProjectFileRemoveIntent, ids: string[],
+    deviceId: string, now: string): PreparedProjectFileRemoveWrite['effect'] | null => {
+    const target = project.attachments?.find((row) => row.id === intent.attachmentId);
+    if (intent.kind !== 'remove' || ids.length !== 1 || ids[0] !== intent.attachmentId
+        || target?.kind !== 'file' || target.deletedAt) return null;
+    const attachments = softDeleteAttachment(project.attachments ?? [], intent.attachmentId, now);
     const transition = applyProjectLifecycleTransition(project, { attachments }, [], [], now, deviceId);
     return { project: { before: project, after: normalizeProjectLifecycleFields({
         ...project, ...transition.projectUpdates,
@@ -796,6 +810,10 @@ export const createProjectCoreActions = ({
     commitPreparedProjectAttachmentWrite: async (input): Promise<PreparedTaskEditResult> => {
         let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
             error: 'Prepared Project attachment edit conflicts with current data' };
+        const intent = input.request.intent;
+        if ('version' in input && input.version !== 1
+            || intent.kind === 'remove' && input.scope.project.attachments
+                ?.find((row) => row.id === intent.attachmentId)?.kind !== 'link') return result;
         set((state) => {
             const current = state._projectsById.get(input.request.projectId);
             if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
@@ -808,6 +826,37 @@ export const createProjectCoreActions = ({
                 || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
                 || !sameProjectSqliteRow(current, input.scope.project)) return state;
             const planned = projectAttachmentWriteEffect(current, input.request.intent, input.result.attachmentIds,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectFileRemoveWrite: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project file removal conflicts with current data' };
+        if (input.version !== 2 || input.request.intent.kind !== 'remove'
+            || input.scope.project.attachments?.find((row) => row.id === input.request.intent.attachmentId)?.kind !== 'file') return result;
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectFileRemoveWriteEffect(current, input.request.intent, input.result.attachmentIds,
                 input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
             if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
             const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);

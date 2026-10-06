@@ -181,6 +181,7 @@ export type PreparedProjectTagsWrite = {
 };
 
 export type ProjectAttachmentIntent = { kind: 'add'; text: string } | { kind: 'remove'; attachmentId: string };
+export type ProjectFileRemoveIntent = Extract<ProjectAttachmentIntent, { kind: 'remove' }>;
 
 /** One frozen native Project URL attachment change and its complete Project receipt. */
 export type PreparedProjectAttachmentWrite = {
@@ -190,6 +191,9 @@ export type PreparedProjectAttachmentWrite = {
     deviceIdToInitialize: string | null;
     updateAt: string;
 };
+
+/** One frozen metadata-only Project file removal and its complete Project receipt. */
+export type PreparedProjectFileRemoveWrite = PreparedProjectAttachmentWrite & { version: 2 };
 
 /** One frozen nonarchived Project status change and its complete Project receipt. */
 export type PreparedProjectStatus = {
@@ -721,6 +725,7 @@ export interface TaskStore {
     commitPreparedProjectNotesWrite: (input: PreparedProjectNotesWrite & { request: { projectId: string; text: string } }) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectTagsWrite: (input: PreparedProjectTagsWrite & { request: { projectId: string; intent: import('./project-tags').ProjectTagsIntent } }) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectAttachmentWrite: (input: PreparedProjectAttachmentWrite & { request: { projectId: string; requestId: string; intent: ProjectAttachmentIntent }; result: { id: string; attachmentIds: string[] } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectFileRemoveWrite: (input: PreparedProjectFileRemoveWrite & { request: { projectId: string; requestId: string; intent: ProjectFileRemoveIntent }; result: { id: string; attachmentIds: string[] } }) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectStatus: (input: PreparedProjectStatus & { request: { projectId: string; status: 'active' | 'waiting' | 'someday' } }) => Promise<PreparedTaskEditResult>;
     commitPreparedTrashProjectRestore: (input: PreparedTrashProjectRestore) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectDelete: (input: PreparedProjectDelete) => Promise<PreparedTaskEditResult>;

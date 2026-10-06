@@ -281,7 +281,7 @@ import { createSomedaySectionTaskMethods } from './native-host-contract-someday-
 import { createSomedaySectionMoveMethods } from './native-host-contract-someday-section-move';
 import { createProjectNotesWriteMethods } from './native-host-contract-project-notes';
 import { createProjectTagsWriteMethods } from './native-host-contract-project-tags';
-import { createProjectAttachmentWriteMethods } from './native-host-contract-project-attachments';
+import { createProjectAttachmentWriteMethods, createProjectFileRemoveWriteMethods } from './native-host-contract-project-attachments';
 import { createProjectStatusMethods } from './native-host-contract-project-status';
 import { createTrashProjectRestoreMethods } from './native-host-contract-trash-project-restore';
 import { createProjectDeleteMethods } from './native-host-contract-project-delete';
@@ -1841,6 +1841,8 @@ export function createNativeHostContract(options: {
         ...createProjectTagsWriteMethods({ readiness, save,
             revision: projectMutationRevision }),
         ...createProjectAttachmentWriteMethods({ readiness, save,
+            revision: projectMutationRevision, t: () => translate }),
+        ...createProjectFileRemoveWriteMethods({ readiness, save,
             revision: projectMutationRevision, t: () => translate }),
         ...createProjectStatusMethods({ readiness, save,
             revision: projectMutationRevision }),

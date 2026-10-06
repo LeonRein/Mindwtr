@@ -1180,7 +1180,9 @@ final class FoundationUITests: XCTestCase {
         boardTap(app, "project-attachment-link-save")
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: input)
         waitForExpectations(timeout: 20)
-        XCTAssertFalse(app.buttons["project-attachment-remove-task122-file"].exists)
+        let fileRemove = app.buttons["project-attachment-remove-task122-file"]
+        revealPagedElement(app, fileRemove, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        boardEnabled(fileRemove)
         app.terminate(); app = openProject122(library)
         let first = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label == %@", "project-attachment-open-", "Task122 First")).firstMatch
         tapProject122(app, first)
@@ -1209,6 +1211,7 @@ final class FoundationUITests: XCTestCase {
         boardTap(app, "project-details-toggle")
         XCTAssertFalse(app.buttons["project-attachment-add-link"].exists && app.buttons["project-attachment-add-link"].isEnabled)
         XCTAssertFalse(app.buttons["project-attachment-remove-task122-web"].exists && app.buttons["project-attachment-remove-task122-web"].isEnabled)
+        XCTAssertFalse(app.buttons["project-attachment-remove-task122-file"].exists && app.buttons["project-attachment-remove-task122-file"].isEnabled)
         app.terminate()
     }
 
@@ -1405,6 +1408,74 @@ final class FoundationUITests: XCTestCase {
         shot.name = fileOpen ? "Project Notes retained after refused file Open" : "Project Notes saved before browser handoff"
         shot.lifetime = .keepAlways; add(shot)
         boardTap(app, "project-back"); app.terminate()
+    }
+
+    func testProjectFileRemoveFlushesNotesAndPersistsAcrossColdRead() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-ui-test-library", "1f2c5a73-350e-402b-b1fd-ada347b0dc79"]
+        let notes = "Task281 Notes before file Remove"
+        func projects() {
+            boardEnabled(app.buttons["tab-menu"], timeout: 30)
+            boardTap(app, "tab-menu"); boardTap(app, "menu-projects")
+            boardEnabled(app.textFields["projects-create-title"])
+        }
+        func open(_ id: String) {
+            if id == "task121-archived" {
+                let section = app.buttons["projects-section-archived"]
+                revealPagedElement(app, section, in: app.scrollViews["projects-scroll"])
+                if section.value as? String == "Expand" { section.tap() }
+            }
+            let row = app.buttons["project-open-" + id]
+            revealPagedElement(app, row, in: app.scrollViews["projects-scroll"])
+            boardEnabled(row); row.tap(); boardTap(app, "project-details-toggle")
+        }
+        func tap(_ id: String) {
+            let button = app.buttons[id]
+            revealPagedElement(app, button, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+            boardEnabled(button); XCTAssertGreaterThanOrEqual(button.frame.height + 0.000001, 44)
+            button.tap()
+        }
+        app.launch(); projects(); open("task121-active")
+        tap("project-notes-toggle")
+        if app.buttons["project-notes-mode-edit"].isEnabled { tap("project-notes-mode-edit") }
+        let input = app.textViews["project-notes-input"]
+        boardEnabled(input); input.tap(); input.typeText(notes)
+        // The retained Task121 file is missing and foreign. Metadata Remove
+        // must complete after Notes flush without requiring local byte access.
+        tap("project-attachment-remove-task121-file")
+        let file = app.buttons["project-attachment-open-task121-file"]
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: file)
+        waitForExpectations(timeout: 20)
+        XCTAssertFalse(app.buttons["project-attachment-remove-task121-file"].exists)
+        XCTAssertFalse(app.buttons["project-attachment-write-retry"].exists)
+        boardEnabled(app.buttons["project-back"])
+        app.terminate(); app.launch(); projects(); open("task121-active")
+        let sibling = app.buttons["project-attachment-open-task121-web"]
+        revealPagedElement(app, sibling, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        boardEnabled(sibling)
+        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+            "project-attachment-open-task121-")).count, 3)
+        XCTAssertFalse(file.exists)
+        XCTAssertFalse(app.buttons["project-attachment-remove-task121-file"].exists)
+        tap("project-notes-toggle")
+        if app.buttons["project-notes-mode-preview"].exists && app.buttons["project-notes-mode-preview"].isEnabled {
+            tap("project-notes-mode-preview")
+        }
+        let text = app.staticTexts[notes]
+        revealPagedElement(app, text, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        XCTAssertTrue(text.exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Project file metadata removed with Notes retained after cold launch"
+        shot.lifetime = .keepAlways; add(shot)
+        boardTap(app, "project-back"); open("task121-archived")
+        let archivedOpen = app.buttons["project-attachment-open-task121-file"]
+        revealPagedElement(app, archivedOpen, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        let archivedRemove = app.buttons["project-attachment-remove-task121-file"]
+        XCTAssertTrue(archivedRemove.exists)
+        XCTAssertFalse(archivedRemove.isEnabled)
+        XCTAssertGreaterThanOrEqual(archivedRemove.frame.height + 0.000001, 44)
+        boardEnabled(app.buttons["project-back"])
+        app.terminate()
     }
 
     private func openTask120(_ library: String) -> XCUIApplication {

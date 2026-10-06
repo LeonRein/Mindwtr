@@ -1954,10 +1954,11 @@ struct ProjectDetailScreen: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                         }
-                        if entry.text("kind") == "link" {
+                        if ["link", "file"].contains(entry.text("kind")) {
                             Button {
-                                model.removeProjectAttachmentLink(entry.text("id"))
                                 resignProjectNotesInput()
+                                if entry.text("kind") == "file" { model.removeProjectAttachmentFile(entry.text("id")) }
+                                else { model.removeProjectAttachmentLink(entry.text("id")) }
                             } label: {
                                 Text(model.label("attachments.remove")).rnFont(13, .semibold)
                                     .frame(minWidth: 44, minHeight: 44, alignment: .leading)

@@ -1149,6 +1149,8 @@ final class CoreModel: ObservableObject {
     private var projectAttachmentOpeningRowsRaw: String?
     private var projectAttachmentOpeningRevision = ""
     private var projectAttachmentWriteRequest: String?
+    private var projectAttachmentWriteMethod = "projectAttachmentWrite"
+    private weak var projectAttachmentWriteHost: CoreHost?
     private var projectAttachmentWriteExpectedID: String?
     private var projectAttachmentWriteSession = 0
     private var projectCreateAreaFilterValue: String?
@@ -3813,7 +3815,7 @@ final class CoreModel: ObservableObject {
                 calendarComposerRecoveredResult = recovery.object("result")
             } else if recovery.text("method") == "mindSweepCommit" {
                 mindSweepRecoveredResult = recovery.object("result")
-            } else if ["projectCreateCommit", "projectFocusCommit", "projectRenameCommit", "projectFlowCommit", "projectTaskSortCommit", "projectStatusCommit", "projectDateCommit", "projectAreaCommit", "projectTagsWriteCommit", "projectAttachmentWriteCommit", "projectSectionCreateCommit", "projectSectionRenameCommit", "projectSectionDeleteCommit", "projectSectionOrderCommit", "projectTaskOrderCommit", "projectNotesWriteCommit", "areaCreateCommit", "areaColorCommit", "areaOrderCommit", "areaRenameCommit",
+            } else if ["projectCreateCommit", "projectFocusCommit", "projectRenameCommit", "projectFlowCommit", "projectTaskSortCommit", "projectStatusCommit", "projectDateCommit", "projectAreaCommit", "projectTagsWriteCommit", "projectAttachmentWriteCommit", "projectFileRemoveWriteCommit", "projectSectionCreateCommit", "projectSectionRenameCommit", "projectSectionDeleteCommit", "projectSectionOrderCommit", "projectTaskOrderCommit", "projectNotesWriteCommit", "areaCreateCommit", "areaColorCommit", "areaOrderCommit", "areaRenameCommit",
                        "areaDeleteCommit"].contains(recovery.text("method")) {
                 // The host already verified the durable row. Reopen the list;
                 // there is no project-detail navigation for quick add.
@@ -17518,11 +17520,11 @@ final class CoreModel: ObservableObject {
 
     private func readProjectAttachmentEditOptions(projectID id: String, session: Int) async throws {
         projectAttachmentEditOptionsCurrent = false
-        guard projectAttachmentEditContext(id, session: session) else { throw CocoaError(.coderReadCorrupt) }
+        guard let currentHost = host, projectAttachmentEditContext(id, session: session) else { throw CocoaError(.coderReadCorrupt) }
         let revision = projectDetail.text("mutationRevision")
         let options = try await query("projectAttachmentEditOptions", [try json(["projectId": id])])
         let project = options.object("project")
-        guard projectAttachmentEditContext(id, session: session),
+        guard host === currentHost, !Task.isCancelled, projectAttachmentEditContext(id, session: session),
               options.count == 3, options.text("revision") == revision,
               project.count == 7, project.text("id") == id,
               let canEdit = options["canEdit"] as? NSNumber,
@@ -17618,8 +17620,16 @@ final class CoreModel: ObservableObject {
     }
 
     func removeProjectAttachmentLink(_ attachmentID: String) {
-        guard projectAttachmentRemoveEnabled,
-              projectAttachmentRows.contains(where: { $0.text("id") == attachmentID && $0.text("kind") == "link" }),
+        beginProjectAttachmentRemove(attachmentID, kind: "link")
+    }
+
+    func removeProjectAttachmentFile(_ attachmentID: String) {
+        beginProjectAttachmentRemove(attachmentID, kind: "file")
+    }
+
+    private func beginProjectAttachmentRemove(_ attachmentID: String, kind: String) {
+        guard projectAttachmentRemoveEnabled, let currentHost = host,
+              projectAttachmentRows.filter({ $0.text("id") == attachmentID && $0.text("kind") == kind }).count == 1,
               let rowsRaw = try? json(projectAttachmentRows) else { return }
         let id = projectHeader.text("id"), session = projectFilterSession
         let claim = UUID()
@@ -17630,35 +17640,42 @@ final class CoreModel: ObservableObject {
         projectAttachmentOpeningRevision = ""
         projectAttachmentWriteError = nil
         projectAttachmentEditReadError = nil
-        Task { await performProjectAttachmentRemove(attachmentID, projectID: id, session: session, claim: claim) }
+        Task { await performProjectAttachmentRemove(attachmentID, kind: kind, projectID: id,
+            session: session, claim: claim, currentHost: currentHost) }
     }
 
-    private func performProjectAttachmentRemove(_ attachmentID: String, projectID id: String,
-                                                session: Int, claim: UUID) async {
+    private func performProjectAttachmentRemove(_ attachmentID: String, kind: String, projectID id: String,
+                                                session: Int, claim: UUID, currentHost: CoreHost) async {
         defer { if projectAttachmentEditClaim == claim { projectAttachmentEditOpening = false } }
-        guard await flushProjectNotesEdit(), projectAttachmentEditClaim == claim,
-              projectAttachmentEditContext(id, session: session),
+        func current() -> Bool {
+            host === currentHost && !Task.isCancelled && projectAttachmentEditClaim == claim
+                && projectAttachmentEditContext(id, session: session)
+        }
+        guard current(), await flushProjectNotesEdit(), current(),
               !projectNotesDirty && !projectNotesWritePending else { return }
         if !projectAttachmentsVisible || projectAttachmentLoading { await readProjectAttachments(force: true) }
+        guard current() else { return }
         guard projectAttachmentsVisible, !projectAttachmentLoading,
               (try? json(projectAttachmentRows)) == projectAttachmentOpeningRowsRaw,
-              projectAttachmentRows.contains(where: { $0.text("id") == attachmentID && $0.text("kind") == "link" }) else {
-            projectAttachmentEditReadError = "Project links changed. Try again."
+              projectAttachmentRows.filter({ $0.text("id") == attachmentID && $0.text("kind") == kind }).count == 1 else {
+            projectAttachmentEditReadError = "Project attachments changed. Try again."
             return
         }
         await performProjectAttachmentWrite(["kind": "remove", "attachmentId": attachmentID],
-                                            projectID: id, session: session)
+            projectID: id, session: session, fileRemove: kind == "file", removeClaim: claim)
     }
 
     private func performProjectAttachmentWrite(_ intent: CoreObject, projectID id: String,
-                                               session: Int, submittedText: String? = nil) async {
-        guard projectAttachmentEditContext(id, session: session), !projectNotesDirty,
+                                               session: Int, submittedText: String? = nil, fileRemove: Bool = false, removeClaim: UUID? = nil) async {
+        guard let currentHost = host, projectAttachmentEditContext(id, session: session), !projectNotesDirty,
               !projectNotesWritePending, !busy, !retryNeeded, projectAttachmentWriteRequest == nil else { return }
         busy = true
         defer { finishOperation() }
         do {
             try await readProjectAttachmentEditOptions(projectID: id, session: session)
-            guard projectAttachmentEditOptionsCurrent, projectAttachmentEditOptions.flag("canEdit"),
+            guard host === currentHost, !Task.isCancelled,
+                  removeClaim == nil || projectAttachmentEditClaim == removeClaim,
+                  projectAttachmentEditOptionsCurrent, projectAttachmentEditOptions.flag("canEdit"),
                   !projectNotesDirty && !projectNotesWritePending,
                   submittedText == nil || projectAttachmentLinkDraft == submittedText,
                   projectAttachmentEditContext(id, session: session) else {
@@ -17672,19 +17689,33 @@ final class CoreModel: ObservableObject {
                                                       "projectId": id, "intent": intent, "expected": expected])
             projectAttachmentWriteExpectedID = id
             projectAttachmentWriteSession = session
+            projectAttachmentWriteMethod = fileRemove ? "projectFileRemoveWrite" : "projectAttachmentWrite"
+            projectAttachmentWriteHost = currentHost
         } catch {
-            projectAttachmentEditReadError = "Project links changed. Try again."
+            guard host === currentHost, !Task.isCancelled,
+                  removeClaim == nil || projectAttachmentEditClaim == removeClaim,
+                  projectAttachmentEditContext(id, session: session) else { return }
+            projectAttachmentEditReadError = "Project attachments changed. Try again."
             return
         }
+        guard let request = projectAttachmentWriteRequest else { return }
+        let method = projectAttachmentWriteMethod
         let result: CoreObject
-        do { result = try await query("projectAttachmentWrite", [projectAttachmentWriteRequest!]) }
+        do {
+            result = try await query(method, [request])
+            guard host === currentHost, !Task.isCancelled,
+                  projectAttachmentWriteHost === currentHost,
+                  projectAttachmentWriteRequest == request, projectAttachmentWriteMethod == method,
+                  projectAttachmentWriteExpectedID == id, projectAttachmentWriteSession == session,
+                  removeClaim == nil || projectAttachmentEditClaim == removeClaim else { throw CancellationError() }
+        }
         catch { await handleProjectAttachmentWriteError(error); return }
         do {
             let accepted = try acknowledgeProjectAttachmentWrite(result)
             if accepted { try await refreshProjectAttachmentsAfterWrite(projectID: id, session: session) }
         } catch {
             if projectAttachmentWriteRequest != nil { await handleProjectAttachmentWriteError(error) }
-            else { projectAttachmentEditReadError = "Project links could not be refreshed. Try again." }
+            else { projectAttachmentEditReadError = "Project attachments could not be refreshed. Try again." }
         }
     }
 
@@ -17694,6 +17725,7 @@ final class CoreModel: ObservableObject {
         }
         if result.count == 1, let message = result["message"] as? String, !message.isEmpty {
             projectAttachmentWriteRequest = nil
+            projectAttachmentWriteHost = nil
             projectAttachmentWriteExpectedID = nil
             retryNeeded = false
             projectAttachmentLinkError = message
@@ -17703,10 +17735,11 @@ final class CoreModel: ObservableObject {
         }
         if result.count == 1 && result["blocked"] as? String == "" {
             projectAttachmentWriteRequest = nil
+            projectAttachmentWriteHost = nil
             projectAttachmentWriteExpectedID = nil
             projectAttachmentEditOptionsCurrent = false
             retryNeeded = false
-            projectAttachmentWriteError = "Project links are no longer editable."
+            projectAttachmentWriteError = "Project attachments are no longer editable."
             projectAttachmentLinkError = projectAttachmentWriteError
             projectAttachmentEditReadError = projectAttachmentWriteError
             error = nil
@@ -17719,6 +17752,7 @@ final class CoreModel: ObservableObject {
             throw CocoaError(.coderReadCorrupt)
         }
         projectAttachmentWriteRequest = nil
+        projectAttachmentWriteHost = nil
         projectAttachmentWriteExpectedID = nil
         projectAttachmentLinkPresented = false
         projectAttachmentLinkDraft = ""
@@ -17736,25 +17770,29 @@ final class CoreModel: ObservableObject {
     }
 
     private func refreshProjectAttachmentsAfterWrite(projectID id: String, session: Int) async throws {
+        guard let currentHost = host else { throw CancellationError() }
         try await readSelectedSurface()
-        guard projectAttachmentEditContext(id, session: session) else { throw CocoaError(.coderReadCorrupt) }
+        guard host === currentHost, !Task.isCancelled,
+              projectAttachmentEditContext(id, session: session) else { throw CocoaError(.coderReadCorrupt) }
         await readProjectAttachments(force: true)
-        guard projectAttachmentsVisible else { throw CocoaError(.coderReadCorrupt) }
+        guard host === currentHost, !Task.isCancelled,
+              projectAttachmentEditContext(id, session: session), projectAttachmentsVisible else { throw CocoaError(.coderReadCorrupt) }
     }
 
     private func handleProjectAttachmentWriteError(_ failure: Error) async {
         if projectAttachmentWriteRequest != nil && isDefiniteRejection(failure) {
             projectAttachmentWriteRequest = nil
+            projectAttachmentWriteHost = nil
             projectAttachmentWriteExpectedID = nil
             projectAttachmentEditOptionsCurrent = false
             retryNeeded = false
-            projectAttachmentWriteError = "Project links could not be saved. Try again."
+            projectAttachmentWriteError = "Project attachments could not be saved. Try again."
             projectAttachmentLinkError = projectAttachmentWriteError
             projectAttachmentEditReadError = projectAttachmentWriteError
             error = nil
         } else {
             retryNeeded = projectAttachmentWriteRequest != nil
-            projectAttachmentWriteError = "Project links could not be saved. Retry the pending write."
+            projectAttachmentWriteError = "Project attachments could not be saved. Retry the pending write."
             projectAttachmentLinkError = projectAttachmentWriteError
             error = projectAttachmentWriteError
         }
@@ -17776,7 +17814,7 @@ final class CoreModel: ObservableObject {
             try await readProjectAttachmentEditOptions(projectID: id, session: session)
             projectAttachmentEditReadError = nil
             projectAttachmentWriteError = nil
-        } catch { projectAttachmentEditReadError = "Project links could not be loaded. Try again." }
+        } catch { projectAttachmentEditReadError = "Project attachments could not be loaded. Try again." }
     }
 
     func flushProjectNotesEdit() async -> Bool {
@@ -21687,6 +21725,23 @@ final class CoreModel: ObservableObject {
         }
         guard !busy, !projectRenameEditing || projectRenameRequest != nil else { return }
         guard ready else { await start(); return }
+        let attachmentRetryRequest = projectAttachmentWriteRequest
+        let attachmentRetryMethod = projectAttachmentWriteMethod
+        let attachmentRetryHost = projectAttachmentWriteHost
+        let attachmentRetryID = projectAttachmentWriteExpectedID
+        let attachmentRetrySession = projectAttachmentWriteSession
+        let attachmentRetryClaim = projectAttachmentEditClaim
+        func attachmentRetryCurrent() -> Bool {
+            attachmentRetryRequest == nil || attachmentRetryMethod != "projectFileRemoveWrite"
+                || (attachmentRetryHost != nil && host === attachmentRetryHost && !Task.isCancelled
+                    && projectAttachmentWriteHost === attachmentRetryHost
+                    && projectAttachmentWriteRequest == attachmentRetryRequest
+                    && projectAttachmentWriteMethod == attachmentRetryMethod
+                    && projectAttachmentWriteExpectedID == attachmentRetryID
+                    && projectAttachmentWriteSession == attachmentRetrySession
+                    && projectAttachmentEditClaim == attachmentRetryClaim)
+        }
+        guard attachmentRetryCurrent() else { return }
         busy = true
         var boardTaskOpened = false
         defer {
@@ -21695,6 +21750,7 @@ final class CoreModel: ObservableObject {
         }
         do {
             let acknowledgment = try await host!.retryPending()
+            guard attachmentRetryCurrent() else { throw CancellationError() }
             if backupDocumentPending, let currentHost = host, backupDocumentHost === currentHost {
                 guard let acknowledgment else { throw CocoaError(.coderReadCorrupt) }
                 if !appLock.concealed {
@@ -22086,15 +22142,17 @@ final class CoreModel: ObservableObject {
                 return
             }
             if let request = projectAttachmentWriteRequest {
+                guard attachmentRetryCurrent() else { throw CancellationError() }
                 let result: CoreObject
                 if let acknowledgment { result = try decode(acknowledgment) }
-                else { result = try await query("projectAttachmentWriteRetryOutcome", [request]) }
+                else { result = try await query(projectAttachmentWriteMethod + "RetryOutcome", [request]) }
+                guard attachmentRetryCurrent() else { throw CancellationError() }
                 let id = projectAttachmentWriteExpectedID ?? ""
                 let session = projectAttachmentWriteSession
                 let accepted = try acknowledgeProjectAttachmentWrite(result)
                 if accepted {
                     do { try await refreshProjectAttachmentsAfterWrite(projectID: id, session: session) }
-                    catch { projectAttachmentEditReadError = "Project links could not be refreshed. Try again." }
+                    catch { projectAttachmentEditReadError = "Project attachments could not be refreshed. Try again." }
                 }
                 return
             }
