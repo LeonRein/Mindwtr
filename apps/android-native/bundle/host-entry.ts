@@ -25,14 +25,14 @@ import {
     validateNativeAttachmentDraftBeginV2,
     validateNativeAttachmentDraftLineageV2,
     prepareNativeAttachmentDraftAddV2,
-    validateNativeAttachmentDraftBeginV3,
-    validateNativeAttachmentDraftLineageV3,
-    prepareNativeAttachmentDraftAddV3,
-    prepareNativeAttachmentDraftRemoveV3,
+    validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftBeginV4,
+    validateNativeAttachmentDraftLineageV3, validateNativeAttachmentDraftLineageV4,
+    prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftAddV4,
+    prepareNativeAttachmentDraftRemoveV3, prepareNativeAttachmentDraftRemoveV4,
     readNativeAttachmentDraftRemoveFrozen,
-    completeNativeAttachmentDraftAdd,
+    completeNativeAttachmentDraftAdd, completeNativeAttachmentDraftAddV4,
     prepareNativeAttachmentDraftDiscardCandidates,
-    prepareNativeAttachmentDraftDiscardCandidatesV3,
+    prepareNativeAttachmentDraftDiscardCandidatesV3, prepareNativeAttachmentDraftDiscardCandidatesV4,
     isAttachmentFileInUse,
     planAttachmentOpen,
     getAttachmentResolutionMessage,
@@ -1091,7 +1091,7 @@ const settledAttachmentSaveState = () => {
 type AttachmentFileEditSaveEnvelope = Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0]
     | Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0];
 const validateAttachmentFileEditSave = (input: AttachmentFileEditSaveEnvelope) => {
-    if (input?.request?.version === 2 && input.prepared?.version === 2) {
+    if ((input?.request?.version === 2 || input?.request?.version === 3) && input.prepared?.version === input.request.version) {
         return contract.validatePreparedOwnedEditorCompleteTaskDraftSave(input as Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0]);
     }
     if (input?.request?.version === 1 && input.prepared?.version === 1) {
@@ -1140,7 +1140,7 @@ const retireAttachmentFileEditSave = (json: string, referencedCallback: () => st
             const envelope = attachmentDraftJson(input.envelopeJSON) as AttachmentFileEditSaveEnvelope;
             const checked = validateAttachmentFileEditSave(envelope);
             if (!checked.ok || index >= checked.value.settlementPlan.length) throw attachmentSaveInvalid();
-            const complete = envelope.request.version === 2
+            const complete = (envelope.request.version === 2 || envelope.request.version === 3)
                 ? envelope as Parameters<typeof contract.validatePreparedOwnedEditorCompleteTaskDraftSave>[0] : null;
             const legacy = envelope as Parameters<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>[0];
             const afterTask = complete ? complete.prepared.decision.kind === 'changed'
@@ -2974,7 +2974,7 @@ globalThis.MindwtrHost = {
             requireSaved();
             if (globalThis.__mindwtrHostPlatform === 'ios') {
                 const input = attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorCompleteTaskCancellationUndo>[0];
-                if (input?.cancel?.request?.version === 2) return unwrap(await contract.prepareOwnedEditorCompleteTaskCancellationUndo(input));
+                if ((input?.cancel?.request?.version === 2 || input?.cancel?.request?.version === 3)) return unwrap(await contract.prepareOwnedEditorCompleteTaskCancellationUndo(input));
             }
             return unwrap(await contract.prepareTaskCancellationUndo(editorJson(json) as Parameters<typeof contract.prepareTaskCancellationUndo>[0]));
         });
@@ -3382,6 +3382,38 @@ globalThis.MindwtrHost = {
             return result;
         });
     },
+    attachmentDraftBeginV4(json: string): string {
+        return submit(async () => {
+            const result = validateNativeAttachmentDraftBeginV4(attachmentDraftJson(json), attachmentDraftDependencies);
+            try {
+                await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
+                    message: 'Native iOS link-compatible attachment lineage validated',
+                    context: { releaseCheck: 'v1.3.5/ios-attachment-link-lineage', outcome: 'validated' } }, { force: true });
+            } catch { /* Diagnostics do not change validation or grant native ownership. */ }
+            return result;
+        });
+    },
+    attachmentDraftValidateLineageV4(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return validateNativeAttachmentDraftLineageV4(attachmentDraftJson(json));
+        });
+    },
+    attachmentDraftPrepareV4(json: string): string {
+        return submit(async () => prepareNativeAttachmentDraftAddV4(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
+    attachmentDraftRemovePrepareV4(json: string): string {
+        return submit(async () => prepareNativeAttachmentDraftRemoveV4(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
+    attachmentDraftDiscardCandidatesV4(json: string): string {
+        return submit(async () => {
+            if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
+            return prepareNativeAttachmentDraftDiscardCandidatesV4(attachmentDraftJson(json));
+        });
+    },
+    attachmentDraftResultV4(json: string): string {
+        return submit(async () => completeNativeAttachmentDraftAddV4(attachmentDraftJson(json), attachmentDraftDependencies));
+    },
     attachmentDraftValidateLineageV3(json: string): string {
         return submit(async () => {
             if (globalThis.__mindwtrHostPlatform !== 'ios') throw new Error('NOT_READY: Attachment draft capability is unavailable');
@@ -3452,7 +3484,7 @@ globalThis.MindwtrHost = {
             requireSaved();
             const input = attachmentDraftJson(json) as Parameters<typeof contract.prepareOwnedEditorFileEditTaskDraftSave>[0]
                 | Parameters<typeof contract.prepareOwnedEditorCompleteTaskDraftSave>[0];
-            if (input?.version === 2) return unwrap(await contract.prepareOwnedEditorCompleteTaskDraftSave(input));
+            if (input?.version === 2 || input?.version === 3) return unwrap(await contract.prepareOwnedEditorCompleteTaskDraftSave(input));
             if (input?.version === 1) return unwrap(await contract.prepareOwnedEditorFileEditTaskDraftSave(input));
             throw new Error('INVALID_INPUT');
         });
@@ -3467,7 +3499,7 @@ globalThis.MindwtrHost = {
         return submit(async () => {
             requireOwnedAttachmentSave();
             const input = attachmentDraftJson(json) as AttachmentFileEditSaveEnvelope;
-            if (input?.request?.version === 2 && input.prepared?.version === 2) return unwrap(await contract.commitPreparedOwnedEditorCompleteTaskDraftSave(input as Parameters<typeof contract.commitPreparedOwnedEditorCompleteTaskDraftSave>[0]));
+            if ((input?.request?.version === 2 || input?.request?.version === 3) && input.prepared?.version === input.request.version) return unwrap(await contract.commitPreparedOwnedEditorCompleteTaskDraftSave(input as Parameters<typeof contract.commitPreparedOwnedEditorCompleteTaskDraftSave>[0]));
             if (input?.request?.version === 1 && input.prepared?.version === 1) return unwrap(await contract.commitPreparedOwnedEditorFileEditTaskDraftSave(input as Parameters<typeof contract.commitPreparedOwnedEditorFileEditTaskDraftSave>[0]));
             throw new Error('INVALID_INPUT');
         });
@@ -3500,11 +3532,12 @@ globalThis.MindwtrHost = {
             const projectFileRemove = operation === 'project-file-remove' && outcome === 'saved';
             const projectFileAdd = operation === 'project-file-add' && ['saved', 'abandoned'].includes(outcome);
             const projectFileHash = operation === 'project-file-hash' && outcome === 'saved';
+            const taskFileHash = operation === 'task-file-hash' && outcome === 'saved';
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !relocatedOpen && !projectFileRemove && !projectFileAdd && !projectFileHash
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !relocatedOpen && !projectFileRemove && !projectFileAdd && !projectFileHash && !taskFileHash
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || relocatedOpen || projectFileRemove || projectFileAdd || projectFileHash)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || relocatedOpen || projectFileRemove || projectFileAdd || projectFileHash || taskFileHash)) return {};
             try {
                 if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
                     ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
@@ -3522,6 +3555,7 @@ globalThis.MindwtrHost = {
                         : projectFileRemove ? { releaseCheck: 'v1.3.5/ios-project-file-remove' }
                         : projectFileAdd ? { releaseCheck: 'v1.3.5/ios-project-file-add' }
                         : projectFileHash ? { releaseCheck: 'v1.3.5/ios-project-file-hash' }
+                        : taskFileHash ? { releaseCheck: 'v1.3.5/ios-task-file-hash' }
                         : containerRecovery ? { releaseCheck: 'v1.3.5/ios-attachment-container-recovery' }
                         : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }

@@ -98,14 +98,14 @@ struct NativeAttachmentDraftStore {
         init(from decoder: Decoder) throws {
             let c = try NativeAttachmentDraftStore.container(CodingKeys.self, from: decoder)
             version = try c.decode(Int.self, forKey: .version)
-            try NativeAttachmentDraftStore.require(version == 3)
+            try NativeAttachmentDraftStore.require(version == 3 || version == 4)
             session = try c.decode(Session.self, forKey: .session)
             operations = try c.decode([MixedOperation].self, forKey: .operations)
             discard = try c.decodeIfPresent(Discard.self, forKey: .discard)
             checkpointAdvance = try c.decodeIfPresent(CheckpointAdvance.self, forKey: .checkpointAdvance)
         }
         func encode(to encoder: Encoder) throws {
-            try NativeAttachmentDraftStore.require(version == 3)
+            try NativeAttachmentDraftStore.require(version == 3 || version == 4)
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(version, forKey: .version)
             try c.encode(session, forKey: .session)
@@ -733,7 +733,7 @@ struct NativeAttachmentDraftStore {
     }
     private static func validate(_ record: MixedRecord) throws {
         let session = record.session
-        try require(record.version == 3 && record.operations.count <= 128)
+        try require((record.version == 3 || record.version == 4) && record.operations.count <= 128)
         // Reuse the existing V2 session/Discard/advance grammar, without
         // widening its decoder or persisting a synthetic legacy record.
         try validate(Record(version: 2, session: session, operations: [], discard: record.discard,
@@ -765,6 +765,18 @@ struct NativeAttachmentDraftStore {
             try accountSnapshot(entry.before); try accountSnapshot(entry.after)
             switch entry {
             case .add(let op):
+                if record.version == 4 {
+                    let frozen = try JSONSerialization.jsonObject(with: Data(op.preparedJSON.utf8)) as? [String: Any]
+                    let keys = Set(["version", "kind", "taskID", "requestId", "picked", "measuredSize", "managedDirectoryURI",
+                        "beforePayloadJSON", "afterPayloadJSON", "prepared", "targetURI", "attachment", "sourceSha256"])
+                    try require(frozen != nil && Set(frozen!.keys) == keys
+                        && (frozen!["version"] as? NSNumber)?.doubleValue == 2)
+                    let source = (frozen!["prepared"] as? [String: Any])?["attachment"] as? [String: Any]
+                    let completed = frozen!["attachment"] as? [String: Any]
+                    try require((frozen!["sourceSha256"] as? String).map { equal($0, op.source.sha256) } == true
+                        && (source?["fileHash"] as? String).map { equal($0, op.source.sha256) } == true
+                        && (completed?["fileHash"] as? String).map { equal($0, op.source.sha256) } == true)
+                }
                 try account(rawStrings(op))
                 // Private structural view only: the original mixed owner and
                 // all tagged continuity checks above remain authoritative here.
@@ -925,7 +937,7 @@ struct NativeAttachmentDraftStore {
             case 1, 2:
                 let value = try JSONDecoder().decode(Record.self, from: read.data)
                 try Self.validate(value); record = .legacy(value)
-            case 3:
+            case 3, 4:
                 try Self.require(read.links == 1)
                 let value = try JSONDecoder().decode(MixedRecord.self, from: read.data)
                 try Self.validate(value); record = .mixed(value)

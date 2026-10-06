@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { createNativeHostContract, type NativeHostResult } from './native-host-contract';
-import { prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3, type NativeAttachmentDraftOperationV3 } from './native-attachment-draft';
+import { prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3, prepareNativeAttachmentDraftAddV4, prepareNativeAttachmentDraftRemoveV4, type NativeAttachmentDraftOperationV3, type NativeAttachmentDraftOperationV4 } from './native-attachment-draft';
 import { ASSOCIATIONS, LIFECYCLE, RECURRENCE, SCHEDULE, getNativeTaskRecurrenceBase, getNativeTaskScheduleBase } from './native-host-contract-task-save';
 import { createOwnedEditorCompleteTaskDraftSaveMethods, createOwnedEditorFileEditTaskDraftSaveMethods,
     type OwnedEditorCompleteSaveRequest, type OwnedEditorCompleteSaveEnvelope,
@@ -84,7 +84,7 @@ async function open(path: string, initial?: AppData) {
     return { db, host, baseHost, adapter, fault, writes, control, deps };
 }
 let env: Awaited<ReturnType<typeof open>>, path: string;
-type RequestOptions = { events?: string[]; edits?: Partial<TaskDraft>; checklist?: ChecklistItem[]; intent?: 'cancel' | 'skip' };
+type RequestOptions = { events?: string[]; edits?: Partial<TaskDraft>; checklist?: ChecklistItem[]; intent?: 'cancel' | 'skip'; historyVersion?: 3 | 4 };
 async function request(options: RequestOptions = {}): Promise<OwnedEditorCompleteSaveRequest> {
     const raw = (await env.adapter.getData({ rawTasks: true })).tasks.find((row) => row.id === 'complete')!;
     const draft = createTaskDraft({ ...raw, recurrence: normalizeRecurrenceForLoad(raw.recurrence), timeSpentMinutes: normalizeTimeSpentMinutes(raw.timeSpentMinutes) });
@@ -110,25 +110,27 @@ async function request(options: RequestOptions = {}): Promise<OwnedEditorComplet
         attachmentsOwned: true, attachmentsBase: base, attachments: base, linkSheet: {},
         ...(options.checklist ? { checklistBase, checklistValue } : {}), ...(scheduleOwned ? { scheduleBase: getNativeTaskScheduleBase(raw) } : {}),
         ...(recurrenceOwned ? { recurrenceBase: getNativeTaskRecurrenceBase({ ...raw, recurrence: normalizeRecurrenceForLoad(raw.recurrence) }) } : {}) });
-    const priorOperations: NativeAttachmentDraftOperationV3[] = []; let beforePayloadJSON = initialPayloadJSON;
+    const historyVersion = options.historyVersion ?? 3;
+    const priorOperations: (NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4)[] = []; let beforePayloadJSON = initialPayloadJSON;
     for (const [index, event] of (options.events ?? ['add', 'baseline-file']).entries()) {
-        const lineage = { version: 3 as const, taskID: raw.id, initialPayloadJSON, beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT };
+        const lineage = { version: historyVersion, taskID: raw.id, initialPayloadJSON, beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT };
         const requestId = `${String(index + 1).padStart(8, '0')}-1111-4111-8111-111111111111`;
         if (event === 'add') {
-            const added = await prepareNativeAttachmentDraftAddV3({ ...lineage, requestId,
+            const prepare = historyVersion === 4 ? prepareNativeAttachmentDraftAddV4 : prepareNativeAttachmentDraftAddV3;
+            const added = await prepare({ ...lineage, requestId, ...(historyVersion === 4 ? { sourceSha256: "a".repeat(64) } : {}),
                 picked: { uri: `file:///cache/${index}.pdf`, name: 'Report.pdf', mimeType: null, size: 3 }, measuredSize: 3 },
             { assertEditable: () => {}, t: (key) => key });
             if (added.kind !== 'prepared') throw new Error('Fixture Add refused');
-            priorOperations.push({ kind: 'add', operation: added }); beforePayloadJSON = added.afterPayloadJSON;
+            priorOperations.push({ kind: 'add', operation: added } as NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4); beforePayloadJSON = added.afterPayloadJSON;
         } else {
-            const removed = prepareNativeAttachmentDraftRemoveV3({ ...lineage, requestId, attachmentId: event }, { assertEditable: () => {}, t: (key) => key });
+            const removed = (historyVersion === 4 ? prepareNativeAttachmentDraftRemoveV4 : prepareNativeAttachmentDraftRemoveV3)({ ...lineage, requestId, attachmentId: event }, { assertEditable: () => {}, t: (key) => key });
             priorOperations.push({ kind: 'remove', operation: removed }); beforePayloadJSON = removed.afterPayloadJSON;
         }
     }
     const changed = new Set(touched.filter((field) => !taskEditValuesEqual(touchedBase[field], edited[field])));
     for (const group of [ASSOCIATIONS, RECURRENCE, LIFECYCLE]) if (group.some((field) => changed.has(field))) group.forEach((field) => changed.add(field));
-    return clone({ version: 2, kind: 'owned-editor-file-edit-save', checkpoint: { version: 1, sessionID: SESSION, taskID: raw.id,
-        generation: priorOperations.length + 1, payloadJSON: beforePayloadJSON }, ownedDraft: { version: 3, taskID: raw.id, initialPayloadJSON,
+    return clone({ version: historyVersion === 4 ? 3 : 2, kind: 'owned-editor-file-edit-save', checkpoint: { version: 1, sessionID: SESSION, taskID: raw.id,
+        generation: priorOperations.length + 1, payloadJSON: beforePayloadJSON }, ownedDraft: { version: historyVersion, taskID: raw.id, initialPayloadJSON,
         beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT }, saveRequest: { id: raw.id, requestId: ID,
         base: Object.fromEntries([...changed].map((field) => [field, touchedBase[field]])),
         patch: Object.fromEntries([...changed].map((field) => [field, edited[field]])), scheduleBase: getNativeTaskScheduleBase(raw),
@@ -156,6 +158,46 @@ afterEach(async () => {
 });
 
 describe('internal complete owned editor Save', () => {
+    it('selects complete3/history4 and cold-replays exact hash-bearing Add/Remove/Add with checklist once', async () => {
+        const selected = await request({ historyVersion: 4, events: ['add', '00000001-1111-4111-8111-111111111111', 'add'],
+            edits: { title: 'Hashed files' }, checklist: [item('one', 'Changed', true)] });
+        const envelope = await plan(selected), frozen = JSON.stringify(envelope);
+        expect(envelope.request.version).toBe(3); expect(envelope.prepared.version).toBe(3);
+        expect(envelope.prepared.decision.prepared.version).toBe(2);
+        const validation = unwrap(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(envelope)); expect(validation.version).toBe(3);
+        expect(after(envelope).attachments?.filter((entry) => entry.id.startsWith('000000'))).toHaveLength(2);
+        expect(after(envelope).attachments?.find((entry) => entry.id.startsWith('00000003'))?.fileHash).toBe('a'.repeat(64));
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(envelope)); const saved = rows();
+        env = await open(path); env.writes.mockClear(); unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(envelope));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+        const wrongPair = clone(envelope); wrongPair.request.version = 2; wrongPair.prepared.version = 2; wrongPair.prepared.request.version = 2;
+        expect(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(wrongPair)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+        const wrongHash = clone(envelope) as any; wrongHash.request.ownedDraft.priorOperations[0].operation.sourceSha256 = 'b'.repeat(64);
+        expect(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(wrongHash)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+        const legacy = await open(path + '.legacy', seed()); env = legacy;
+        const old = await plan(); expect(old.request.version).toBe(2); expect(old.prepared.version).toBe(2);
+        expect(old.request.ownedDraft.priorOperations[0].operation).not.toHaveProperty('sourceSha256');
+    });
+    it('keeps complete3 Cancel/Undo inner2 and cold exact replay without rewriting live hashes', async () => {
+        const cancel = await plan(await request({ historyVersion: 4, intent: 'cancel', edits: { title: 'Hashed cancelled' } }));
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(cancel)); env = await open(path);
+        const undoRequest = { requestId: '88888888-1111-4111-8111-111111111111', cancelRequestId: ID };
+        const prepared = unwrap(await env.host.prepareOwnedEditorCompleteTaskCancellationUndo({ request: undoRequest, cancel })).prepared;
+        expect(prepared.version).toBe(2); expect(prepared.cancel.request.version).toBe(3);
+        const undo = { request: undoRequest, prepared }; unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskCancellationUndo(undo));
+        expect((await rawTask()).status).toBe('next'); expect((await rawTask()).attachments?.find((entry) => entry.id.startsWith('00000001'))?.fileHash).toBe('a'.repeat(64));
+        const saved = rows(); env = await open(path); env.writes.mockClear(); unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskCancellationUndo(undo));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled();
+    });
+    it('admits complete3 empty and Remove-first histories with sealed pair validation', async () => {
+        for (const events of [[], ['baseline-file']]) {
+            const envelope = await plan(await request({ historyVersion: 4, events, edits: { title: 'Selected four' } }));
+            expect(unwrap(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(envelope)).version).toBe(3);
+            expect(envelope.request.ownedDraft.version).toBe(4);
+            const wrong = clone(envelope) as any; wrong.request.ownedDraft.version = 3;
+            expect(env.host.validatePreparedOwnedEditorCompleteTaskDraftSave(wrong).ok).toBe(false);
+        }
+    });
     it('saves literal empty raw arrays after three Adds and cold-replays the serialized exact effect', async () => {
         env = await open(path, seed({ attachments: [], checklist: [] }));
         env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');

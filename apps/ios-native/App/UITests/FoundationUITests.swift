@@ -1999,7 +1999,7 @@ final class FoundationUITests: XCTestCase {
         let add = app.buttons["task-attachment-add-file"]
         revealPagedElement(app, add, in: scroll, outerEdge: true)
         boardEnabled(add); add.tap()
-        // Begin owns an empty V3 draft before the picker; Cancel submits no Add.
+        // Begin owns an empty owned draft before the picker; Cancel submits no Add.
         let cancel = app.navigationBars.buttons["Cancel"].firstMatch
         boardEnabled(cancel, timeout: 30); cancel.tap()
         revealAttachmentTestTitle(app)

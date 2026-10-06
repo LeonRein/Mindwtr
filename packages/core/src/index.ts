@@ -355,3 +355,10 @@ export type { NativeAttachmentDraftDiscardInput, NativeAttachmentDraftDiscardPha
 export type { OwnedFileAddSaveRequest, PreparedOwnedFileAddSave } from './native-host-contract-owned-file-save';
 
 export type { OwnedEditorFileAddSaveRequest, PreparedOwnedEditorFileAddSave } from './native-host-contract-owned-editor-save';
+
+export { validateNativeAttachmentDraftBeginV4, validateNativeAttachmentDraftLineageV4, prepareNativeAttachmentDraftAddV4,
+    prepareNativeAttachmentDraftRemoveV4, completeNativeAttachmentDraftAddV4, readNativeAttachmentDraftFrozenV2 } from './native-attachment-draft';
+export type { NativeAttachmentDraftPreparedV2, NativeAttachmentDraftAddedV2, NativeAttachmentDraftHashedFile,
+    NativeAttachmentDraftOperationV4, NativeAttachmentDraftLineageInputV4, NativeAttachmentDraftLineageV4 } from './native-attachment-draft';
+export { prepareNativeAttachmentDraftDiscardCandidatesV4 } from './native-attachment-draft-discard';
+export type { NativeAttachmentDraftDiscardInputV4, NativeAttachmentDraftDiscardCandidatesV4 } from './native-attachment-draft-discard';

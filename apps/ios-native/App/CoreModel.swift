@@ -948,6 +948,7 @@ final class CoreModel: ObservableObject {
         let session: String
         let generation: Int
         let requestID: String
+        let historyVersion: Int
     }
     private var taskFileImportClaim: TaskFileImportClaim?
     private var taskFileImportTask: Task<Void, Never>?
@@ -2615,7 +2616,7 @@ final class CoreModel: ObservableObject {
         else {
             summary = try decode(encoded)
             guard Set(summary.keys) == Set(["version", "status", "sessionID", "checkpoint", "operations", "discard"]),
-                  [1, 2, 3].contains(summary.number("version")),
+                  [1, 2, 3, 4].contains(summary.number("version")),
                   summary["operations"] is [CoreObject], !summary.text("sessionID").isEmpty else {
                 throw CocoaError(.coderReadCorrupt)
             }
@@ -2627,7 +2628,7 @@ final class CoreModel: ObservableObject {
         else if summary.object("discard").text("phase") == "detached" { taskAttachmentState = .discardedCleanup }
         else if !summary.object("discard").isEmpty { taskAttachmentState = .interrupted }
         else if summary.text("status") == "cleanupPending" { taskAttachmentState = .savedCleanup }
-        else if summary.number("version") != 3 { taskAttachmentState = .blocked }
+        else if ![3, 4].contains(summary.number("version")) { taskAttachmentState = .blocked }
         else if summary.text("status") != "active"
             || summary.objects("operations").contains(where: { $0.text("phase") != "checkpointed" }) {
             taskAttachmentState = .interrupted
@@ -2693,7 +2694,13 @@ final class CoreModel: ObservableObject {
         try requireClaim()
         guard host === currentHost, taskPresented, taskRecoverySession == session, viewedTaskID == taskID,
               taskRecoveryCheckpointError == nil, let snapshot = taskRecoverySnapshot else { throw CocoaError(.fileWriteUnknown) }
-        let result = try decode(try await currentHost.beginAttachmentDraftV3(expectedSession: session, expectedGeneration: snapshot.generation))
+        let result: CoreObject
+        if taskHasAttachmentOwner {
+            guard [3, 4].contains(taskAttachmentSummary.number("version")) else { throw CocoaError(.coderReadCorrupt) }
+            if taskAttachmentSummary.number("version") == 3 {
+                result = try decode(try await currentHost.beginAttachmentDraftV3(expectedSession: session, expectedGeneration: snapshot.generation))
+            } else { result = try decode(try await currentHost.beginAttachmentDraftV4(expectedSession: session, expectedGeneration: snapshot.generation)) }
+        } else { result = try decode(try await currentHost.beginAttachmentDraftV4(expectedSession: session, expectedGeneration: snapshot.generation)) }
         try requireClaim()
         guard host === currentHost, taskPresented, taskRecoverySession == session, viewedTaskID == taskID,
               result.text("sessionID") == session, result.number("generation") == snapshot.generation else { throw CancellationError() }
@@ -2728,7 +2735,7 @@ final class CoreModel: ObservableObject {
             let id = UUID()
             taskFileImportClaim = TaskFileImportClaim(id: id, kind: kind, host: currentHost, taskID: taskID,
                 session: session, generation: taskRecoveryGeneration,
-                requestID: UUID().uuidString.lowercased())
+                requestID: UUID().uuidString.lowercased(), historyVersion: taskAttachmentSummary.number("version"))
             taskFileImporterID = id
             taskFileImporterPresented = true
             return id
@@ -2805,16 +2812,22 @@ final class CoreModel: ObservableObject {
                 let encoded: String
                 switch source {
                 case .file(let url):
-                    encoded = try await claim.host.addProviderAttachmentV3(selectedURL: url,
-                        expectedSession: claim.session, expectedGeneration: claim.generation, requestId: claim.requestID)
+                    encoded = try await claim.historyVersion == 4
+                        ? claim.host.addProviderAttachmentV4(selectedURL: url, expectedSession: claim.session,
+                            expectedGeneration: claim.generation, requestId: claim.requestID)
+                        : claim.host.addProviderAttachmentV3(selectedURL: url, expectedSession: claim.session,
+                            expectedGeneration: claim.generation, requestId: claim.requestID)
                 case .photo(let provider):
-                    encoded = try await claim.host.addPhotoProviderAttachmentV3(itemProvider: provider,
-                        expectedSession: claim.session, expectedGeneration: claim.generation, requestId: claim.requestID)
+                    encoded = try await claim.historyVersion == 4
+                        ? claim.host.addPhotoProviderAttachmentV4(itemProvider: provider, expectedSession: claim.session,
+                            expectedGeneration: claim.generation, requestId: claim.requestID)
+                        : claim.host.addPhotoProviderAttachmentV3(itemProvider: provider, expectedSession: claim.session,
+                            expectedGeneration: claim.generation, requestId: claim.requestID)
                 }
                 let reply = try decode(encoded)
                 guard taskAttachmentClaimIsCurrent(claim, requireGeneration: false),
                       reply.text("requestId") == claim.requestID, reply.text("sessionID") == claim.session,
-                      reply.text("status") == "added" else { throw CancellationError() }
+                      reply.text("status") == "added", reply.number("version") == (claim.historyVersion == 4 ? 2 : 1) else { throw CancellationError() }
                 try await adoptTaskAttachmentCheckpoint(claim.host, session: claim.session, taskID: claim.taskID,
                     expectedGeneration: reply.number("generation"))
                 guard taskAttachmentClaimIsCurrent(claim, requireGeneration: false) else { throw CancellationError() }
@@ -2895,7 +2908,7 @@ final class CoreModel: ObservableObject {
                 let discard = summary.object("discard")
                 if !discard.isEmpty {
                     let reply: String
-                    if summary.number("version") == 3 {
+                    if [3, 4].contains(summary.number("version")) {
                         reply = try await currentHost.finishAttachmentDraftDiscardV3(expectedSession: session, requestId: discard.text("requestId"))
                     } else {
                         reply = try await currentHost.finishAttachmentDraftDiscard(expectedSession: session, requestId: discard.text("requestId"))
@@ -2909,7 +2922,7 @@ final class CoreModel: ObservableObject {
                         taskRecoveryGateVisible = taskRecoverySnapshot != nil || taskRecoveryCorrupt
                     }
                 } else {
-                    if summary.number("version") == 3 {
+                    if [3, 4].contains(summary.number("version")) {
                         _ = try await currentHost.recoverAttachmentDraftV3(expectedSession: session)
                     } else {
                         _ = try await currentHost.recoverAttachmentDraft(expectedSession: session)
@@ -19148,7 +19161,7 @@ final class CoreModel: ObservableObject {
             let reply: String
             if !discard.isEmpty {
                 requestID = discard.text("requestId")
-                if summary.number("version") == 3 {
+                if [3, 4].contains(summary.number("version")) {
                     reply = try await currentHost.finishAttachmentDraftDiscardV3(expectedSession: session, requestId: requestID)
                 } else { reply = try await currentHost.finishAttachmentDraftDiscard(expectedSession: session, requestId: requestID) }
             } else {
@@ -19163,7 +19176,7 @@ final class CoreModel: ObservableObject {
                         "generation": checkpoint.number("generation")])
                     taskAttachmentDiscardRequest = request
                 }
-                if summary.number("version") == 3 { reply = try await currentHost.discardAttachmentDraftV3(requestJSON: request) }
+                if [3, 4].contains(summary.number("version")) { reply = try await currentHost.discardAttachmentDraftV3(requestJSON: request) }
                 else { reply = try await currentHost.discardAttachmentDraft(requestJSON: request) }
             }
             let value = try decode(reply)
@@ -19280,7 +19293,7 @@ final class CoreModel: ObservableObject {
         defer { finishOperation() }
         do {
             if owned {
-                guard taskAttachmentSummary.number("version") == 3,
+                guard [3, 4].contains(taskAttachmentSummary.number("version")),
                       taskAttachmentSummary.object("discard").isEmpty,
                       taskAttachmentState != .savedCleanup else { throw CocoaError(.coderReadCorrupt) }
                 _ = try await host.recoverAttachmentDraftV3(expectedSession: snapshot.sessionID)
@@ -20228,7 +20241,7 @@ final class CoreModel: ObservableObject {
               taskChecklistWriteKind == nil, !taskChecklistReadPending else { return }
         guard !taskAttachmentWorking, taskFileImporterID == nil else { return }
         let ownedSave = taskHasActiveAttachmentOwner
-        guard !ownedSave || (taskAttachmentState == .active && taskAttachmentSummary.number("version") == 3) else {
+        guard !ownedSave || (taskAttachmentState == .active && [3, 4].contains(taskAttachmentSummary.number("version"))) else {
             taskAttachmentError = "Finish the interrupted attachment change before saving."
             return
         }

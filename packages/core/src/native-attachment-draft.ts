@@ -57,6 +57,24 @@ export type NativeAttachmentDraftRemoveInputV3 = NativeAttachmentDraftLineageInp
     requestId: string; attachmentId: string;
 };
 export type NativeAttachmentDraftLineageV3 = Omit<NativeAttachmentDraftLineage, 'version'> & { version: 3 };
+export type NativeAttachmentDraftHashedFile = NativeAttachmentDraftFile & Readonly<{ fileHash: string }>;
+export type NativeAttachmentDraftPreparedV2 = Omit<NativeAttachmentDraftPrepared, 'version' | 'prepared' | 'attachment'> & Readonly<{
+    version: 2; sourceSha256: string; prepared: Readonly<{ kind: 'prepared'; attachment: NativeAttachmentDraftHashedFile }>;
+    attachment: NativeAttachmentDraftHashedFile;
+}>;
+export type NativeAttachmentDraftOperationV4 = Readonly<
+    { kind: 'add'; operation: NativeAttachmentDraftPreparedV2 }
+    | { kind: 'remove'; operation: NativeAttachmentDraftRemovePrepared }
+>;
+export type NativeAttachmentDraftLineageInputV4 = Omit<NativeAttachmentDraftLineageInputV3, 'version' | 'priorOperations'> & {
+    version: 4; priorOperations: readonly NativeAttachmentDraftOperationV4[];
+};
+export type NativeAttachmentDraftLineageV4 = Omit<NativeAttachmentDraftLineage, 'version'> & { version: 4 };
+export type NativeAttachmentDraftAddedV2 = Omit<NativeAttachmentDraftAdded, 'version' | 'attachment'> & Readonly<{
+    version: 2; attachment: NativeAttachmentDraftHashedFile;
+}>;
+type MixedLineage = NativeAttachmentDraftLineageInputV3 | NativeAttachmentDraftLineageInputV4;
+type FrozenAdd = NativeAttachmentDraftPrepared | NativeAttachmentDraftPreparedV2;
 export type NativeAttachmentDraftRefusal = { kind: 'refused'; message: string };
 export type NativeAttachmentDraftCompleteInput = { prepared: NativeAttachmentDraftPrepared };
 export type NativeAttachmentDraftAdded = Readonly<{
@@ -150,8 +168,12 @@ const picked = (value: unknown): NativeAttachmentDraftPicked => {
     return Object.freeze({ uri: fileURI(input.uri), name: input.name as string | null,
         mimeType: input.mimeType as string | null, size: input.size as number | null });
 };
-const attachment = (value: unknown): NativeAttachmentDraftFile => {
-    if (!exact(value, FILE_FIELDS, ['mimeType'])) invalid();
+const sha256 = (value: unknown): string => {
+    if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) invalid();
+    return value as string;
+};
+const attachment = (value: unknown, hashed = false): NativeAttachmentDraftFile | NativeAttachmentDraftHashedFile => {
+    if (!exact(value, hashed ? [...FILE_FIELDS, 'fileHash'] : FILE_FIELDS, ['mimeType'])) invalid();
     const input = value as Record<string, unknown>;
     const id = requestID(input.id), uri = fileURI(input.uri);
     if (input.kind !== 'file' || typeof input.title !== 'string' || input.title.length > 100_000
@@ -161,7 +183,8 @@ const attachment = (value: unknown): NativeAttachmentDraftFile => {
     try { if (new Date(createdAt).toISOString() !== createdAt) invalid(); } catch { return invalid(); }
     const file: NativeAttachmentDraftFile = Object.freeze({ id, kind: 'file', title: input.title as string, uri,
         ...(own(input, 'mimeType') ? { mimeType: input.mimeType as string } : {}), size: size(input.size),
-        createdAt, updatedAt: createdAt, localStatus: 'available' });
+        createdAt, updatedAt: createdAt, localStatus: 'available',
+        ...(hashed ? { fileHash: sha256(input.fileHash) } : {}) });
     if (!readNativeAttachments([file])) invalid();
     return file;
 };
@@ -189,24 +212,27 @@ const initialPayload = (encoded: unknown, taskID: string): void => {
 };
 
 /** Capture bounded scalar proof fields before parsing payloads or awaiting shared policy. */
-const frozenShape = (value: unknown): NativeAttachmentDraftPrepared => {
-    if (!exact(value, PREPARED_FIELDS)) invalid();
+const frozenShape = (value: unknown, version: 1 | 2 = 1): FrozenAdd => {
+    if (!exact(value, version === 2 ? [...PREPARED_FIELDS, 'sourceSha256'] : PREPARED_FIELDS)) invalid();
     const input = value as Record<string, unknown>;
-    if (input.version !== 1 || input.kind !== 'prepared' || !exact(input.prepared, ['kind', 'attachment'])
+    if (input.version !== version || input.kind !== 'prepared' || !exact(input.prepared, ['kind', 'attachment'])
         || input.prepared.kind !== 'prepared') invalid();
     const prepared = Object.freeze({ kind: 'prepared' as const,
-        attachment: attachment((input.prepared as Record<string, unknown>).attachment) });
-    const result: NativeAttachmentDraftPrepared = Object.freeze({ version: 1, kind: 'prepared',
+        attachment: attachment((input.prepared as Record<string, unknown>).attachment, version === 2) });
+    const result = Object.freeze({ version, kind: 'prepared' as const,
         taskID: text(input.taskID, 500, true), requestId: requestID(input.requestId), picked: picked(input.picked),
         measuredSize: size(input.measuredSize), managedDirectoryURI: fileURI(input.managedDirectoryURI, true),
         beforePayloadJSON: text(input.beforePayloadJSON, PAYLOAD_BYTES, true),
         afterPayloadJSON: text(input.afterPayloadJSON, PAYLOAD_BYTES, true), prepared,
-        targetURI: fileURI(input.targetURI), attachment: attachment(input.attachment) });
+        targetURI: fileURI(input.targetURI), attachment: attachment(input.attachment, version === 2),
+        ...(version === 2 ? { sourceSha256: sha256(input.sourceSha256) } : {}) }) as FrozenAdd;
     jsonBytes(result, PREPARED_BYTES);
     return result;
 };
-const validateFrozen = (value: NativeAttachmentDraftPrepared): void => {
+const validateFrozen = (value: FrozenAdd): void => {
     const source = value.prepared.attachment;
+    if (value.version === 2 && (value.prepared.attachment.fileHash !== value.sourceSha256
+        || value.attachment.fileHash !== value.sourceSha256)) invalid();
     if (source.id !== value.requestId || source.title !== (value.picked.name || 'file') || source.uri !== value.picked.uri
         || source.mimeType !== (value.picked.mimeType ?? undefined) || source.size !== value.measuredSize
         || value.targetURI !== value.managedDirectoryURI + getManagedAttachmentFileName(source)
@@ -218,7 +244,13 @@ const validateFrozen = (value: NativeAttachmentDraftPrepared): void => {
 
 /** Internal structural reader; no current policy, IO or publication authority. */
 export function readNativeAttachmentDraftFrozen(input: unknown): NativeAttachmentDraftPrepared {
-    const captured = frozenShape(input);
+    const captured = frozenShape(input) as NativeAttachmentDraftPrepared;
+    validateFrozen(captured);
+    return captured;
+}
+
+export function readNativeAttachmentDraftFrozenV2(input: unknown): NativeAttachmentDraftPreparedV2 {
+    const captured = frozenShape(input, 2) as NativeAttachmentDraftPreparedV2;
     validateFrozen(captured);
     return captured;
 }
@@ -247,7 +279,7 @@ const captureLineage = (object: Record<string, unknown>, additionalFields: objec
     for (let index = 0; index < additions.length; index++) {
         const descriptor = Object.getOwnPropertyDescriptor(additions, String(index));
         if (!descriptor?.enumerable || !own(descriptor, 'value')) invalid();
-        const copy = frozenShape(descriptor!.value);
+        const copy = frozenShape(descriptor!.value) as NativeAttachmentDraftPrepared;
         encodedBytes += jsonBytes(copy, PREPARED_BYTES) + (captured.priorAdditions.length ? 1 : 0);
         if (encodedBytes > PREPARE_BYTES) invalid();
         captured.priorAdditions.push(copy);
@@ -354,13 +386,13 @@ Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
     const additionalFields = { requestId: requestID(object.requestId), picked: picked(object.picked), measuredSize: size(object.measuredSize) };
     const captured = { ...captureLineage(object, additionalFields, version), ...additionalFields };
     if ((version === 1 ? validateLineage(captured) : validateLineageV2(captured)).has(captured.requestId)) invalid();
-    return prepareCapturedAdd(captured, deps);
+    return prepareCapturedAdd(captured, deps) as Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal>;
 }
 
 // Both sealed legacy and mixed histories use the same picked-file policy and metadata producer.
 async function prepareCapturedAdd(captured: { taskID: string; beforePayloadJSON: string; requestId: string;
-    picked: NativeAttachmentDraftPicked; measuredSize: number; managedDirectoryURI: string },
-    deps: NativeAttachmentDraftDependencies): Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
+    picked: NativeAttachmentDraftPicked; measuredSize: number; managedDirectoryURI: string; sourceSha256?: string },
+    deps: NativeAttachmentDraftDependencies): Promise<FrozenAdd | NativeAttachmentDraftRefusal> {
     const before = payload(captured.beforePayloadJSON, captured.taskID);
     if (before.attachments.length >= 1_000 || before.attachments.some((item) => item.id === captured.requestId)) invalid();
     const { assertEditable, t } = deps;
@@ -372,19 +404,22 @@ async function prepareCapturedAdd(captured: { taskID: string; beforePayloadJSON:
     // RN's optional undefined MIME field is absent in the durable JSON record.
     const preparedAttachment = { ...result.attachment };
     if (preparedAttachment.mimeType === undefined) delete preparedAttachment.mimeType;
-    const prepared = Object.freeze({ kind: 'prepared' as const, attachment: attachment(preparedAttachment) });
+    const hashed = captured.sourceSha256 !== undefined;
+    const prepared = Object.freeze({ kind: 'prepared' as const, attachment: attachment({ ...preparedAttachment,
+        ...(hashed ? { fileHash: captured.sourceSha256 } : {}) }, hashed) });
     const targetURI = captured.managedDirectoryURI + getManagedAttachmentFileName(prepared.attachment);
     fileURI(targetURI);
     if (targetURI === captured.picked.uri) return { kind: 'refused', message: t('attachments.fileNotReadable') };
-    const completed = attachment({ ...prepared.attachment, uri: targetURI, size: captured.measuredSize, localStatus: 'available' });
+    const completed = attachment({ ...prepared.attachment, uri: targetURI, size: captured.measuredSize, localStatus: 'available' }, hashed);
     let afterPayloadJSON: string;
     try { afterPayloadJSON = JSON.stringify({ ...before.object, attachments: [...before.attachments, completed] }); }
     catch { return invalid(); }
     text(afterPayloadJSON, PAYLOAD_BYTES, true);
-    const frozen: NativeAttachmentDraftPrepared = Object.freeze({ version: 1, kind: 'prepared', taskID: captured.taskID,
+    const frozen = Object.freeze({ version: hashed ? 2 : 1, kind: 'prepared', taskID: captured.taskID,
         requestId: captured.requestId, picked: captured.picked, measuredSize: captured.measuredSize,
         managedDirectoryURI: captured.managedDirectoryURI, beforePayloadJSON: captured.beforePayloadJSON,
-        afterPayloadJSON, prepared, targetURI, attachment: completed });
+        afterPayloadJSON, prepared, targetURI, attachment: completed,
+        ...(hashed ? { sourceSha256: captured.sourceSha256 } : {}) }) as FrozenAdd;
     jsonBytes(frozen, PREPARED_BYTES);
     return frozen;
 }
@@ -392,8 +427,18 @@ async function prepareCapturedAdd(captured: { taskID: string; beforePayloadJSON:
 /** Call only after native publication proof. This projection neither copies nor owns bytes. */
 export async function completeNativeAttachmentDraftAdd(input: unknown, deps: NativeAttachmentDraftDependencies):
 Promise<NativeAttachmentDraftAdded | NativeAttachmentDraftRefusal> {
+    return completeDraftAdd(input, deps, 1) as Promise<NativeAttachmentDraftAdded | NativeAttachmentDraftRefusal>;
+}
+
+export async function completeNativeAttachmentDraftAddV4(input: unknown, deps: NativeAttachmentDraftDependencies):
+Promise<NativeAttachmentDraftAddedV2 | NativeAttachmentDraftRefusal> {
+    return completeDraftAdd(input, deps, 2) as Promise<NativeAttachmentDraftAddedV2 | NativeAttachmentDraftRefusal>;
+}
+
+async function completeDraftAdd(input: unknown, deps: NativeAttachmentDraftDependencies, version: 1 | 2):
+Promise<NativeAttachmentDraftAdded | NativeAttachmentDraftAddedV2 | NativeAttachmentDraftRefusal> {
     if (!exact(input, ['prepared'])) invalid();
-    const frozen = frozenShape((input as Record<string, unknown>).prepared);
+    const frozen = frozenShape((input as Record<string, unknown>).prepared, version);
     validateFrozen(frozen);
     const { assertEditable, t } = deps;
     assertEditable(frozen.taskID);
@@ -406,8 +451,8 @@ Promise<NativeAttachmentDraftAdded | NativeAttachmentDraftRefusal> {
         persist: async () => ({ ...frozen.attachment }), t });
     assertEditable(frozen.taskID);
     if (result.kind === 'refused') return result;
-    return Object.freeze({ version: 1, kind: 'added', taskID: frozen.taskID, requestId: frozen.requestId,
-        afterPayloadJSON: frozen.afterPayloadJSON, attachment: frozen.attachment });
+    return Object.freeze({ version, kind: 'added', taskID: frozen.taskID, requestId: frozen.requestId,
+        afterPayloadJSON: frozen.afterPayloadJSON, attachment: frozen.attachment }) as NativeAttachmentDraftAdded | NativeAttachmentDraftAddedV2;
 }
 
 
@@ -476,30 +521,30 @@ export function readNativeAttachmentDraftRemoveFrozen(input: unknown): NativeAtt
     return captured;
 }
 
-const captureLineageV3 = (object: Record<string, unknown>, additionalFields: object = {}): NativeAttachmentDraftLineageInputV3 => {
+const captureLineageV3 = (object: Record<string, unknown>, additionalFields: object = {}, version: 3 | 4 = 3): MixedLineage => {
     const operations = object.priorOperations;
-    if (object.version !== 3 || !Array.isArray(operations) || Object.getPrototypeOf(operations) !== Array.prototype
+    if (object.version !== version || !Array.isArray(operations) || Object.getPrototypeOf(operations) !== Array.prototype
         || operations.length > 128 || Reflect.ownKeys(operations).length !== operations.length + 1) invalid();
-    const captured: NativeAttachmentDraftLineageInputV3 = { version: 3, taskID: text(object.taskID, 500, true),
+    const captured = { version, taskID: text(object.taskID, 500, true),
         initialPayloadJSON: text(object.initialPayloadJSON, PAYLOAD_BYTES, true),
         beforePayloadJSON: text(object.beforePayloadJSON, PAYLOAD_BYTES, true),
         managedDirectoryURI: fileURI(object.managedDirectoryURI, true), priorOperations: [] };
-    const copied: NativeAttachmentDraftOperationV3[] = [];
+    const copied: (NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4)[] = [];
     let bytes = jsonBytes({ ...captured, ...additionalFields }, PREPARE_BYTES);
     for (let index = 0; index < (operations as unknown[]).length; index++) {
         const descriptor = Object.getOwnPropertyDescriptor(operations, String(index));
         if (!descriptor?.enumerable || !own(descriptor, 'value') || !exact(descriptor.value, ['kind', 'operation'])) invalid();
         const entry = descriptor!.value as Record<string, unknown>;
-        const operation: NativeAttachmentDraftOperationV3 = entry.kind === 'add'
-            ? Object.freeze({ kind: 'add', operation: frozenShape(entry.operation) })
+        const operation = entry.kind === 'add'
+            ? Object.freeze({ kind: 'add' as const, operation: frozenShape(entry.operation, version === 4 ? 2 : 1) })
             : entry.kind === 'remove' ? Object.freeze({ kind: 'remove', operation: removeShape(entry.operation) }) : invalid();
         bytes += jsonBytes(operation, PREPARED_BYTES) + (index ? 1 : 0);
         if (bytes > PREPARE_BYTES) invalid();
-        copied.push(operation);
+        copied.push(operation as NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4);
     }
-    return { ...captured, priorOperations: Object.freeze(copied) };
+    return { ...captured, priorOperations: Object.freeze(copied) } as MixedLineage;
 };
-const validateLineageV3 = (captured: NativeAttachmentDraftLineageInputV3): Set<string> => {
+const validateLineageV3 = (captured: MixedLineage): Set<string> => {
     const initial = payloadV3(captured.initialPayloadJSON, captured.taskID);
     if (!linkOnlyGapV3(initial.object.attachmentsBase, initial.attachments)) invalid();
     let previous = initial.attachments;
@@ -536,7 +581,7 @@ Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal> {
     const fields = { requestId: requestIDV3(object.requestId), picked: picked(object.picked), measuredSize: size(object.measuredSize) };
     const captured = { ...captureLineageV3(object, fields), ...fields };
     if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
-    return prepareCapturedAdd(captured, deps);
+    return prepareCapturedAdd(captured, deps) as Promise<NativeAttachmentDraftPrepared | NativeAttachmentDraftRefusal>;
 }
 
 export function prepareNativeAttachmentDraftRemoveV3(input: unknown, deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftRemovePrepared {
@@ -545,6 +590,11 @@ export function prepareNativeAttachmentDraftRemoveV3(input: unknown, deps: Nativ
     const fields = { requestId: requestIDV3(object.requestId), attachmentId: attachmentIDV3(object.attachmentId) };
     const captured = { ...captureLineageV3(object, fields), ...fields };
     if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
+    return prepareCapturedRemove(captured, deps);
+}
+
+function prepareCapturedRemove(captured: MixedLineage & { requestId: string; attachmentId: string },
+    deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftRemovePrepared {
     const before = payloadV3(captured.beforePayloadJSON, captured.taskID);
     const selected = before.attachments.find((item) => item.id === captured.attachmentId);
     if (!selected || selected.kind !== 'file' || selected.deletedAt) invalid();
@@ -558,4 +608,34 @@ export function prepareNativeAttachmentDraftRemoveV3(input: unknown, deps: Nativ
         beforePayloadJSON: captured.beforePayloadJSON, afterPayloadJSON });
     assertEditable(captured.taskID);
     return frozen;
+}
+
+/** Selected hash-bearing history. Historical V3 and Add1 readers remain sealed. */
+export function validateNativeAttachmentDraftBeginV4(input: unknown, deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftLineageV4 {
+    const begin = validateNativeAttachmentDraftBeginV3(input, deps);
+    return Object.freeze({ ...begin, version: 4 });
+}
+export function validateNativeAttachmentDraftLineageV4(input: unknown): NativeAttachmentDraftLineageV4 {
+    if (!exact(input, LINEAGE_V3_FIELDS)) invalid();
+    const captured = captureLineageV3(input as Record<string, unknown>, {}, 4);
+    validateLineageV3(captured);
+    return Object.freeze({ version: 4, taskID: captured.taskID, payloadJSON: captured.beforePayloadJSON });
+}
+export async function prepareNativeAttachmentDraftAddV4(input: unknown, deps: NativeAttachmentDraftDependencies):
+Promise<NativeAttachmentDraftPreparedV2 | NativeAttachmentDraftRefusal> {
+    if (!exact(input, [...LINEAGE_V3_FIELDS, 'requestId', 'picked', 'measuredSize', 'sourceSha256'])) invalid();
+    const object = input as Record<string, unknown>;
+    const fields = { requestId: requestIDV3(object.requestId), picked: picked(object.picked),
+        measuredSize: size(object.measuredSize), sourceSha256: sha256(object.sourceSha256) };
+    const captured = { ...captureLineageV3(object, fields, 4), ...fields };
+    if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
+    return prepareCapturedAdd(captured, deps) as Promise<NativeAttachmentDraftPreparedV2 | NativeAttachmentDraftRefusal>;
+}
+export function prepareNativeAttachmentDraftRemoveV4(input: unknown, deps: NativeAttachmentDraftDependencies): NativeAttachmentDraftRemovePrepared {
+    if (!exact(input, [...LINEAGE_V3_FIELDS, 'requestId', 'attachmentId'])) invalid();
+    const object = input as Record<string, unknown>;
+    const fields = { requestId: requestIDV3(object.requestId), attachmentId: attachmentIDV3(object.attachmentId) };
+    const captured = { ...captureLineageV3(object, fields, 4), ...fields };
+    if (captured.priorOperations.length >= 128 || validateLineageV3(captured).has(captured.requestId)) invalid();
+    return prepareCapturedRemove(captured, deps);
 }

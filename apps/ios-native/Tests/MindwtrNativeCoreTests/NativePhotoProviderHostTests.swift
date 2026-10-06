@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CryptoKit
 import Darwin
 import UniformTypeIdentifiers
 import CryptoKit
@@ -212,9 +213,10 @@ final class NativePhotoProviderHostTests: XCTestCase {
         try await host.checkpointEditorDraft(.init(sessionID: UUID().uuidString.lowercased(), taskID: taskID, generation: 1, payloadJSON: payload))
         return (host, opening)
     }
-    private func add(_ host: CoreHost, item: NSItemProvider, id: String = UUID().uuidString.lowercased()) async throws -> String {
+    private func add(_ host: CoreHost, item: NSItemProvider, id: String = UUID().uuidString.lowercased(), historyVersion: Int = 3) async throws -> String {
         let snapshot = try latest()
-        return try await host.addPhotoProviderAttachmentV3(itemProvider: item, expectedSession: snapshot.sessionID,
+        return try await historyVersion == 4 ? host.addPhotoProviderAttachmentV4(itemProvider: item, expectedSession: snapshot.sessionID,
+            expectedGeneration: snapshot.generation, requestId: id) : host.addPhotoProviderAttachmentV3(itemProvider: item, expectedSession: snapshot.sessionID,
             expectedGeneration: snapshot.generation, requestId: id)
     }
     func testActualPhotoAddSaveAndColdOpenUseProcessedMetadataAndExactBytes() async throws {
@@ -252,7 +254,7 @@ final class NativePhotoProviderHostTests: XCTestCase {
             Data(sql("SELECT * FROM tasks WHERE id='unrelated-photo-save'").utf8)))
         let bytes = try imageBytes(), selected = try source(bytes), item = Provider(), addID = UUID().uuidString.lowercased()
         item.synchronousURL = selected; item.suggestedName = "Private.photo.png"
-        _ = try await add(host, item: item, id: addID)
+        _ = try await add(host, item: item, id: addID, historyVersion: 4)
         let added = try lastAdd(), snapshot = try latest(), target = try XCTUnwrap(URL(string: added.targetURI))
         let processed = try XCTUnwrap(UIImage(data: bytes)?.pngData()), targetIdentity = try inode(target)
         XCTAssertEqual(item.loads, 1); XCTAssertEqual(added.requestId, addID); XCTAssertEqual(added.phase, .checkpointed)
@@ -260,6 +262,11 @@ final class NativePhotoProviderHostTests: XCTestCase {
         XCTAssertEqual(try rows(), before); XCTAssertEqual(try Data(contentsOf: selected), bytes)
         let afterPayload = try object(snapshot.payloadJSON), attachments = try XCTUnwrap(afterPayload["attachments"] as? [[String: Any]])
         XCTAssertEqual(attachments.count, 1); XCTAssertEqual(attachments[0]["id"] as? String, addID)
+        let digest = SHA256.hash(data: processed).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(added.source.sha256, digest); XCTAssertEqual(try store.readMixed()?.version, 4)
+        XCTAssertEqual(attachments[0]["fileHash"] as? String, digest)
+        let frozenAdd = try object(added.preparedJSON)
+        XCTAssertEqual(frozenAdd["version"] as? Int, 2); XCTAssertEqual(frozenAdd["sourceSha256"] as? String, digest)
         let requestID = UUID().uuidString.lowercased()
         let saveJSON = try json(["id": taskID, "requestId": requestID, "base": try XCTUnwrap(afterPayload["touchedBase"]),
             "patch": try XCTUnwrap(afterPayload["edited"]), "scheduleBase": try XCTUnwrap(opening["scheduleBase"]),
@@ -282,7 +289,7 @@ final class NativePhotoProviderHostTests: XCTestCase {
         let arguments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(argumentsJSON.utf8)) as? [String])
         XCTAssertEqual(arguments.count, 1)
         let wrapper = try object(XCTUnwrap(arguments.first)), envelope = try XCTUnwrap(wrapper["envelope"] as? [String: Any])
-        XCTAssertEqual(wrapper["version"] as? Int, 3)
+        XCTAssertEqual(wrapper["version"] as? Int, 4)
         let frozenRequest = try XCTUnwrap(envelope["request"] as? [String: Any])
         XCTAssertEqual(try json(XCTUnwrap(frozenRequest["saveRequest"])), saveJSON)
         let lineage = try XCTUnwrap(frozenRequest["ownedDraft"] as? [String: Any])
@@ -318,7 +325,7 @@ final class NativePhotoProviderHostTests: XCTestCase {
         let originalBundle = try XCTUnwrap(ProcessInfo.processInfo.environment["MINDWTR_CORE_BUNDLE"])
         let probe = root.appendingPathComponent("photo-save-recovery-core-host.js")
         try (String(contentsOfFile: originalBundle, encoding: .utf8)
-            + "\n;(()=>{for(const name of ['attachmentFileEditSavePrepare','attachmentDraftPrepareV3']){if(typeof MindwtrHost[name]!=='function')throw Error('Missing recovery fixture method');MindwtrHost[name]=function(){throw Error('Terminal photo recovery must not prepare');};}})();\n")
+            + "\n;(()=>{for(const name of ['attachmentFileEditSavePrepare','attachmentDraftPrepareV3','attachmentDraftPrepareV4']){if(typeof MindwtrHost[name]!=='function')throw Error('Missing recovery fixture method');MindwtrHost[name]=function(){throw Error('Terminal photo recovery must not prepare');};}})();\n")
             .write(to: probe, atomically: true, encoding: .utf8)
         let faults = HostIOFaults(); var taskWrites = 0
         faults.beforeSQL = { statement in

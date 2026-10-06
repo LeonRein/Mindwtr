@@ -3427,9 +3427,11 @@ export { planAttachmentOpen, getAttachmentResolutionMessage } from ${JSON.string
 import { logInfo as realLogInfo, setLogger as setRealLogger } from ${JSON.stringify(resolve(app, '../../packages/core/src/logger.ts'))};
 export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLoggingEnabled } from ${JSON.stringify(resolve(app, '../../packages/core/src/diagnostics-log.ts'))};
 export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLineageV3,
+    validateNativeAttachmentDraftBeginV4, validateNativeAttachmentDraftLineageV4,
+    prepareNativeAttachmentDraftAddV4, prepareNativeAttachmentDraftRemoveV4, completeNativeAttachmentDraftAddV4,
     prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3,
     readNativeAttachmentDraftRemoveFrozen } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft.ts'))};
-export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
+export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3, prepareNativeAttachmentDraftDiscardCandidatesV4 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
 import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
 import { createNativeHostContract as createRealCompleteContract } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract.ts'))};
 import { NativeReceiptSqliteAdapter as RealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
@@ -4037,6 +4039,19 @@ const poll = async (state, id) => {
         assert.equal(local.logText, beforeLog);
         local.logFailure = null;
     });
+    await check(async () => {
+        local.settings = { diagnostics: { loggingEnabled: false } };
+        assert.deepEqual(await call(local, 'attachmentDraftBeginV4', begin),
+            { ok: true, value: { version: 4, taskID: 'task257', payloadJSON: opening } });
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-attachment-link-lineage', outcome: 'validated' });
+        const beforeLog = local.logText;
+        assert.equal((await call(local, 'attachmentDraftBeginV4', { ...begin, payloadJSON: '{}' })).ok, false);
+        assert.equal(local.logText, beforeLog);
+        local.logFailure = 'private log failure';
+        assert.equal((await call(local, 'attachmentDraftBeginV4', begin)).ok, true);
+        assert.equal(local.logText, beforeLog); local.logFailure = null;
+    });
     const removedReply = await call(local, 'attachmentDraftRemovePrepareV3', removeInput);
     assert.equal(removedReply.ok, true);
     const removed = removedReply.value;
@@ -4060,6 +4075,31 @@ const poll = async (state, id) => {
             { ok: true, value: { version: 3, taskID: 'task257', payloadJSON: added.afterPayloadJSON } });
         assert.deepEqual(JSON.parse(added.afterPayloadJSON).raw, JSON.parse(opening).raw);
     });
+    await check(async () => {
+        const selected = { ...lineage, version: 4 }, sha = 'a'.repeat(64);
+        const reply = await call(local, 'attachmentDraftPrepareV4', { ...addInput, ...selected, sourceSha256: sha });
+        assert.equal(reply.ok, true); const hashed = reply.value;
+        assert.equal(hashed.version, 2); assert.equal(hashed.sourceSha256, sha);
+        assert.equal(hashed.prepared.attachment.fileHash, sha); assert.equal(hashed.attachment.fileHash, sha);
+        const full = { ...selected, beforePayloadJSON: hashed.afterPayloadJSON, priorOperations: [{ kind: 'add', operation: hashed }] };
+        assert.deepEqual(await call(local, 'attachmentDraftValidateLineageV4', full),
+            { ok: true, value: { version: 4, taskID: 'task257', payloadJSON: hashed.afterPayloadJSON } });
+        assert.equal((await call(local, 'attachmentDraftValidateLineageV3', full)).ok, false);
+        assert.equal((await call(local, 'attachmentDraftPrepareV3', { ...addInput, sourceSha256: sha })).ok, false);
+        const removed = await call(local, 'attachmentDraftRemovePrepareV4', { ...full,
+            requestId: '28800000-0000-4000-8000-000000000003', attachmentId: hashed.requestId });
+        assert.equal(removed.ok, true); assert.equal(removed.value.version, 1);
+        const discarded = { version: 3, historyVersion: 4, taskID: selected.taskID, managedDirectoryURI: ROOT,
+            initialPayloadJSON: opening, checkpointPayloadJSON: removed.value.afterPayloadJSON,
+            operations: [{ kind: 'add', phase: 'checkpointed', preparedJSON: JSON.stringify(hashed) },
+                { kind: 'remove', phase: 'checkpointed', preparedJSON: JSON.stringify(removed.value) }] };
+        const planned = await call(local, 'attachmentDraftDiscardCandidatesV4', discarded);
+        assert.equal(planned.ok, true); assert.equal(planned.value.version, 3); assert.equal(planned.value.historyVersion, 4);
+        assert.deepEqual(planned.value.candidates.map((value) => value.requestId), [hashed.requestId]);
+        assert.equal((await call(local, 'attachmentDraftDiscardCandidatesV3', discarded)).ok, false);
+        const wrong = structuredClone(full); wrong.priorOperations[0].operation.sourceSha256 = 'b'.repeat(64);
+        assert.equal((await call(local, 'attachmentDraftValidateLineageV4', wrong)).ok, false);
+    });
     // Historical retry has no optional capability, current editable task or fresh clock.
     const historical = makeState(0, [], 'ios'); historical.localTaskReadOnly = true;
     historical.sandbox = true; historical.workspaceTransition = true;
@@ -4080,7 +4120,7 @@ const poll = async (state, id) => {
         if (variant === 'readOnly') state.localTaskReadOnly = true;
         if (variant === 'taskMissing') state.localTaskViewFailure = { ok: false, error: { code: 'TASK_NOT_FOUND', message: 'Not found' } };
         if (variant === 'persistence') state.persistenceFailure = { message: 'failed' };
-        for (const [method, input] of [['attachmentDraftBeginV3', begin], ['attachmentDraftPrepareV3', addInput], ['attachmentDraftRemovePrepareV3', removeInput]]) {
+        for (const [method, input] of [['attachmentDraftBeginV3', begin], ['attachmentDraftBeginV4', begin], ['attachmentDraftPrepareV3', addInput], ['attachmentDraftRemovePrepareV3', removeInput]]) {
             await check(async () => assert.equal((await call(state, method, input)).ok, false, `${variant}/${method}`));
         }
         if (variant !== 'readOnly' && variant !== 'taskMissing') {
@@ -5507,6 +5547,7 @@ const poll = async (state, id) => {
         ['project-file-add', 'v1.3.5/ios-project-file-add', 'saved'],
         ['project-file-add', 'v1.3.5/ios-project-file-add', 'abandoned'],
         ['project-file-hash', 'v1.3.5/ios-project-file-hash', 'saved'],
+        ['task-file-hash', 'v1.3.5/ios-task-file-hash', 'saved'],
     ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };

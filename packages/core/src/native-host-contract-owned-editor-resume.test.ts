@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { createNativeHostContract } from './native-host-contract';
 import { createOwnedTaskEditorResumeMethods } from './native-host-contract-task-editor-resume';
-import { prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3, type NativeAttachmentDraftOperationV3 } from './native-attachment-draft';
+import { prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3, prepareNativeAttachmentDraftAddV4, prepareNativeAttachmentDraftRemoveV4,
+    type NativeAttachmentDraftOperationV3, type NativeAttachmentDraftOperationV4 } from './native-attachment-draft';
 import { NativeReceiptSqliteAdapter } from './native-request-receipts';
 import { flushPendingSave, getPersistenceStatus, resetForTests, setStorageAdapter, useTaskStore } from './store';
 import { createTaskDraft, type TaskDraftField } from './task-draft';
@@ -61,7 +62,7 @@ async function open(initial = task(), settings: AppData['settings'] = { deviceId
         } };
 }
 let env: Awaited<ReturnType<typeof open>>;
-async function request({ events = ['add', 'file'], groups = [] as string[], checklist = false } = {}) {
+async function request({ events = ['add', 'file'], groups = [] as string[], checklist = false, historyVersion = 3 as 3 | 4 } = {}) {
     const raw = await env.raw(), draft = createTaskDraft({ ...raw, recurrence: normalizeRecurrenceForLoad(raw.recurrence), timeSpentMinutes: normalizeTimeSpentMinutes(raw.timeSpentMinutes) });
     const fields = [...new Set(['title', ...groups.flatMap((group) => group === 'schedule' ? SCHEDULE : group === 'recurrence' ? RECURRENCE : LIFECYCLE)])];
     const payload = { version: 2, taskID: raw.id, tab: 'task', touchedBase: Object.fromEntries(fields.map((field) => [field, draft[field as keyof typeof draft] ?? null])),
@@ -75,28 +76,47 @@ async function request({ events = ['add', 'file'], groups = [] as string[], chec
         ...(groups.includes('recurrence') ? { recurrenceBase: getNativeTaskRecurrenceBase({ ...raw, recurrence: normalizeRecurrenceForLoad(raw.recurrence) }) } : {}),
         ...(checklist ? { checklistBase: raw.checklist } : {}) };
     const initialPayloadJSON = JSON.stringify(payload, null, 2); let beforePayloadJSON = initialPayloadJSON;
-    const priorOperations: NativeAttachmentDraftOperationV3[] = [];
+    const priorOperations: (NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4)[] = [];
     for (const [index, event] of events.entries()) {
-        const lineage = { version: 3 as const, taskID: raw.id, initialPayloadJSON, beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT };
+        const lineage = { version: historyVersion, taskID: raw.id, initialPayloadJSON, beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT };
         const requestId = `26900000-0000-4000-8000-${String(index + 10).padStart(12, '0')}`;
         if (event === 'add') {
-            const added = await prepareNativeAttachmentDraftAddV3({ ...lineage, requestId,
+            const added = await (historyVersion === 4 ? prepareNativeAttachmentDraftAddV4 : prepareNativeAttachmentDraftAddV3)({ ...lineage, requestId,
+                ...(historyVersion === 4 ? { sourceSha256: 'a'.repeat(64) } : {}),
                 picked: { uri: 'file:///cache/picked.pdf', name: 'Report.pdf', mimeType: null, size: 3 }, measuredSize: 3 }, { assertEditable: () => {}, t: (key) => key });
             if (added.kind !== 'prepared') throw new Error('Fixture Add refused');
-            priorOperations.push({ kind: 'add', operation: added }); beforePayloadJSON = added.afterPayloadJSON;
+            priorOperations.push({ kind: 'add', operation: added } as NativeAttachmentDraftOperationV3 | NativeAttachmentDraftOperationV4); beforePayloadJSON = added.afterPayloadJSON;
         } else {
-            const removed = prepareNativeAttachmentDraftRemoveV3({ ...lineage, requestId, attachmentId: event }, { assertEditable: () => {}, t: (key) => key });
+            const removed = (historyVersion === 4 ? prepareNativeAttachmentDraftRemoveV4 : prepareNativeAttachmentDraftRemoveV3)({ ...lineage, requestId, attachmentId: event }, { assertEditable: () => {}, t: (key) => key });
             priorOperations.push({ kind: 'remove', operation: removed }); beforePayloadJSON = removed.afterPayloadJSON;
         }
     }
-    return { version: 1, kind: 'owned-editor-resume', checkpoint: { version: 1, sessionID: SESSION, taskID: raw.id,
-        generation: priorOperations.length + 1, payloadJSON: beforePayloadJSON }, ownedDraft: { version: 3, taskID: raw.id,
+    return { version: historyVersion === 4 ? 2 : 1, kind: 'owned-editor-resume', checkpoint: { version: 1, sessionID: SESSION, taskID: raw.id,
+        generation: priorOperations.length + 1, payloadJSON: beforePayloadJSON }, ownedDraft: { version: historyVersion, taskID: raw.id,
         initialPayloadJSON, beforePayloadJSON, priorOperations, managedDirectoryURI: ROOT } };
 }
 beforeEach(async () => { env = await open(); });
 afterEach(async () => { await flushPendingSave(); resetForTests(); for (const db of databases.splice(0)) db.close(); });
 
 describe('selected owned editor resume', () => {
+    it('selects Resume2/history4 without altering raw buffers and rejects crosswired hashes before reads', async () => {
+        for (const events of [[], ['add', 'file']]) {
+            const input = await request({ historyVersion: 4, events }), frozen = JSON.stringify(input), rows = env.rows(), status = getPersistenceStatus();
+            expect(input.version).toBe(2); expect(input.ownedDraft.version).toBe(4);
+            expect(await env.owned.checkOwnedTaskEditorResume(input)).toMatchObject({ ok: true, value: { kind: 'ready' } });
+            expect(JSON.stringify(input)).toBe(frozen); expect(env.rows()).toEqual(rows); expect(env.writes()).toBe(0);
+            expect(getPersistenceStatus()).toEqual(status);
+            const before = env.reads(), wrongPair = clone(input); wrongPair.version = 1;
+            expect(await env.owned.checkOwnedTaskEditorResume(wrongPair)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+            if (events.length) {
+                const wrongHash = clone(input), operation = wrongHash.ownedDraft.priorOperations[0].operation;
+                Object.assign(operation, { sourceSha256: 'b'.repeat(64) });
+                expect(await env.owned.checkOwnedTaskEditorResume(wrongHash)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+                expect(JSON.parse(input.checkpoint.payloadJSON).attachments.find((row: Attachment) => row.id.startsWith('26900000')).fileHash).toBe('a'.repeat(64));
+            }
+            expect(env.reads()).toBe(before); expect(env.writes()).toBe(0);
+        }
+    });
     it('resumes empty and mixed histories with unresolved raw buffers and queues byte-for-byte intact', async () => {
         for (const events of [[], ['add', 'file']]) {
             const input = await request({ events }), before = JSON.stringify(input), rows = env.rows(), status = getPersistenceStatus();
