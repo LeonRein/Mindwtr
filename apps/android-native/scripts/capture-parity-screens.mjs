@@ -168,8 +168,7 @@ const originalRotation = sh('settings get system user_rotation');
 const shots = [];
 
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 const setNight = async (mode) => {
     sh(`cmd uimode night ${mode}`);

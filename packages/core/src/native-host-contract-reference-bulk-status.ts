@@ -17,6 +17,7 @@ import { normalizeProjectLifecycleFields } from './project-status';
 import { isProjectedRecurringTaskId, projectNextRecurringTask, type RecurrenceProjection } from './recurrence';
 import { projectFocusDateValues, type FocusDateProjection } from './task-utils';
 import { logInfo } from './logger';
+import { referenceBatchModules } from './store-reference-batch-modules';
 import { getBulkMoveStatusOptions } from './task-list-bulk-actions';
 import { isStatusListTaskReadOnly } from './menu-views-model';
 import { generateUUID } from './uuid';
@@ -453,3 +454,13 @@ export { detach as detachReferenceBatchJson, jsonSafe as detachReferenceBatchVal
     requiredDates as requiredReferenceBatchDates, selectedSourcesMatch as referenceBatchSourcesMatch,
     validTask as validReferenceBatchTask, validContextProject as validReferenceBatchProject,
     validArea as validReferenceBatchArea, relevantSettings as relevantReferenceBatchSettings };
+
+// The store's Reference move action reads these here: it cannot import this module (store-reference-batch-modules.ts).
+referenceBatchModules.shared = { historyRowLoadProjection, NativeReceiptSqliteAdapter };
+referenceBatchModules.move = (input) => {
+    const prepared = input as NativeReferenceTasksMovePrepared;
+    return {
+        validateEnvelope: () => Boolean(readReferenceTasksMoveEnvelope({ request: prepared.request, prepared })),
+        authorityMatches: (data) => referenceTasksMoveAuthorityMatches(prepared, data),
+    };
+};

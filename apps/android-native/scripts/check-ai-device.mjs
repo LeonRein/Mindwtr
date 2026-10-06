@@ -159,8 +159,7 @@ const STAGED = '/data/local/tmp/mindwtr-native-dev-ai-check.db';
  * goes back whole (its WAL checkpointed into the main file), and the app starts again.
  */
 const editDatabase = async (mode) => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     const db = database();
     const out = JSON.parse(execFileSync('bun', ['-e', `
         import { Database } from 'bun:sqlite';
@@ -300,8 +299,7 @@ const link = async (query, expected, description) => {
 };
 /** The app started afresh (a new process), on the Inbox. */
 const restart = async (props = {}) => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     for (const [name, value] of Object.entries(props)) sh(`setprop debug.mindwtr.native.${name} ${value}`);
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);

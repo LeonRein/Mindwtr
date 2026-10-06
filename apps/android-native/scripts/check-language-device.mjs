@@ -53,8 +53,7 @@ const setProp = (name, value) => sh(`setprop debug.mindwtr.native.${name} '${val
 
 /** A fresh process (force-stop, launch), then every checked label must be core's text in [language]. */
 const expectLanguage = async (language, step) => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     const [inbox, focus, capture, scope] = ['tab.inbox', 'tab.next', 'nav.addTask', 'projects.allAreas'].map((key) => label(language, key));

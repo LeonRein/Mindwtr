@@ -318,6 +318,33 @@ describe('mobile sync service behind fake ports', () => {
     expect(fake.values.get(SYNC_BACKEND_KEY)).toBe('off');
   });
 
+  it('asks the candidate WebDAV folder, not the stored one, whether it holds ciphertext', async () => {
+    // The stored folder is partly encrypted (an Enable cut off there); a switch to a clean folder must not be refused for it.
+    const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
+    fake.host.attachments.hasPendingWork = async () => true;
+    fake.host.attachments.syncWebdav = vi.fn(async () => false as const);
+    const probe = vi.fn(async (target?: { webdav?: { url: string } }) => (
+      target?.webdav?.url.startsWith('https://candidate.example.com') ? 'plaintext' as const : 'mixed' as const));
+    fake.host.encryption = { ...fake.host.encryption, probeLocationCiphertext: probe };
+    const withFile = (): AppData => ({ ...emptyData(), tasks: [{ id: 't1', title: 'T', status: 'inbox', tags: [], contexts: [],
+      createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
+      attachments: [{ id: 'a1', kind: 'file', title: 'a.pdf', uri: 'file:///a.pdf', cloudKey: 'attachments/a1.pdf', localStatus: 'available',
+        createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z' }] }] } as AppData);
+    fake.host.localData.getData = async () => withFile();
+    fake.host.core!.getInMemoryAppDataSnapshot = () => withFile();
+    fake.host.core!.performSyncCycle = performSyncCycle;
+    const service = createMobileSyncService(fake.host);
+
+    const result = await service.performMobileSync(undefined, {
+      activationProbe: true,
+      configOverride: { backend: 'webdav', webdav: { url: 'https://candidate.example.com/dav', username: 'bea', password: 'pw' } },
+    });
+
+    expect(probe).toHaveBeenCalledWith({ webdav: expect.objectContaining({ url: 'https://candidate.example.com/dav/data.json' }) });
+    // This fake's attachment pass downloads nothing, so the proof fails after it; the location check no longer refuses.
+    expect(String(result.error ?? '')).not.toContain('PARTLY_ENCRYPTED');
+  });
+
   it('refuses a Dropbox candidate in a FOSS build', async () => {
     const fake = createFakeHost({ isFossBuild: true, dropboxAppKey: 'key' });
     const service = createMobileSyncService(fake.host);
@@ -408,6 +435,29 @@ describe('mobile sync service behind fake ports', () => {
     expect(String(result.error)).toContain('partly encrypted');
     const scope = await readSyncLocationScope({ getItem: async (key: string) => fake.values.get(key) ?? null });
     expect(JSON.parse(fake.values.get(SYNC_ENCRYPTION_STATE_KEY)!)).toEqual({ state: 'off', partlyEncryptedScope: scope });
+  });
+
+  it('runs the attachment pass a deferred pre-sync phase owes, even when the document is unchanged', async () => {
+    // A download the last process never finished (the native installer's boot recovery rolled it back): the record holds a
+    // cloudKey and no local file. On a location this device has no fast-sync record or presence stamp for, the pre-sync
+    // phase defers (encryption-recheck), and the unchanged read check then skipped the post-merge pass as well, so even
+    // Sync now never downloaded it.
+    const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
+    const attachmentPasses = vi.fn(async () => false as const);
+    fake.host.attachments.hasPendingWork = async () => true;
+    fake.host.attachments.syncWebdav = attachmentPasses;
+    fake.host.encryption = { ...fake.host.encryption, probeLocationCiphertext: async () => 'plaintext' as const };
+    const service = createMobileSyncService(fake.host);
+    await expect(service.performMobileSync(undefined, { manual: true })).resolves.toMatchObject({ success: true });
+    // No record of a completed cycle here (as after attachment cleanup invalidates it): the posture is unestablished again.
+    fake.values.delete('@mindwtr_fast_sync_state_v1');
+    attachmentPasses.mockClear();
+
+    const result = await service.performMobileSync(undefined, { manual: true });
+
+    expect(result.success).toBe(true);
+    expect(fake.logs.some((line) => line.message.includes('Attachment pre-sync skipped') && line.extra?.reason === 'encryption-recheck')).toBe(true);
+    expect(attachmentPasses).toHaveBeenCalled();
   });
 
   it('does nothing in sandbox mode', async () => {

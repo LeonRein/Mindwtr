@@ -372,7 +372,8 @@ export type MobileSyncEncryptionPort = Pick<
 > & {
   /** Whether the location holds ciphertext beside plaintext (core's encryption service probeSyncLocationCiphertext,
    *  sampled). Asked before a WebDAV or Dropbox attachment pass with no key; absent on a host without the service. */
-  probeLocationCiphertext?: () => Promise<'plaintext' | 'encrypted' | 'mixed'>;
+  /** [target] names the cycle's own WebDAV folder (an activation's candidate is not the stored one); none reads the stored. */
+  probeLocationCiphertext?: (target?: { webdav?: MobileWebDavSyncConfig }) => Promise<'plaintext' | 'encrypted' | 'mixed'>;
 };
 
 /** Core functions and the store, called through here so a host's tests can replace them the
@@ -901,6 +902,9 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
      *  attachment prepare phase until the document read has established what is actually at this
      *  location. See `isSyncEncryptionPostureUnestablished`. */
     private deferUploadsUntilDiscovery = false;
+    /** This cycle's prepare phase was deferred while attachment work was pending (SyncRun's
+     *  `hasDeferredAttachmentWork`): the post-merge pass must run even on an unchanged document. */
+    private deferredAttachmentWork = false;
     /** What the location held when this cycle asked (assertLocationNotPartlyEncrypted); asked once. */
     private locationCiphertext: 'plaintext' | 'encrypted' | 'mixed' | null = null;
     /** Encryption state as the gate saw it, kept for the `activation` diagnostic line so a
@@ -1481,7 +1485,15 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
       if (this.encryptionMaterial) return;
       const probe = host.encryption.probeLocationCiphertext;
       if (!probe || (this.backend !== 'webdav' && !(this.backend === 'cloud' && this.cloudProvider === 'dropbox'))) return;
-      this.locationCiphertext ??= await probe();
+      // The cycle's own folder: an activation probe's candidate is not the stored location yet.
+      if (this.locationCiphertext === null) {
+        this.locationCiphertext = await probe(this.backend === 'webdav' && this.webdavConfig ? { webdav: this.webdavConfig } : undefined);
+        if (this.configOverride) {
+          logSyncInfo('Sync candidate location ciphertext checked', {
+            releaseCheck: 'v1.3.5/candidate-ciphertext-probe', backend: this.backend, found: this.locationCiphertext,
+          });
+        }
+      }
       if (this.locationCiphertext !== 'plaintext') throw new SyncEncryptionPartlyEncryptedError();
     }
 
@@ -1525,6 +1537,7 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
     private createHooks(): SyncRunPlatformHooks {
       return {
         setupCycle: async ({ setStep, setBackend }) => {
+          this.deferredAttachmentWork = false;
           const backend = this.backend;
           setBackend(backend);
           if (backend === 'file' && !(await this.resolveFileBackendConfig())) {
@@ -1704,6 +1717,7 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
             currentChangeAt: String(currentChangeAt),
           });
         },
+        hasDeferredAttachmentWork: () => this.deferredAttachmentWork,
         shouldRunAttachmentPhase: async (data, phase) => {
           const backend = this.backend;
           // #1138 / fresh-join-attachment-posture packet -10: this cycle does not yet know the
@@ -1715,7 +1729,14 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
           // still encrypted. Skip the pre-phase; the post-merge phase runs normally once the read
           // has settled the posture.
           if (phase === 'prepare' && this.deferUploadsUntilDiscovery) {
-            logSyncInfo('Attachment pre-sync skipped', { backend, reason: 'encryption-recheck' });
+            this.deferredAttachmentWork = await host.attachments.hasPendingWork(data, {
+              contentCheckEnabled: backend === 'file' || backend === 'webdav' || backend === 'cloudkit' || backend === 'cloud',
+            });
+            logSyncInfo('Attachment pre-sync skipped', {
+              backend,
+              reason: 'encryption-recheck',
+              ...(this.deferredAttachmentWork ? { owed: 'post-merge', releaseCheck: 'v1.3.5/deferred-attachment-pass' } : {}),
+            });
             return false;
           }
           // #1057 (review B3): every attachment backend now wires check-on-touch

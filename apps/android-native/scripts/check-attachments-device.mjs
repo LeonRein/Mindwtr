@@ -326,8 +326,7 @@ try {
     execFileSync(adbBin, ['-s', serial, 'reverse', `tcp:${WEBDAV_PORT}`, `tcp:${WEBDAV_PORT}`], { stdio: 'ignore' });
     execFileSync(adbBin, ['-s', serial, 'install', '-r', apk], { stdio: 'inherit' });
     sh('setprop debug.mindwtr.native.install_stop \'\'');
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     await waitFor('the Inbox', onInbox, 60_000);
@@ -479,17 +478,21 @@ try {
     check(allLogs().includes('Native Android install stop at=journal'), '(7) the sync\'s install died once its journal was on disk');
     const leftover = attachmentFiles().filter((name) => name.startsWith('.mindwtr-install-'));
     check(leftover.some((name) => name.endsWith('.journal')), `(7) the journal is on disk after the death (${leftover.join(', ')})`);
-    if (pid()) { sh(`am force-stop ${PKG}`); await waitFor('the app process to end', () => pid() === '', 10_000); }
+    if (pid()) await device.stopApp();
     await until('home screen', () => front().includes(`${home}/`) || otherAppFront(), 10_000, 500);
     if (!front().includes(`${home}/`)) sh('input keyevent KEYCODE_HOME');
     device.launch(ACTIVITY);
     await waitFor('the Inbox after the restart', onInbox, 60_000);
     const recovery = /Native Android install recovery (.+)/.exec(logs())?.[1] ?? '';
     check(/restored=1/.test(recovery), `(7) the boot's recovery rolled the install back (${recovery})`);
+    // The startup sync's pre-sync pass may already have installed the file again (it runs about a second after the
+    // recovery): what proves the rollback is no installer file left and a target that is absent or the whole file, never part.
     const afterBoot = attachmentFiles();
-    check(!afterBoot.some((name) => name.startsWith('.mindwtr-install-')) && !afterBoot.some((name) => name.startsWith(killedId)),
-        '(7) no installer file and no half file is left; the target was never written');
-    await syncNow('Sync now (the install again)');
+    const target = afterBoot.find((name) => name.startsWith(killedId));
+    const whole = Boolean(target) && phoneSha(`file:///data/user/0/${PKG}/files/attachments/${target}`) === sha256(extraBytes('install'));
+    check(!afterBoot.some((name) => name.startsWith('.mindwtr-install-')) && (!target || whole),
+        `(7) no installer file and no half file is left; the target is ${target ? 'the whole file (the startup sync installed it again)' : 'absent'}`);
+    if (!target) await syncNow('Sync now (the install again)');
     await until('the install to finish', () => attachmentFiles().some((name) => name.startsWith(killedId)), 120_000, 3_000);
     const installed = live(stored('projects', names.project)).find((a) => a.id === killedId);
     check(installed && phoneSha(installed.uri) === sha256(extraBytes('install')), '(7) the next sync installed the whole file (SHA-256)');
@@ -523,6 +526,18 @@ try {
     console.error(error instanceof Stopped ? `STOPPED: ${error.message}` : `FAIL: ${error.message}`);
     process.exitCode = error instanceof Stopped ? 3 : 1;
 } finally {
+    // A failed run leaves the phone's backend on a folder about to stop: set Sync Off, as step (9) does, so the next check's
+    // app does not keep syncing against it (check-encryption-device.mjs does the same).
+    if (process.exitCode === 1 && dav) {
+        try {
+            if (!front().includes(`${PKG}/`)) device.launch(ACTIVITY);
+            await openSync();
+            await tapTag('sync-backend-off', (current) => current.some((node) => node.text === en['settings.syncOff']), 'Sync off after a failure');
+            console.log('info - Sync set Off after the failure');
+        } catch (error) {
+            console.log(`warn - Sync could not be set Off after the failure: ${error.message}`);
+        }
+    }
     cleanup();
     await sleep(500);
     process.exit(process.exitCode ?? 0);

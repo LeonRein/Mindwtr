@@ -1192,7 +1192,7 @@ class SharedSyncRunMachine {
         if (!scope) return null;
         this.setStep('fast-check');
         await this.yieldToUi();
-        if (this.state.preSyncedLocalData) return null;
+        if (this.state.preSyncedLocalData || this.hooks.hasDeferredAttachmentWork?.()) return null;
         const localData = await this.readLocalDataForSyncCycle();
         this.ensureLocalSnapshotFresh();
         if (hasPendingSyncSideEffects(localData)) return null;
@@ -1331,7 +1331,9 @@ class SharedSyncRunMachine {
     private async trySkipUnchangedReadSync(): Promise<SyncRunResult | null> {
         this.setStep('read-check');
         await this.yieldToUi();
-        if (this.state.preSyncedLocalData) return null;
+        // A deferred pre-sync phase left attachment work (a download the last process never finished) to the post-merge
+        // pass, which this skip would drop too.
+        if (this.state.preSyncedLocalData || this.hooks.hasDeferredAttachmentWork?.()) return null;
         const localData = await this.readLocalDataForSyncCycle();
         this.ensureLocalSnapshotFresh();
         if (hasPendingSyncSideEffects(localData)) return null;

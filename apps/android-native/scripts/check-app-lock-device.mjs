@@ -128,8 +128,7 @@ let changes = 0;
  * old WAL and SHM (the copy holds their content), and renames it over the database, all while the app is stopped; then launches.
  */
 const setLock = async (on) => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     changes += 1;
     const original = pullDatabase(`original-${changes}`);
     const db = resolve(work, `set-${changes}`, DB);
