@@ -1214,6 +1214,17 @@ const attachmentDraftDependencies = {
 };
 
 globalThis.MindwtrHost = {
+    /** Private fixed transport receipt; no request data or domain authority. */
+    nativeHTTPDelivered(): void {
+        if (globalThis.__mindwtrHostPlatform !== 'ios' || !bootAdapter
+            || isSandboxMode() || isWorkspaceTransitionActive()) return;
+        try {
+            logInfo('Native iOS HTTP response delivered', {
+                scope: 'native-ios', force: true,
+                context: { releaseCheck: 'v1.3.5/ios-http-transport', operation: 'http-transport', outcome: 'delivered' },
+            });
+        } catch { /* A fixed diagnostic never changes the transport result. */ }
+    },
     /** Read-only upgrade preflight, before the native host opens SQLite. */
     legacyCheck(legacyState: string, legacyBackup: string): string {
         return submit(async () => {

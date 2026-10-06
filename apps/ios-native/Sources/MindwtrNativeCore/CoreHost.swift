@@ -57,7 +57,7 @@ public final class CoreHost: @unchecked Sendable {
     private let localAttachmentRequests = NativeAttachmentLocalRequests()
 
     public init(databaseURL: URL, bundleURL: URL) {
-        engine = Engine(queue: queue, databaseURL: databaseURL, bundleURL: bundleURL)
+        engine = Engine(queue: queue, databaseURL: databaseURL, bundleURL: bundleURL, localRequests: localAttachmentRequests)
     }
 
     #if DEBUG
@@ -66,7 +66,7 @@ public final class CoreHost: @unchecked Sendable {
     }
 
     init(databaseURL: URL, bundleURL: URL, faults: HostIOFaults, legacyStorage: LegacyRNStorage? = nil) {
-        engine = Engine(queue: queue, databaseURL: databaseURL, bundleURL: bundleURL, legacyStorage: legacyStorage)
+        engine = Engine(queue: queue, databaseURL: databaseURL, bundleURL: bundleURL, legacyStorage: legacyStorage, localRequests: localAttachmentRequests)
         engine.faults = faults
     }
     #endif
@@ -698,6 +698,11 @@ private final class Engine: @unchecked Sendable {
     private var context: JSContext?
     private var database: SQLiteBridge?
     private var attachmentJobs: NativeAttachmentFileJobs?
+    private let localRequests: NativeAttachmentLocalRequests
+    private var httpJobs: NativeHTTPJobs?
+    private enum IOBodySource { case file, http }
+    private var ioBodySource: IOBodySource?
+    private var preferHTTP = true
     private var attachmentGeneration: UInt64 = 0
     private struct ProviderCopyTurn {
         var receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt?
@@ -978,8 +983,9 @@ private final class Engine: @unchecked Sendable {
         return true
     }
 
-    init(queue: DispatchQueue, databaseURL: URL, bundleURL: URL, legacyStorage: LegacyRNStorage? = nil) {
+    init(queue: DispatchQueue, databaseURL: URL, bundleURL: URL, legacyStorage: LegacyRNStorage? = nil, localRequests: NativeAttachmentLocalRequests) {
         self.queue = queue
+        self.localRequests = localRequests
         self.databaseURL = databaseURL
         self.bundleURL = bundleURL
         diagnosticsFile = NativeDiagnosticsLogFile(libraryRoot: databaseURL.deletingLastPathComponent())
@@ -1053,6 +1059,20 @@ private final class Engine: @unchecked Sendable {
             // never prevents database recovery or leaks the exclusive lock.
             attachmentJobs = try? NativeAttachmentFileJobs(libraryRoot: databaseURL.deletingLastPathComponent())
             attachmentGeneration &+= 1
+            #if DEBUG
+            httpJobs = NativeHTTPJobs(registry: localRequests, faults: faults)
+            if let httpJobs { faults?.configureHTTPJobs?(httpJobs) }
+            #else
+            httpJobs = NativeHTTPJobs(registry: localRequests)
+            #endif
+            let httpGeneration = attachmentGeneration
+            httpJobs?.setWake { [weak self] in
+                guard let self else { return }
+                self.queue.async { [weak self] in
+                    guard let self, self.attachmentGeneration == httpGeneration else { return }
+                    self.scheduleAttachmentIdle(immediate: true)
+                }
+            }
             if let jobs = attachmentJobs {
                 #if DEBUG
                 attachmentHooks?.configureJobs?(jobs)
@@ -15769,6 +15789,7 @@ private final class Engine: @unchecked Sendable {
         defer {
             if cancelled {
                 attachmentJobs?.cancelAndDrain()
+                httpJobs?.cancelAndDrain()
                 _ = context.objectForKeyedSubscript("__pumpTimers")?.call(withArguments: [])
                 _ = context.objectForKeyedSubscript("__resumeHostCalls")?.call(withArguments: [])
                 context.exception = nil
@@ -15788,6 +15809,7 @@ private final class Engine: @unchecked Sendable {
                     // Completes uninterruptible RN installer work before allowing
                     // another operation or library owner to observe the namespace.
                     attachmentJobs?.cancelAndDrain()
+                    httpJobs?.cancelAndDrain()
                 }
             }
             if reply == nil || reply!.isNull || reply!.isUndefined {
@@ -15822,7 +15844,7 @@ private final class Engine: @unchecked Sendable {
 
     private func scheduleAttachmentIdle(immediate: Bool = false) {
         guard started, !closed, !invoking, !recoveryActivationPending, pending == nil,
-              attachmentJobs != nil, let context else { return }
+              attachmentJobs != nil || httpJobs != nil, let context else { return }
         let delay = immediate ? 0 : context.objectForKeyedSubscript("__nextTimerDelay")?.call(withArguments: [])?.toDouble() ?? -1
         guard delay.isFinite, delay >= 0 else { return }
         // One scheduled idle turn per generation; completions can move a timer
@@ -15863,6 +15885,64 @@ private final class Engine: @unchecked Sendable {
         try requireRetainedOrdinaryTurn(requirePreparation: true)
         try requireProjectFileAddTurn()
         return result
+    }
+
+    private func requireHTTPAdmission() throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, !recoveryActivationPending, pending == nil,
+              retainedOrdinaryTurn == nil, projectFileAddTurn == nil, lockFD >= 0 else {
+            throw HostFailure("HTTP bridge is unavailable")
+        }
+        try requireNoAttachmentDraft()
+    }
+
+    private func nextIO() throws -> String {
+        guard ioBodySource == nil else { throw HostFailure("I/O response body is unavailable") }
+        func file() -> String? {
+            guard let answer = attachmentJobs?.next(), !answer.isEmpty else { return nil }
+            if let input = try? NativeJSON.jsonObject(with: Data(answer.utf8)) as? [String: Any], input["body"] as? Bool == true {
+                ioBodySource = .file
+            }
+            preferHTTP = true
+            return answer
+        }
+        func http() throws -> String? {
+            guard let answer = try httpJobs?.next() else { return nil }
+            if answer.body { ioBodySource = .http }
+            preferHTTP = false
+            return answer.json
+        }
+        if preferHTTP { return try http() ?? file() ?? "" }
+        return try file() ?? http() ?? ""
+    }
+
+    private func ioBody() throws -> String {
+        guard let source = ioBodySource else { throw HostFailure("I/O response body is unavailable") }
+        ioBodySource = nil
+        switch source {
+        case .file:
+            guard let jobs = attachmentJobs else { throw HostFailure("I/O response body is unavailable") }
+            return jobs.body()
+        case .http:
+            guard let jobs = httpJobs else { throw HostFailure("I/O response body is unavailable") }
+            let result = try jobs.body()
+            if result.completed {
+                // Defer logging until after this JSC turn; never invoke or pump
+                // a host method recursively from a native ioBody callback.
+                let generation = attachmentGeneration
+                queue.async { [weak self] in
+                    guard let self, self.attachmentGeneration == generation, self.started, !self.closed,
+                          !self.invoking, let context = self.context else { return }
+                    _ = context.objectForKeyedSubscript("MindwtrHost")?.invokeMethod("nativeHTTPDelivered", withArguments: [])
+                    context.exception = nil
+                    self.scheduleAttachmentIdle(immediate: true)
+                    #if DEBUG
+                    self.faults?.commandDiagnostic?("httpDelivered")
+                    #endif
+                }
+            }
+            return result.base64
+        }
     }
 
     private func installBridge(_ context: JSContext) {
@@ -15981,6 +16061,27 @@ private final class Engine: @unchecked Sendable {
                               "nowMs": now as Any, "randomBytes": random as Any, "rnStateCommit": rnState as Any, "log": log as Any, "logFile": logFile as Any] {
             bridge.setObject(block, forKeyedSubscript: name as NSString)
         }
+        let netFetch: @convention(block) (JSValue) -> String = { [weak self] request in
+            guard let self, request.isString, let json = request.toString() else { return "!MindwtrNativeError:HTTP request is invalid" }
+            return self.guarded {
+                try self.requireHTTPAdmission()
+                guard let jobs = self.httpJobs else { throw HostFailure("HTTP bridge is unavailable") }
+                return try jobs.submit(json)
+            } ?? "!MindwtrNativeError:HTTP bridge is unavailable"
+        }
+        let netAbort: @convention(block) (JSValue) -> Void = { [weak self] request in
+            guard request.isString, let id = request.toString() else { return }
+            self?.httpJobs?.abort(id)
+        }
+        let next: @convention(block) () -> String = { [weak self] in
+            self?.guarded { try self?.nextIO() } ?? "!MindwtrNativeError:I/O bridge is unavailable"
+        }
+        let body: @convention(block) () -> String = { [weak self] in
+            self?.guarded { try self?.ioBody() } ?? "!MindwtrNativeError:I/O bridge is unavailable"
+        }
+        for (name, block) in ["netFetch": netFetch as Any, "netAbort": netAbort as Any, "ioNext": next as Any, "ioBody": body as Any] {
+            bridge.setObject(block, forKeyedSubscript: name as NSString)
+        }
         if let jobs = attachmentJobs {
             let fileCall: @convention(block) (JSValue) -> String = { [weak self] request in
                 guard let self, request.isString, let json = request.toString() else { return "!MindwtrNativeError:Attachment file request is invalid" }
@@ -15998,11 +16099,9 @@ private final class Engine: @unchecked Sendable {
                 guard let self, request.isString, let uri = request.toString() else { return "!MindwtrNativeError:Attachment file request is invalid" }
                 return self.guarded { try self.requireNoAttachmentDraft(); try jobs.deleteNow(uri); return nil }
             }
-            let next: @convention(block) () -> String = { jobs.next() }
-            let body: @convention(block) () -> String = { jobs.body() }
             for (name, block) in ["fileCall": fileCall as Any, "installerCall": installerCall as Any,
                                   "fileAbort": abort as Any, "fileDirectories": directories as Any,
-                                  "fileDeleteNow": delete as Any, "ioNext": next as Any, "ioBody": body as Any] {
+                                  "fileDeleteNow": delete as Any] {
                 bridge.setObject(block, forKeyedSubscript: name as NSString)
             }
         }
@@ -16032,6 +16131,8 @@ private final class Engine: @unchecked Sendable {
         attachmentGeneration &+= 1
         attachmentIdlePump?.cancel(); attachmentIdlePump = nil
         // No file/installer worker survives release of the library lock.
+        httpJobs?.shutdown(); httpJobs = nil
+        ioBodySource = nil
         attachmentJobs?.shutdown(); attachmentJobs = nil
         providerCopy = nil
         started = false

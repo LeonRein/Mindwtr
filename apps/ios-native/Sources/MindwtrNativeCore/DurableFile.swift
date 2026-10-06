@@ -68,5 +68,10 @@ final class HostIOFaults {
     var journalRemove: (() throws -> Void)?
     var editorDraftRemove: (() throws -> Void)?
     var commandDiagnostic: ((String) -> Void)?
+    var httpConfiguration: URLSessionConfiguration?
+    var httpLoopbackOrigin: URL?
+    var httpTimeout: TimeInterval?
+    var httpByteLimit: Int?
+    var configureHTTPJobs: ((NativeHTTPJobs) -> Void)?
 }
 #endif

@@ -3939,6 +3939,46 @@ const poll = async (state, id) => {
     await new Promise((resolveTick) => setImmediate(resolveTick));
     return JSON.parse(state.MindwtrHost.poll(id));
 };
+// HTTP transport alone enables no KV/sync/AI binding. Its private fixed
+// receipt uses the existing forced Diagnostics writer, without request input.
+{
+    const configureHTTP = (state) => {
+        state.httpCalls = 0;
+        state.__mindwtrNative.netFetch = () => { state.httpCalls++; throw new Error('Unexpected startup network'); };
+        state.__mindwtrNative.netAbort = () => {};
+        state.__mindwtrNative.ioNext = () => '';
+        state.__mindwtrNative.ioBody = () => '';
+    };
+    const local = makeState(0, [], 'ios', configureHTTP);
+    assert.deepEqual(Object.keys(local.contractBindings), []);
+    assert.equal(typeof local.__mindwtrNative.kvMultiGet, 'undefined');
+    local.MindwtrHost.nativeHTTPDelivered();
+    assert.equal(local.logText, null, 'No preboot transport receipt');
+    assert.equal((await poll(local, local.MindwtrHost.boot())).ok, true);
+    assert.equal(local.httpCalls, 0, 'Installing transport starts no request');
+    local.settings = { diagnostics: { loggingEnabled: false } };
+    local.MindwtrHost.nativeHTTPDelivered();
+    await poll(local, local.MindwtrHost.logShare()); // Existing append/share barrier.
+    const lines = local.logText.split('\n').filter((line) => line.includes('v1.3.5/ios-http-transport'));
+    assert.equal(lines.length, 1, 'Forced marker survives disabled logging');
+    assert.deepEqual(JSON.parse(lines[0]).context, {
+        releaseCheck: 'v1.3.5/ios-http-transport', operation: 'http-transport', outcome: 'delivered',
+    });
+    const before = local.logText;
+    for (const field of ['sandbox', 'workspaceTransition']) {
+        local[field] = true; local.MindwtrHost.nativeHTTPDelivered(); local[field] = false;
+    }
+    await new Promise((tick) => setImmediate(tick));
+    assert.equal(local.logText, before, 'Unsettled workspace emits no receipt');
+    for (const platform of ['android', undefined]) {
+        const other = makeState(0, [], platform, configureHTTP);
+        assert.equal((await poll(other, other.MindwtrHost.boot())).ok, true);
+        const prior = other.logText;
+        other.MindwtrHost.nativeHTTPDelivered(); await new Promise((tick) => setImmediate(tick));
+        assert.equal(other.logText, prior, 'Invalid platform emits no transport marker');
+        assert.equal(other.httpCalls, 0);
+    }
+}
 // Production host-entry selects independent local attachment policy only for
 // complete iOS file capabilities. No kvMultiGet, sync settings, AI or backend
 // constructor is supplied; readiness and diagnostic acknowledgments are real.
