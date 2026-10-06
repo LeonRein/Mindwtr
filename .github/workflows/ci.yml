@@ -185,6 +185,7 @@ jobs:
         run: |
           python3 scripts/ci/validate-fastlane-metadata.test.py
           python3 scripts/ci/validate-watch-bundle.test.py
+          python3 scripts/ci/validate-macos-private-apis.test.py
           FASTLANE_METADATA_DIR=/tmp/mindwtr-fastlane-metadata scripts/ci/prepare-fastlane-metadata.sh
 
       - name: iOS App Intents availability check

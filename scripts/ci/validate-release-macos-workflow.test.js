@@ -103,6 +103,18 @@ const loadAppStoreSteps = () => {
   return workflow.jobs["macos-appstore"].steps;
 };
 
+test("App Store: all bundled Mach-O imports are checked immediately before packaging", () => {
+  const steps = loadAppStoreSteps();
+  const installer = steps.find((step) => step.name === "Build signed installer package");
+  const run = withoutShellComments(installer.run);
+  expect(run).toContain('python3 scripts/ci/validate-macos-private-apis.py "$APP_PATH"\n\nxcrun productbuild');
+  expect(run).toContain('--component "$APP_PATH" /Applications');
+  expect(run).toContain('set -euo pipefail');
+  expect(readFileSync(".github/workflows/ci.yml", "utf8")).toContain(
+    "python3 scripts/ci/validate-macos-private-apis.test.py",
+  );
+});
+
 test("App Store: the widget embed step sits between the app build and the installer, gated on the widget profile", () => {
   const steps = loadAppStoreSteps();
   const buildIndex = steps.findIndex(

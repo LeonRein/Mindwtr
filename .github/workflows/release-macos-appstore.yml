@@ -652,6 +652,8 @@ jobs:
             exit 1
           fi
 
+          python3 scripts/ci/validate-macos-private-apis.py "$APP_PATH"
+
           xcrun productbuild \
             --keychain "$KEYCHAIN_PATH" \
             --component "$APP_PATH" /Applications \
