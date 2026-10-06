@@ -1,5 +1,5 @@
 import React from 'react';
-import { Alert, Modal } from 'react-native';
+import { Alert, Modal, Platform } from 'react-native';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import renderer, { act } from 'react-test-renderer';
 
@@ -10,6 +10,9 @@ import {
   type Section,
   type Task,
 } from '@mindwtr/core';
+
+import { AdaptiveWindowContextProvider } from './adaptive-window-context';
+import { resolveAdaptiveWindow } from '../lib/adaptive-window';
 
 import { restoreRecoveredTaskEditInput, TaskEditModal } from './task-edit-modal';
 import { TaskEditCustomRecurrenceModal } from './task-edit/TaskEditCustomRecurrenceModal';
@@ -220,6 +223,59 @@ describe('TaskEditModal', () => {
         focusedCount: taskEditStore.current!.tasks.filter((task: Task) => task.isFocusedToday && !isTaskFutureFocusCandidate(task)).length,
         sequentialProjectIds: new Set<string>(), sequentialWithinSectionProjectIds: new Set<string>(),
       });
+    }
+  });
+
+  it.each([
+    { platform: 'android', tab: 'view', readOnly: false, width: 390, folded: false, edges: ['top', 'bottom'] },
+    { platform: 'android', tab: 'task', readOnly: false, width: 390, folded: false, edges: ['top', 'bottom'] },
+    { platform: 'android', tab: 'view', readOnly: true, width: 390, folded: false, edges: ['top', 'bottom'] },
+    { platform: 'ios', tab: 'view', readOnly: false, width: 390, folded: false, edges: ['top'] },
+    { platform: 'web', tab: 'view', readOnly: false, width: 390, folded: false, edges: ['top'] },
+    { platform: 'android', tab: 'view', readOnly: false, width: 1000, folded: false, edges: [] },
+    { platform: 'android', tab: 'view', readOnly: false, width: 390, folded: true, edges: [] },
+  ] as const)('reserves system safe areas for $platform $tab (readOnly=$readOnly, width=$width, folded=$folded)', async ({
+    platform, tab, readOnly, width, folded, edges,
+  }) => {
+    const originalPlatform = Platform.OS;
+    Object.defineProperty(Platform, 'OS', { configurable: true, value: platform });
+    const adaptiveWindow = resolveAdaptiveWindow({
+      width, height: 844, platform: platform === 'android' ? 'android' : 'other',
+      insets: { top: 24, bottom: 48 },
+      nativeSnapshot: folded ? {
+        width, height: 844,
+        features: [{
+          bounds: { left: 0, top: 410, right: width, bottom: 430 },
+          orientation: 'horizontal', state: 'half-opened', isSeparating: true, occlusionType: 'full',
+        }],
+      } : null,
+    });
+    let tree: renderer.ReactTestRenderer | undefined;
+    try {
+      await act(async () => {
+        tree = renderer.create(
+          <AdaptiveWindowContextProvider value={adaptiveWindow}>
+            <TaskEditModal
+              visible defaultTab={tab} readOnly={readOnly}
+              task={{
+                id: 'safe-area-task', title: 'Long task', status: 'next', tags: [], contexts: [],
+                description: 'Last preview field',
+                createdAt: '2026-10-05T00:00:00.000Z', updatedAt: '2026-10-05T00:00:00.000Z',
+              }}
+              onClose={vi.fn()} onSave={vi.fn()}
+            />
+          </AdaptiveWindowContextProvider>,
+        );
+      });
+      const surface = tree!.root.find((node) => node.type === ('View' as any) && node.props.testID === 'task-edit-adaptive-surface');
+      expect(surface.findByType('SafeAreaView' as any).props.edges).toEqual(edges);
+      if (adaptiveWindow.isExpanded || adaptiveWindow.activeFeature) {
+        expect(surface.props.style.at(-1).height).toBe(adaptiveWindow.foregroundFrame.height);
+        expect(adaptiveWindow.foregroundFrame.y + adaptiveWindow.foregroundFrame.height).toBeLessThanOrEqual(844 - 48);
+      }
+    } finally {
+      await act(async () => tree?.unmount());
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: originalPlatform });
     }
   });
 

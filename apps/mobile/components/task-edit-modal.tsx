@@ -1140,7 +1140,7 @@ function TaskEditModalInner({
                 >
                 <SafeAreaView
                     style={[styles.container, { backgroundColor: tc.bg }]}
-                    edges={constrainEditorSurface ? [] : ['top']}
+                    edges={constrainEditorSurface ? [] : (Platform.OS === 'android' ? ['top', 'bottom'] : ['top'])}
                 >
                     <SandboxWorkspaceCue />
                     <TaskEditHeader
