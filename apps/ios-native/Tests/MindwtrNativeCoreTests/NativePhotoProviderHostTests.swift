@@ -238,6 +238,122 @@ final class NativePhotoProviderHostTests: XCTestCase {
         let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
         XCTAssertTrue(log.contains("v1.3.5/ios-task-photo-add")); XCTAssertFalse(log.contains("Private.photo"))
     }
+    func testProcessedPhotoInterruptedCompleteSaveRecoversColdExactlyOnceWithoutProvider() async throws {
+        let bootstrap = try core(); _ = try await bootstrap.start(); await bootstrap.close()
+        _ = try sql("INSERT INTO tasks(id,title,status,contexts,tags,attachments,checklist,createdAt,updatedAt,rev,revBy) VALUES ('unrelated-photo-save','Untouched','inbox','[]','[]',NULL,NULL,?,?,1,'fixture')", [at, at])
+        let (host, opening) = try await seed(), initial = try latest(), savedTitle = "Photo recovery / 文"
+        var payload = try object(initial.payloadJSON), raw = try XCTUnwrap(payload["raw"] as? [String: Any])
+        let draft = try XCTUnwrap(opening["draft"] as? [String: Any])
+        payload["touchedBase"] = ["title": try XCTUnwrap(draft["title"])]; payload["edited"] = ["title": savedTitle]
+        raw["title"] = savedTitle; payload["raw"] = raw
+        try await host.checkpointEditorDraft(.init(sessionID: initial.sessionID, taskID: taskID,
+            generation: initial.generation + 1, payloadJSON: json(payload)))
+        let before = try rows(), unrelated = try json(NativeJSON.jsonObject(with:
+            Data(sql("SELECT * FROM tasks WHERE id='unrelated-photo-save'").utf8)))
+        let bytes = try imageBytes(), selected = try source(bytes), item = Provider(), addID = UUID().uuidString.lowercased()
+        item.synchronousURL = selected; item.suggestedName = "Private.photo.png"
+        _ = try await add(host, item: item, id: addID)
+        let added = try lastAdd(), snapshot = try latest(), target = try XCTUnwrap(URL(string: added.targetURI))
+        let processed = try XCTUnwrap(UIImage(data: bytes)?.pngData()), targetIdentity = try inode(target)
+        XCTAssertEqual(item.loads, 1); XCTAssertEqual(added.requestId, addID); XCTAssertEqual(added.phase, .checkpointed)
+        XCTAssertEqual(try Data(contentsOf: target), processed); XCTAssertEqual(added.source.size, Int64(processed.count))
+        XCTAssertEqual(try rows(), before); XCTAssertEqual(try Data(contentsOf: selected), bytes)
+        let afterPayload = try object(snapshot.payloadJSON), attachments = try XCTUnwrap(afterPayload["attachments"] as? [[String: Any]])
+        XCTAssertEqual(attachments.count, 1); XCTAssertEqual(attachments[0]["id"] as? String, addID)
+        let requestID = UUID().uuidString.lowercased()
+        let saveJSON = try json(["id": taskID, "requestId": requestID, "base": try XCTUnwrap(afterPayload["touchedBase"]),
+            "patch": try XCTUnwrap(afterPayload["edited"]), "scheduleBase": try XCTUnwrap(opening["scheduleBase"]),
+            "checklist": ["base": [], "value": []], "attachments": ["base": [], "value": attachments]] as [String: Any])
+        let ownerBytes = try Data(contentsOf: store.url), ownerIdentity = try inode(store.url)
+        let hooks = AttachmentDraftHostHooks(); var terminalHits = 0
+        hooks.boundary = { if $0 == .afterSaveTerminal { terminalHits += 1; throw HostFailure("Controlled photo Save terminal") } }
+        await host.configureAttachmentDraftHost(hooks)
+        var known: CoreHostAttachmentCleanupPending?
+        do {
+            _ = try await host.saveAttachmentDraftComplete(saveRequestJSON: saveJSON,
+                expectedSession: snapshot.sessionID, expectedGeneration: snapshot.generation)
+            XCTFail("Expected saved photo with retained cleanup")
+        } catch let pending as CoreHostAttachmentCleanupPending { known = pending }
+        XCTAssertEqual(terminalHits, 1)
+        let acknowledged = try object(XCTUnwrap(known).resultJSON), journal = database.appendingPathExtension("pending.json")
+        let command = try object(String(decoding: Data(contentsOf: journal), as: UTF8.self))
+        XCTAssertEqual(command["method"] as? String, "attachmentFileEditSaveCommit")
+        let argumentsJSON = try XCTUnwrap(command["argumentsJSON"] as? String)
+        let arguments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(argumentsJSON.utf8)) as? [String])
+        XCTAssertEqual(arguments.count, 1)
+        let wrapper = try object(XCTUnwrap(arguments.first)), envelope = try XCTUnwrap(wrapper["envelope"] as? [String: Any])
+        XCTAssertEqual(wrapper["version"] as? Int, 3)
+        let frozenRequest = try XCTUnwrap(envelope["request"] as? [String: Any])
+        XCTAssertEqual(try json(XCTUnwrap(frozenRequest["saveRequest"])), saveJSON)
+        let lineage = try XCTUnwrap(frozenRequest["ownedDraft"] as? [String: Any])
+        let operations = try XCTUnwrap(lineage["priorOperations"] as? [[String: Any]])
+        XCTAssertEqual(operations.count, 1); XCTAssertEqual(operations[0]["kind"] as? String, "add")
+        XCTAssertEqual((operations[0]["operation"] as? [String: Any])?["requestId"] as? String, addID)
+        let terminal = try XCTUnwrap(command["terminal"] as? [String: Any])
+        let state = try object(XCTUnwrap((terminal["success"] as? [String: Any])?["_0"] as? String))
+        XCTAssertEqual(state["phase"] as? String, "domainSaved")
+        XCTAssertEqual(try json(object(XCTUnwrap(state["resultJSON"] as? String))), try json(acknowledged))
+        XCTAssertEqual(try editor.read()?.snapshot, snapshot)
+        XCTAssertEqual(try editor.read()?.attempt?.argumentsJSON, try json([saveJSON]))
+        XCTAssertEqual(try lastAdd(), added); XCTAssertEqual(try Data(contentsOf: store.url), ownerBytes)
+        XCTAssertEqual(try inode(store.url), ownerIdentity); XCTAssertEqual(try inode(target), targetIdentity)
+        let frozenEditor = try Data(contentsOf: editor.url), editorIdentity = try inode(editor.url), savedRows = try rows()
+        XCTAssertNotEqual(savedRows, before)
+        let prepared = try XCTUnwrap(envelope["prepared"] as? [String: Any])
+        let decision = try XCTUnwrap(prepared["decision"] as? [String: Any]); XCTAssertEqual(decision["kind"] as? String, "changed")
+        let effect = try XCTUnwrap((decision["prepared"] as? [String: Any])?["effect"] as? [String: Any])
+        let effects = try XCTUnwrap(effect["tasks"] as? [[String: Any]]); XCTAssertEqual(effects.count, 1)
+        let after = try XCTUnwrap(effects[0]["after"] as? [String: Any])
+        XCTAssertEqual(after["id"] as? String, taskID); XCTAssertEqual(after["title"] as? String, savedTitle)
+        XCTAssertEqual(try json(XCTUnwrap(after["attachments"])), try json(attachments))
+        let saved = try XCTUnwrap((NativeJSON.jsonObject(with: Data(sql("SELECT * FROM tasks WHERE id=?", [taskID]).utf8)) as? [[String: Any]])?.first)
+        XCTAssertEqual(saved["title"] as? String, savedTitle); XCTAssertEqual(saved["rev"] as? Int, 2)
+        XCTAssertEqual(saved["rev"] as? Int, after["rev"] as? Int)
+        XCTAssertEqual(try json(NativeJSON.jsonObject(with: Data(XCTUnwrap(saved["attachments"] as? String).utf8))), try json(attachments))
+        XCTAssertEqual(try json(NativeJSON.jsonObject(with:
+            Data(sql("SELECT * FROM tasks WHERE id='unrelated-photo-save'").utf8))), unrelated)
+        XCTAssertEqual(acknowledged["id"] as? String, taskID)
+        XCTAssertEqual((acknowledged["draft"] as? [String: Any])?["title"] as? String, savedTitle)
+        try FileManager.default.removeItem(at: selected); await host.close()
+        let originalBundle = try XCTUnwrap(ProcessInfo.processInfo.environment["MINDWTR_CORE_BUNDLE"])
+        let probe = root.appendingPathComponent("photo-save-recovery-core-host.js")
+        try (String(contentsOfFile: originalBundle, encoding: .utf8)
+            + "\n;(()=>{for(const name of ['attachmentFileEditSavePrepare','attachmentDraftPrepareV3']){if(typeof MindwtrHost[name]!=='function')throw Error('Missing recovery fixture method');MindwtrHost[name]=function(){throw Error('Terminal photo recovery must not prepare');};}})();\n")
+            .write(to: probe, atomically: true, encoding: .utf8)
+        let faults = HostIOFaults(); var taskWrites = 0
+        faults.beforeSQL = { statement in
+            if ["INSERT INTO tasks", "UPDATE tasks", "DELETE FROM tasks"].contains(where: { statement.hasPrefix($0) }) {
+                taskWrites += 1; throw HostFailure("Terminal photo recovery must not write tasks")
+            }
+        }
+        let cold = CoreHost(databaseURL: database, bundleURL: probe, faults: faults)
+        addTeardownBlock { await cold.close() }
+        let recoveryHooks = AttachmentDraftHostHooks(); var detachHits = 0
+        recoveryHooks.boundary = { if $0 == .beforeSaveEditorDetach {
+            detachHits += 1
+            XCTAssertEqual(try self.lastAdd(), added)
+            XCTAssertEqual(try Data(contentsOf: self.store.url), ownerBytes); XCTAssertEqual(try self.inode(self.store.url), ownerIdentity)
+            XCTAssertEqual(try Data(contentsOf: self.editor.url), frozenEditor); XCTAssertEqual(try self.inode(self.editor.url), editorIdentity)
+            let actual = try self.object(String(decoding: Data(contentsOf: journal), as: UTF8.self))
+            XCTAssertEqual(actual["argumentsJSON"] as? String, argumentsJSON)
+        } }
+        await cold.configureAttachmentDraftHost(recoveryHooks)
+        let startup = try object(await cold.start()), recovery = try XCTUnwrap(startup["recovery"] as? [String: Any])
+        XCTAssertEqual(detachHits, 1); XCTAssertEqual(Set(recovery.keys), Set(["method", "result"]))
+        XCTAssertEqual(recovery["method"] as? String, "attachmentFileEditSaveCommit")
+        XCTAssertEqual(try json(XCTUnwrap(recovery["result"])), try json(acknowledged))
+        XCTAssertEqual(taskWrites, 0); XCTAssertEqual(item.loads, 1); XCTAssertEqual(try rows(), savedRows)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: selected.path)); XCTAssertEqual(try Data(contentsOf: target), processed)
+        XCTAssertEqual(try inode(target), targetIdentity); XCTAssertTrue(try entries().isEmpty)
+        XCTAssertNil(try editor.read()); XCTAssertNil(try store.readMixed()); XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        let plan = try object(await cold.prepareTaskFileOpen(requestJSON: json([
+            "owner": ["kind": "task", "taskId": taskID, "attachments": attachments], "attachmentId": addID])))
+        XCTAssertEqual(plan["status"] as? String, "available"); XCTAssertEqual((plan["open"] as? [String: Any])?["kind"] as? String, "image")
+        XCTAssertEqual(try rows(), savedRows); XCTAssertEqual(try Data(contentsOf: target), processed)
+        await cold.close(); let clean = try core(); let ordinary = try object(await clean.start())
+        XCTAssertNil(ordinary["recovery"]); XCTAssertEqual(try rows(), savedRows); XCTAssertEqual(item.loads, 1)
+        XCTAssertNil(try editor.read()); XCTAssertNil(try store.readMixed()); XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+    }
     func testWaitingPhotoBlocksConflictingOwnersAndCancelPreservesProtectedEditor() async throws {
         let (host, opening) = try await seed(), snapshot = try latest(), rowsBefore = try rows(), selected = try source(imageBytes())
         let controlled = Provider(), requested = expectation(description: "photo is awaiting selection bytes")
