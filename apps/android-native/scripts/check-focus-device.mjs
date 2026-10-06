@@ -237,22 +237,15 @@ const expectSection = async (title, section, label) => {
 
 /** Opens the editor from the Inbox, scrolling and loading more until the row appears. */
 const openFromInbox = async (title) => {
-    let nodes = await inbox();
-    for (let page = 0; page < 20; page += 1) {
-        nodes = await device.reveal(title, 20);
-        // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
-        const row = inList(nodes, title);
-        if (row) {
-            await tap(row);
-            // The Inbox list opens the Form tab (RN's defaultEditTab="task").
-            return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
-        }
-        const more = button(nodes, 'More');
-        if (!more) break;
-        await tap(more);
-        await sleep(1500);
-    }
-    return fail(`row ${title} is not in the Inbox`);
+    await inbox();
+    // The Inbox grows with every run and pages by 50: reveal scrolls to the end, loading more as it goes (one pass; a
+    // fresh pass per page went back to the top and never got past its first 20 swipes).
+    const nodes = await device.reveal(title, 400);
+    // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
+    const row = inList(nodes, title) ?? fail(`row ${title} is not in the Inbox`);
+    await tap(row);
+    // The Inbox list opens the Form tab (RN's defaultEditTab="task").
+    return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
 };
 /** RN opens a task from Focus on its View tab (resolveTaskOpenTab); the Edit tab then shows the Form this check edits. */
 const openFromFocus = async (title) => {
