@@ -57,9 +57,10 @@ function collectCodeSlugs({ file, source }) {
     }
   }
   // Native Android diagnostics likewise put the field in the first string of
-  // an android.util.Log info/warn call; unused string constants do not count.
+  // an android.util.Log info/warn call, or of CoreHost.logLine (core's log, so
+  // Settings > Diagnostics); unused string constants do not count.
   if (file.endsWith(".kt")) {
-    for (const message of source.matchAll(/\bLog\.(?:i|w)\([^,()]+,\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
+    for (const message of source.matchAll(/(?:\bLog\.(?:i|w)\([^,()]+,|\.logLine\()\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
       for (const match of message[1].matchAll(/\breleaseCheck=([\w./-]+)/g)) {
         sites.push({ file, slug: match[1] });
       }
@@ -167,9 +168,11 @@ describe("release diagnostics ledger", () => {
       Log.i(TAG, "Host reused releaseCheck=v1.3.0/android-reuse " +
           "reason=\$reason")
       Log.w(CoreHost.TAG, "Guard blocked releaseCheck=v1.3.0/android-guard outcome=blocked")
+      runtime.logLine("Held publication releaseCheck=v1.3.0/android-log-line", JSONObject())
     ` })).toEqual([
       { file, slug: "v1.3.0/android-reuse" },
       { file, slug: "v1.3.0/android-guard" },
+      { file, slug: "v1.3.0/android-log-line" },
     ]);
   });
 

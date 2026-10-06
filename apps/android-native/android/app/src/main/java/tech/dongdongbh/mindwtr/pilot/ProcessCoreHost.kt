@@ -313,8 +313,8 @@ internal object ProcessCoreHost {
      */
     private fun publishHeldWidgets(runtime: CoreHost, trigger: String) {
         widgetThread.execute {
-            runtime.logLine("Native Android held widget publication",
-                JSONObject().put("releaseCheck", "v1.3.5/widget-publication-after-content").put("trigger", trigger))
+            runtime.logLine("Native Android held widget publication releaseCheck=v1.3.5/widget-publication-after-content",
+                JSONObject().put("trigger", trigger))
         }
         refreshWidgets(runtime)
     }
