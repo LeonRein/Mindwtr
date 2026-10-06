@@ -975,6 +975,39 @@ describe('notification-service-local', () => {
     );
   });
 
+  it('schedules a task added while the startup cycle is still arming alarms', async () => {
+    mockStoreState.tasks = [
+      { id: 'existing', title: 'Existing', description: '', dueDate: new Date(Date.now() + 5 * 60 * 1000).toISOString() },
+    ];
+    const firstArm = deferred<{ id: number }>();
+    mockAlarmScheduleAlarm.mockReturnValueOnce(firstArm.promise);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const start = startLocalMobileNotifications();
+      for (let turn = 0; turn < 200 && mockAlarmScheduleAlarm.mock.calls.length === 0; turn += 1) await Promise.resolve();
+      expect(mockAlarmScheduleAlarm).toHaveBeenCalledTimes(1);
+
+      // A capture-queue import lands while the cycle waits on the native module: the store tells whoever is subscribed now.
+      const prevState = { ...mockStoreState };
+      mockStoreState.tasks = [
+        ...mockStoreState.tasks,
+        { id: 'captured', title: 'Captured', description: '', dueDate: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString() },
+      ];
+      for (const [listener] of mockStoreSubscribe.mock.calls as unknown as Array<[(state: unknown, prev: unknown) => void]>) {
+        listener({ ...mockStoreState }, prevState);
+      }
+      firstArm.resolve({ id: 5 });
+      await start;
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(mockAlarmScheduleAlarm).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ taskId: 'captured' }) })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not schedule the same reminder twice when reschedule requests overlap', async () => {
     await startLocalMobileNotifications();
     const listener = (mockStoreSubscribe.mock.calls as unknown[][])[0]?.[0] as (state: unknown, prevState: unknown) => void;

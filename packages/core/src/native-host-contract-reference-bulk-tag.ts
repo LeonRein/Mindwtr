@@ -14,6 +14,7 @@ import { getStorageAdapter, useTaskStore } from './store';
 import { projectFocusDateValues, type FocusDateProjection } from './task-utils';
 import { buildBulkTaskTokenUpdates } from './bulk-task-tokens';
 import { logInfo } from './logger';
+import { referenceBatchModules } from './store-reference-batch-modules';
 import { detachReferenceBatchJson, detachReferenceBatchValue, readReferenceBatchSelectionRequest,
     rawReferenceBatchScope, loadedReferenceBatchProject, referenceBatchSettingsReadable,
     requiredReferenceBatchDates, referenceBatchSourcesMatch, validReferenceBatchTask,
@@ -263,3 +264,12 @@ export function createReferenceTasksAddTagMethods(deps: {
     };
 }
 
+// The store's Reference addTag action reads these here: it cannot import this module (store-reference-batch-modules.ts).
+referenceBatchModules.shared = { historyRowLoadProjection, NativeReceiptSqliteAdapter };
+referenceBatchModules.addTag = (input) => {
+    const prepared = input as NativeReferenceTasksAddTagPrepared;
+    return {
+        validateEnvelope: () => Boolean(readReferenceTasksAddTagEnvelope({ request: prepared.request, prepared })),
+        authorityMatches: (data) => referenceTasksAddTagAuthorityMatches(prepared, data),
+    };
+};

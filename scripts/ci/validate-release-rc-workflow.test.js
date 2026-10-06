@@ -23,6 +23,31 @@ test('macOS release reuses a version withdrawn by the developer', () => {
   expect(route.run).toContain('Reusing the existing version record for upload.');
 });
 
+test('macOS recovery uploads rejected builds without bypassing locked versions', () => {
+  const route = readMacosRelease().jobs['macos-appstore'].steps.find(
+    (step) => step.name === 'Resolve App Store review submission flag',
+  );
+  const stateGate = route.run.match(/case "\$\{TARGET_VERSION_STATE:-\}" in[\s\S]*?esac/)[0];
+  for (const state of ['PREPARE_FOR_SUBMISSION', 'DEVELOPER_REJECTED', 'REJECTED', 'IN_REVIEW', 'READY_FOR_SALE', 'UNKNOWN']) {
+    const dir = mkdtempSync(join(tmpdir(), 'macos-review-state-'));
+    const envPath = join(dir, 'env');
+    let output;
+    try {
+      execFileSync('bash', ['-c', stateGate], {
+        encoding: 'utf8',
+        env: { ...process.env, TARGET_VERSION_STATE: state, APP_VERSION: '1.3.4', GITHUB_ENV: envPath },
+      });
+      output = readFileSync(envPath, 'utf8');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const editable = ['PREPARE_FOR_SUBMISSION', 'DEVELOPER_REJECTED', 'REJECTED'].includes(state);
+    expect(output.includes('SKIP_APP_VERSION_UPDATE_FOR_UPLOAD=true')).toBe(editable);
+    expect(output.includes('SKIP_APPSTORE_UPLOAD=true')).toBe(!editable);
+    expect(output.includes('EFFECTIVE_SUBMIT_FOR_REVIEW=false')).toBe(!editable);
+  }
+});
+
 test('Watch release routing embeds Watch in stable and RC archives', () => {
   const stable = parse(readFileSync('.github/workflows/release.yml', 'utf8'));
   const rc = parse(readFileSync('.github/workflows/release-rc.yml', 'utf8'));

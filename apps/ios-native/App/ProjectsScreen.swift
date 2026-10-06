@@ -18,6 +18,10 @@ struct ProjectsScreen: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 0) {
+                if model.projectFileAddRecoveryVisible {
+                    ProjectFileAddRecoveryPanel(model: model, palette: palette)
+                        .padding(16)
+                }
                 controls
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if ["active", "deferred", "archived"].allSatisfy({ model.projects.objects($0).isEmpty }) {
@@ -776,6 +780,43 @@ private struct AreaManagerSheet: View {
     }
 }
 
+struct ProjectFileAddRecoveryPanel: View {
+    @ObservedObject var model: CoreModel
+    let palette: AppPalette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Pending file attachment").rnFont(16, .semibold)
+                .foregroundStyle(palette.text).accessibilityAddTraits(.isHeader)
+            Text(model.projectFileAddError ?? "An attachment operation needs attention.")
+                .rnFont(14).foregroundStyle(palette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Stopping ends the pending attachment operation. It does not undo an attachment that was already saved.")
+                .rnFont(13).foregroundStyle(palette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.busy { ProgressView().frame(minHeight: 44) }
+            HStack(spacing: 12) {
+                Button { Task { await model.retryProjectFileAdd() } } label: {
+                    Text(model.label("common.retry").isEmpty ? "Retry" : model.label("common.retry"))
+                        .rnFont(14, .semibold).frame(maxWidth: .infinity, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(palette.tint).accessibilityIdentifier("project-file-add-retry")
+                Button { Task { await model.stopProjectFileAdd() } } label: {
+                    Text("Stop attachment operation").rnFont(14, .semibold)
+                        .frame(maxWidth: .infinity, minHeight: 44).contentShape(Rectangle())
+                }
+                .foregroundStyle(palette.danger).accessibilityIdentifier("project-file-add-stop")
+            }
+            .buttonStyle(.plain).disabled(!model.projectFileAddRecoveryEnabled)
+        }
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(palette.filter, in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("project-file-add-recovery")
+    }
+}
+
 struct ProjectDetailScreen: View {
     @ObservedObject var model: CoreModel
     let palette: AppPalette
@@ -794,17 +835,23 @@ struct ProjectDetailScreen: View {
     @State private var cancelProjectConfirmedID = ""
     @State private var cancelProjectConfirmedRevision = ""
     @State private var projectDateDraft = Date()
+    @State private var filePickerID: UUID?
 
     var body: some View {
         let fileOpenID = model.projectFileOpenPresentation?.id
         VStack(spacing: 0) {
+            if model.projectFileAddRecoveryVisible {
+                ProjectFileAddRecoveryPanel(model: model, palette: palette)
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+            }
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
                     Button { resignProjectNotesInput(); Task { await model.closeProject() } } label: {
                         AppIcon(name: "chevron", size: 24).rotationEffect(.degrees(90)).foregroundStyle(palette.tint)
                             .frame(width: 44, height: 44).contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain).disabled(model.busy || model.retryNeeded || model.projectRenameEditing || model.projectAttachmentOpening)
+                    .buttonStyle(.plain).disabled(model.busy || model.retryNeeded || model.projectRenameEditing
+                        || model.projectAttachmentOpening || model.projectFileAddOpening || model.projectFileImporterPresented)
                     .accessibilityLabel(model.label("common.back")).accessibilityIdentifier("project-back")
                     if model.projectRenameEditing {
                         TextField(model.label("taskEdit.titleLabel"), text: Binding(
@@ -1226,6 +1273,21 @@ struct ProjectDetailScreen: View {
             Text(model.projectAttachmentOpenError ?? "")
                 .accessibilityIdentifier("project-attachment-open-error")
         }
+        .sheet(item: Binding(
+            get: {
+                guard let filePickerID, filePickerID == model.projectFileImporterID,
+                      model.projectFileImporterPresented else { return nil }
+                return NativeDocumentPickerClaim(id: filePickerID)
+            },
+            set: { (claim: NativeDocumentPickerClaim?) in
+                if claim == nil { model.setProjectFileImporterPresented(false, pickerID: filePickerID) }
+            })) { claim in
+                NativeDocumentPicker(pickerID: claim.id) { result, capturedID in
+                    Task { await model.completeProjectFileImport(result, pickerID: capturedID) }
+                }
+                .id(claim.id)
+                .interactiveDismissDisabled()
+            }
         .sheet(item: Binding(
             get: { model.projectFileOpenPresentation },
             set: { presentation in
@@ -1886,6 +1948,32 @@ struct ProjectDetailScreen: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(model.label("attachments.title")).rnFont(15, .semibold)
                 .foregroundStyle(palette.text).accessibilityAddTraits(.isHeader)
+            Button {
+                resignProjectNotesInput()
+                Task {
+                    if let id = await model.prepareProjectFileImport(), model.projectFileImporterID == id {
+                        filePickerID = id
+                    }
+                }
+            } label: {
+                Label(model.label("attachments.addFile"), systemImage: "doc.badge.plus")
+                    .rnFont(14, .semibold).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(palette.tint)
+            .disabled(!model.projectFileAddOpenEnabled)
+            .accessibilityIdentifier("project-attachment-add-file")
+            if let message = model.projectFileAddError, !model.projectFileAddPending {
+                Text(message).rnFont(13).foregroundStyle(palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("project-attachment-add-error")
+                Button { Task { await model.retryProjectFileAddRead() } } label: {
+                    Text(model.label("common.retry")).rnFont(14, .semibold)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).disabled(model.busy || model.retryNeeded)
+                .accessibilityIdentifier("project-attachment-add-read-retry")
+            }
             Button {
                 model.openProjectAttachmentLinkSheet()
                 resignProjectNotesInput()

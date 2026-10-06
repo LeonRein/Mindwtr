@@ -32,7 +32,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -112,23 +112,15 @@ const tapDescribed = async (description, expected, what = description) => {
 const datePicker = (nodes) => Boolean(button(nodes, 'OK')) && nodes.some((node) => /\bToday\b/.test(`${node.text} ${node['content-desc']}`));
 
 const openEditor = async (title) => {
-    let nodes = await inbox();
-    // The Inbox grows with every run and pages by 50, so scroll and load more until the row appears.
-    for (let page = 0; page < 20; page += 1) {
-        nodes = await reveal(title, 20);
-        // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
-        const row = inList(nodes, title);
-        if (row) {
-            await tap(row);
-            // The Inbox list opens the Form tab (RN's defaultEditTab="task", resolveTaskOpenTab).
-            return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
-        }
-        const more = button(nodes, 'More');
-        if (!more) break;
-        await tap(more);
-        await sleep(1500);
-    }
-    return fail(`row ${title} is not in the Inbox`);
+    await inbox();
+    // The Inbox grows with every run and pages by 50: reveal scrolls to the end, loading more as it goes (one pass; a
+    // fresh pass per page went back to the top and never got past its first 20 swipes).
+    const nodes = await reveal(title, 400);
+    // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
+    const row = inList(nodes, title) ?? fail(`row ${title} is not in the Inbox`);
+    await tap(row);
+    // The Inbox list opens the Form tab (RN's defaultEditTab="task", resolveTaskOpenTab).
+    return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
 };
 /** RN's status chips: "Status: <status>", selected when chosen. */
 const chooseStatus = async (value) => {

@@ -69,8 +69,9 @@ if (command === 'fixture') {
     adb('install', '-r', seedApk);
     sh(`am force-stop ${pkg}`);
     const runAs = (c) => sh(`run-as ${pkg} ${c}`);
-    // The whole app state goes: database, its recovery checkpoint, the journal, device writes and screen state.
-    runAs('rm -rf files no_backup shared_prefs cache');
+    // The whole app state goes: database, its recovery checkpoint, the journal, device writes and screen state, and RN's
+    // RKStorage under databases/ (a sync backend left there ran sync cycles over the 5,000 tasks into the warm starts).
+    runAs('rm -rf files no_backup shared_prefs cache databases');
     runAs('mkdir -p files');
     if (db !== 'empty') {
         const staged = `/data/local/tmp/${pkg}.seed.db`;

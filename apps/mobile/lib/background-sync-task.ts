@@ -138,7 +138,7 @@ const backgroundSyncRunner = (): MobileBackgroundSyncRunner => {
     sync: {
       getConfigurationStatus: () => getMobileSyncConfigurationStatus(),
       performSync: () => performMobileSync(),
-      abort: () => abortMobileSync(),
+      abort: () => abortMobileSync('deadline'),
       setRequestDeadline: (at) => setMobileSyncRequestDeadline(at),
     },
     flushPendingSave: () => flushPendingSave(),

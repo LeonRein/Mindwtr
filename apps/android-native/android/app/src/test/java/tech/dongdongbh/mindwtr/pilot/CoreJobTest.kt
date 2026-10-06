@@ -13,6 +13,11 @@ class CoreJobTest {
     private var bootFailure: Throwable? = null
     private var jobFailure: Throwable? = null
     private var contextFailure: Throwable? = null
+    private var syncFailure: Throwable? = null
+    private var syncWanted = true
+    private var appActive = false
+    private var nextStored = true
+    private var ensured = true
 
     private val calls = object : CoreJob.Calls {
         override fun recover(): Boolean {
@@ -29,19 +34,118 @@ class CoreJobTest {
             contextFailure?.let { throw it }
             return JSONObject().put("notification", notification ?: JSONObject.NULL)
         }
+        override fun backgroundSync(trigger: String): JSONObject {
+            events += "sync $trigger"
+            syncFailure?.let { throw it }
+            return JSONObject().put("schedule", syncWanted)
+        }
+        override fun appActive() = appActive
     }
 
     private fun run(job: String?, input: Map<String, String?> = emptyMap()) = CoreJob.run(job, input,
         boot = { events += "boot"; bootFailure?.let { throw it }; calls },
         post = { events += "post ${it.getString("title")}" },
         refreshWidgets = { events += "widgets" },
+        syncAgain = { events += "again"; nextStored },
+        ensureSync = { events += "ensure"; ensured },
         log = { message, fields -> lines += "$message ${fields.optString("job")} ${fields.optString("outcome")} ${fields.optString("error")}".trim() })
 
     private val lines = mutableListOf<String>()
 
     @Test fun theHostBootsBeforeTheJobAndWidgetsRefreshAfterIt() {
         assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
-        assertEquals(listOf("boot", "recover", "drain", "widgets"), events)
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure", "widgets"), events)
+    }
+
+    // #1257: what a capture job stored while the app was closed is sent before the job ends (core's capture run), never after.
+    @Test fun aCaptureJobSendsWhatItStoredBeforeItEnds() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure", "widgets"), events)
+        assertEquals(listOf("Native Android core work ingest success"), lines)
+    }
+
+    // Review S4a 2: a capture job succeeds only once its upload is owned: sent, or failed and recorded with the scheduled job in
+    // WorkManager to retry it (the first native start after RN's may be a capture, with no screen to schedule it).
+    // A widget tap or a capture is stored and drawn before the job waits for any sync (a dead server can hold that for minutes).
+    @Test fun aCaptureJobStoresAndDrawsWhatItDrainedBeforeItWaitsForTheSync() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("drain", "widgets", "sync capture"), events.filter { it in setOf("drain", "widgets", "sync capture") }.take(3))
+    }
+
+    @Test fun aCaptureJobMakesSureTheScheduledJobExistsWhenCoreWantsIt() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("sync capture", "ensure"), events.filter { it == "sync capture" || it == "ensure" })
+        events.clear()
+        syncWanted = false
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "widgets"), events)
+    }
+
+    @Test fun aCaptureWhoseScheduledJobIsNotStoredRetries() {
+        ensured = false
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture", "ensure"), events)
+    }
+
+    @Test fun aCaptureWhoseSyncThrowsRetriesItsUpload() {
+        // The capture is committed; the retry sends it (the count it owes survives in OwedUploads).
+        syncFailure = IllegalStateException("Core backgroundSync timed out")
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.INGEST))
+        assertEquals(listOf("boot", "recover", "drain", "widgets", "sync capture"), events)
+        assertEquals(listOf("Native Android core work ingest retry Core backgroundSync timed out"), lines)
+    }
+
+    @Test fun whatTheDrainsStoredIsOwedUntilARunSettlesItAcrossProcessDeath() {
+        var stored = 0
+        val first = OwedUploads(read = { stored }, write = { stored = it })
+        first.add(2)
+        // A new process reads the same store.
+        val restarted = OwedUploads(read = { stored }, write = { stored = it })
+        val owed = restarted.owed()
+        assertEquals(2, owed)
+        // A capture stored while that run went on stays owed.
+        restarted.add(1)
+        restarted.settle(owed)
+        assertEquals(1, restarted.owed())
+        first.add(0)
+        assertEquals(1, stored)
+    }
+
+    @Test fun theSyncJobRunsCoresScheduledRunThenQueuesItsNext() {
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "sync scheduled", "again", "widgets"), events)
+    }
+
+    @Test fun theSyncJobQueuesNoNextRunOnceCoreSaysItIsNotWanted() {
+        syncWanted = false
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "sync scheduled", "widgets"), events)
+    }
+
+    @Test fun theSyncJobSkipsWhileTheAppIsInFrontAndQueuesItsNext() {
+        // RN's Expo worker runs nothing while the app is in the foreground (its triggers sync) and schedules the next run.
+        appActive = true
+        assertEquals(CoreJob.Outcome.Success, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "again", "widgets"), events)
+    }
+
+    @Test fun aSyncJobWhoseRunFailsRetriesAndKeepsItsPlaceInTheChain() {
+        syncFailure = IllegalStateException("Core backgroundSync timed out")
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "sync scheduled"), events)
+    }
+
+    // Review S4a 3: a next run WorkManager did not store would end the chain; the job retries instead of reporting success.
+    @Test fun aSyncJobWhoseNextRunIsNotStoredRetries() {
+        nextStored = false
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover", "drain", "sync scheduled", "again"), events)
+    }
+
+    @Test fun aSyncJobWaitsForRecoveryAndTheDrain() {
+        recovered = false
+        assertEquals(CoreJob.Outcome.Retry, run(CoreJob.SYNC))
+        assertEquals(listOf("boot", "recover"), events)
     }
 
     @Test fun anOwedJournalThatStillFailsRetriesLaterAndDrainsNothing() {

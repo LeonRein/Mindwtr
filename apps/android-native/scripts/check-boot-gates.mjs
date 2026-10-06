@@ -731,7 +731,7 @@ const kotlinFiles = [activity, model, owner, editorUi, focusUi, projectsUi, labe
 assert.equal(kotlinFiles.join('\n').match(/(?<!class )CoreHost\(/g).length, 1);
 // The dev build keeps its own database. The upgradetest build gets the RN database and RN's state
 // only from the guard, before CoreHost exists: before any open of it, the checkpoint, and any core write.
-assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val installer = HostInstaller\(app\.filesDir, app\.cacheDir\)\s*val keyValue = RnKeyValue\(app\.getDatabasePath\("RKStorage"\)\)\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}, HostIo\(app\),\s*File\(app\.filesDir, "journal"\), deviceStore\(app\),\s*File\(app\.filesDir, DiagnosticsLogFile\.RELATIVE_PATH\),\s*keyValue, HostFiles\(app\.filesDir, app\.cacheDir, content = AndroidContentSource\(app\)\), installer,\s*ReminderAlarms\(app, keyValue, checkpointRnState = \{ if \(legacy != null\) LegacyRnStoreGuard\.checkpointRnState\(app\.dataDir\) \}\),\s*HostWidgets\(app\) \{ appState \}\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
+assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val installer = HostInstaller\(app\.filesDir, app\.cacheDir\)\s*val keyValue = RnKeyValue\(app\.getDatabasePath\("RKStorage"\)\)\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}, HostIo\(app\),\s*File\(app\.filesDir, "journal"\), deviceStore\(app\),\s*File\(app\.filesDir, DiagnosticsLogFile\.RELATIVE_PATH\),\s*keyValue, HostFiles\(app\.filesDir, app\.cacheDir, content = AndroidContentSource\(app\)\), installer,\s*ReminderAlarms\(app, keyValue, checkpointRnState = \{ if \(legacy != null\) LegacyRnStoreGuard\.checkpointRnState\(app\.dataDir\) \}\),\s*HostWidgets\(app\) \{ appState \},\s*scheduleBackgroundSync = \{ on -> CoreWork\.scheduleSyncStored\(app, on\) \}\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
 // RN's installer journal recovery runs at boot after the validated load and before the journal's replay, the first write that
 // can reach files/attachments (pass A2); it is RN's own Kotlin, compiled as it is.
 assert.match(owner, /loadTheme\(runtime, legacy\?\.theme\)\s*(?:\/\/[^\n]*\n\s*)*recoverInstalls\(installer\)\s*if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)/);
@@ -854,7 +854,7 @@ assert.match(model, /ProcessCoreHost\.get\(/);
 // Storage exceptions never cross the QuickJS JNI boundary.
 assert.equal(coreHost.match(/JSCallFunction \{/g).length, 1, 'the only JS callback constructor is guarded');
 const bridgeCallbacks = coreHost.match(/bridge\.setProperty\([^\n]*/g);
-assert.equal(bridgeCallbacks.length, 40, 'the SQL calls, trace, nowMs, randomBytes, rnStateCommit, collationKey, dateTimeFormat, log, the fetch, secret and sync crypto calls, logFile, the key-value calls, hostEvent, the queue\'s file calls the attachment file, delete, abort and installer calls and the reminder alarms\' calls: and the widgets\' three calls: each guarded');
+assert.equal(bridgeCallbacks.length, 41, 'the SQL calls, trace, nowMs, randomBytes, rnStateCommit, collationKey, dateTimeFormat, log, the fetch, secret and sync crypto calls, logFile, the key-value calls, hostEvent, the queue\'s file calls the attachment file, delete, abort and installer calls and the reminder alarms\' calls: and the widgets\' three calls, and the background sync\'s schedule: each guarded');
 assert(bridgeCallbacks.includes('bridge.setProperty("fileAbort", guarded { args -> io.fileAbort(args[0] as String); null })'));
 assert(bridgeCallbacks.includes('bridge.setProperty("fileDeleteNow", guarded { args -> files.deleteNow(args[0] as String); null })'));
 // The attachment file port and the installer only start their call on the engine thread; HostIo's files thread runs it.
@@ -1116,7 +1116,7 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
         assert.match(coreHost, /if \(debugFault\("ai_consent_reset"\) == "1"\) keyValue\.remove\("mindwtr-ai-provider-consent-v1"\)/);
     }
     // Core's AI device binds RN's stores (host-ai.ts): the refused secret calls (an AI key is no sync commit), RN's AsyncStorage.
-    assert.match(hostEntry, /const nativeAI = nativeSync \? createNativeAI\(keyValue, \(\) => globalThis\.__mindwtrSecrets as HostSecrets\) : null;/);
+    assert.match(hostEntry, /const nativeAI = nativeSync \? createNativeAI\(keyValue, \(\) => globalThis\.__mindwtrSecrets as HostSecrets, isFossBuild\) : null;/);
     assert.match(hostEntry, /const localAttachments = nativeSync \? null : createNativeLocalAttachmentsForHost\(\);/);
     assert.match(hostEntry, /const attachmentsHost = nativeSync\?\.attachmentsHost \?\? localAttachments\?\.contractHost;/);
     assert.match(hostEntry, /createNativeHostContract\(\{ \.\.\.\(nativeSync \? \{ syncSettings: nativeSync\.settingsHost \} : \{\}\), \.\.\.\(nativeAI \? \{ ai: nativeAI \} : \{\}\),\s*\.\.\.\(attachmentsHost \? \{ attachments: attachmentsHost \} : \{\}\) \}\)/);
@@ -1188,8 +1188,11 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
         // only an unjournaled write or a read, so no journaled write can skip the journal through it.
         assert.match(journalKt, /fun unjournaled\(method: String, args: List<Any\?>\): Boolean = method in WRITES && key\(method, args\) in UNJOURNALED/);
         assert.match(coreHost, /private fun callLong\(method: String, vararg args: Any\?, handle: LongCall = LongCall\(\)\): JSONObject \{\s+require\(method !in WriteJournal\.WRITES \|\| WriteJournal\.unjournaled\(method, args\.toList\(\)\)\)/);
-        assert.deepEqual([...coreHost.matchAll(/\bcallLong\("(\w+)"/g)].map((m) => m[1]), ['menuCommand', 'aiRequest', 'attachmentRequest'],
-            'only Settings › Sync\'s commands, the AI\'s requests and the attachments\' downloads take the long path');
+        assert.deepEqual([...coreHost.matchAll(/\bcallLong\("(\w+)"/g)].map((m) => m[1]), ['backgroundSync', 'menuCommand', 'aiRequest', 'attachmentRequest'],
+            'only CoreWork\'s background sync run, Settings › Sync\'s commands, the AI\'s requests and the attachments\' downloads take the long path');
+        // S4a: CoreWork's background run (core's runner) is a read-and-sync like Sync now: no journaled write.
+        assert.match(coreHost, /fun backgroundSync\(trigger: String, stored: Int\): JSONObject =\s+callLong\("backgroundSync", trigger, stored, debugFault\("bgsync_deadline_ms"\)\.toIntOrNull\(\) \?: 0\)/);
+        assert(!writes.includes('backgroundSync'), 'a background sync run is no journaled write');
         assert.match(coreHost, /fun attachmentRequest\(name: String, json: String\): JSONObject = callLong\("attachmentRequest", name, json\)/);
         assert(!writes.includes('attachmentRequest'), 'an attachment request is no journaled write');
         assert.match(coreHost, /fun syncCommand\(name: String, json: String\): JSONObject = callLong\("menuCommand", name, json\)/);
@@ -1263,17 +1266,20 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
     assert.match(owner, /private fun replay\(runtime: CoreHost\): Boolean \{\s+val replay = runtime\.replayJournal\(\)\s+replay\.owed\?\.let \{ recordFailure\(PendingFailure\(FailedAction\("journal", ""\), it, null\)\); return false \}\s+(?:\/\/[^\n]*\s+)+if \(replay\.left > 0\) return true\s+runCatching \{ runtime\.pruneReceipts\(\) \}[\s\S]*?return true\s+\}/);
     // Sync (plan block 1): its triggers start only after the validated load, a replay that finished (no entry owed) and the queue
     // drain (ProcessCoreHost.recovered), or once the owed journal retry went through; nothing else starts them.
-    assert.match(owner, /loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.set\(runtime\)\s+return runtime/);
+    assert.match(owner, /loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.hold\(runtime\)\s+return runtime/);
     assert.equal([activity, model, owner, menuModel].join('\n').match(/syncStart\(/g).length, 1, 'one start of the triggers, in startSync');
-    assert.equal([activity, model, owner, menuModel].join('\n').match(/startSync\(app, runtime\)/g).length, 1, 'startSync only in recovered, after the drain (at once, or held for the first screen\'s content)');
+    assert.equal([activity, model, owner, menuModel].join('\n').match(/startSync\(app, runtime\)/g).length, 3, 'startSync only in recovered, after the drain (held for the first screen\'s content, or CoreWork\'s through startSyncWithScreen)');
     // Startup follow-up: the boot's start is held until the first screen shows its content: the Inbox's first rows (contentShown),
     // another tab's boot read, or a 3 s fallback; CoreWork's and the owed retry's start at once. One start at a time.
     // The reminder alarms start with sync (pass R1), held with it.
-    assert.match(owner, /startSync = \{\s+val start = \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+if \(deferSync\) deferredSync\.set\(start\) else start\(\)\s+\},/);
-    assert.match(owner, /fun startDeferredSync\(\) \{\s+deferredSync\.getAndSet\(null\)\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.getAndSet\(null\)\?\.let\(::refreshWidgets\)\s+\}/, 'the boot\'s widget publication waits with its sync start');
+    assert.match(owner, /startSync = \{\s+if \(deferSync\) deferredSync\.set \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\} else \{\s+startSyncWithScreen\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+\},/);
+    assert.match(owner, /fun startDeferredSync\(trigger: String = "content"\) \{\s+synchronized\(deferredSync\) \{\s+screenShown = true\s+deferredSync\.getAndSet\(null\)\s+\}\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.take\(\)\?\.let \{ publishHeldWidgets\(it, trigger\) \}\s+\}/, 'the boot\'s widget publication waits with its sync start');
+    // S4a: a process no screen showed in (a CoreWork job's) starts no triggers: as RN's headless runs, it syncs only through core's
+    // background run, which the job awaits. Once a screen showed, CoreWork's recovery starts them at once.
+    assert.match(owner, /private fun startSyncWithScreen\(app: Application, runtime: CoreHost\) \{\s+val now = synchronized\(deferredSync\) \{\s+(?:\/\/[^\n]*\s+)*if \(!screenShown\) deferredSync\.compareAndSet\(null\) \{ startSync\(app, runtime\) \}\s+screenShown\s+\}\s+if \(now\) startSync\(app, runtime\)\s+\}/);
     assert.match(owner, /fun contentShown\(\) \{\s+startDeferredSync\(\)/);
     assert.match(owner, /private fun startSync\(app: Application, runtime: CoreHost\): Unit = synchronized\(syncLock\) \{\s+if \(syncHost != null\) return/);
-    assert.match(model, /if \(screen != Screen\.Inbox\) ProcessCoreHost\.startDeferredSync\(\)\s+main\.postDelayed\(ProcessCoreHost::startDeferredSync, SYNC_FALLBACK_MS\)/);
+    assert.match(model, /if \(screen != Screen\.Inbox\) ProcessCoreHost\.startDeferredSync\(\)\s+main\.postDelayed\(\{ ProcessCoreHost\.startDeferredSync\("boot-timeout"\) \}, SYNC_FALLBACK_MS\)/);
     assert.equal([activity, model, owner, menuModel].join('\n').match(/recovered\(app, runtime(?:, deferSync = true)?\)|ProcessCoreHost\.recovered\(getApplication\(\), runtime\)/g).length, 2, 'recovered after the boot replay and the owed retry (CoreWork\'s is checked with the runner)');
     // Core's receipts are pruned once per boot, and only after a replay that left nothing: never before the replay, never while an
     // entry that may need its receipt is left.
@@ -1510,17 +1516,46 @@ assert.match(labelsKt, /strings = LABEL_KEYS\.filter\(values::has\)\.associateWi
 assert.match(labelsKt, /if \(logged\.add\(name\)\) Log\.w\(/, 'a missing key is logged once');
 assert.equal(kotlinFiles.join('\n').match(/Labels\.load\(/g).length, 1);
 assert.match(owner, /runtime\.language\(stored \?: "", Locale\.getDefault\(\)\.toLanguageTag\(\)\)\s+Labels\.load\(runtime\.strings\(LABEL_KEYS\)\)/);
-assert.match(owner, /runtime\.start\([^\n]*\)\s+setLanguage\(runtime, language \?: legacy\?\.language\)\s+loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.set\(runtime\)\s+return runtime/);
+assert.match(owner, /runtime\.start\([^\n]*\)\s+setLanguage\(runtime, language \?: legacy\?\.language\)\s+loadTheme\(runtime, legacy\?\.theme\)\s+(?:\/\/[^\n]*\s+)*recoverInstalls\(installer\)\s+if \(replay\(runtime\)\) recovered\(app, runtime, deferSync = true\)\s+(?:\/\/[^\n]*\s+)*deferredWidgets\.hold\(runtime\)\s+return runtime/);
 // After a finished replay (the boot's, the owed retry's, CoreWork's): the queue drain, then sync (StartOrder, StartOrderTest). Any
 // drain that did not finish becomes the screens' owed journal retry, holds sync back, and CoreWork retries it.
-assert.match(owner, /fun recovered\(app: Application, runtime: CoreHost, deferSync: Boolean = false\): Boolean = StartOrder\.afterReplay\(\s+drain = \{ drain\(runtime, queue\(app\), app\) \},\s+owe = \{ message -> recordFailure\(PendingFailure\(FailedAction\("journal", ""\), message, null\)\) \},\s+retryLater = \{ runCatching \{ CoreWork\.retryDrain\(app\) \}[^\n]*\},\s+(?:\/\/[^\n]*\s+)*startSync = \{\s+val start = \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+if \(deferSync\) deferredSync\.set\(start\) else start\(\)\s+\},\s+refreshWidgets = \{ refreshWidgets\(runtime\) \},\s+\)/);
+assert.match(owner, /fun recovered\(app: Application, runtime: CoreHost, deferSync: Boolean = false\): Boolean = StartOrder\.afterReplay\(\s+drain = \{ drain\(runtime, queue\(app\), app\) \},\s+owe = \{ message -> recordFailure\(PendingFailure\(FailedAction\("journal", ""\), message, null\)\) \},\s+retryLater = \{ runCatching \{ CoreWork\.retryDrain\(app\) \}[^\n]*\},\s+(?:\/\/[^\n]*\s+)*startSync = \{\s+if \(deferSync\) deferredSync\.set \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\} else \{\s+startSyncWithScreen\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+\},\s+refreshWidgets = \{ refreshWidgets\(runtime\) \},\s+\)/);
 assert.match(source('StartOrder.kt'), /Drain\.Done -> \{\s+startSync\(\)\s+return true\s+\}\s+Drain\.Unswept -> \{\s+startSync\(\)\s+(?:\/\/[^\n]*\s+)*refreshWidgets\(\)\s+retryLater\(\)\s+\}\s+Drain\.Waiting -> retryLater\(\)\s+is Drain\.Failed -> \{\s+owe\(result\.message\)\s+retryLater\(\)\s+\}/);
 assert.match(source('CoreWork.kt'), /fun retryDrain\(context: Context\) = enqueue\(context, CoreJob\.INGEST, emptyMap\(\), ExistingWorkPolicy\.KEEP\)/, 'a retry never cancels a running drain');
+// S4a: the background sync job, as RN's expo-background-task worker: core's interval, a network, its next run appended after it; a
+// reconcile keeps a queued or running job (KEEP: RN's #1001 fix), only core's "off" cancels it; RN's own worker is cancelled at every
+// process start. Core's runner and schedule decision on the host's ports are tested in bundle/host-sync.test.ts (bun), run here.
+{
+    const coreWork = source('CoreWork.kt');
+    const rnScheduler = readFileSync(resolve(app, '../../node_modules/expo-background-task/android/src/main/java/expo/modules/backgroundtask/BackgroundTaskScheduler.kt'), 'utf8');
+    const coreRunner = readFileSync(resolve(app, '../../packages/core/src/mobile-background-sync.ts'), 'utf8');
+    assert.equal(/const val RN_SYNC_WORK = "(\w+)"/.exec(coreWork)[1], /WORKER_IDENTIFIER = "(\w+)"/.exec(rnScheduler)[1], 'RN\'s worker name is Expo\'s');
+    assert.equal(/const val SYNC_INTERVAL_MINUTES = (\d+)L/.exec(coreWork)[1], /MOBILE_BACKGROUND_SYNC_MINIMUM_INTERVAL_MINUTES = (\d+);/.exec(coreRunner)[1], 'core\'s interval');
+    assert.match(rnScheduler, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
+    assert.match(coreWork, /\.setInitialDelay\(SYNC_INTERVAL_MINUTES, TimeUnit\.MINUTES\)\s+\.setConstraints\(Constraints\.Builder\(\)\.setRequiredNetworkType\(NetworkType\.CONNECTED\)\.build\(\)\)/);
+    assert.match(coreWork, /if \(on\) work\.enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.KEEP, syncRequest\(\)\) else work\.cancelUniqueWork\(SYNC_WORK\)/);
+    assert.match(coreWork, /enqueueUniqueWork\(SYNC_WORK, ExistingWorkPolicy\.APPEND_OR_REPLACE, syncRequest\(\)\)/);
+    // Review S4a 4: core hears "scheduled" only once WorkManager stored it; a refusal or no answer throws back to core.
+    assert.match(coreWork, /fun scheduleSyncStored\(context: Context, on: Boolean\) \{\s+scheduleSync\(context, on\)\.result\.get\(STORE_WAIT_SECONDS, TimeUnit\.SECONDS\)\s+\}/);
+    assert.equal(coreWork.match(/enqueueUniqueWork\(SYNC_WORK/g).length, 2, 'the sync job is queued only by core\'s decision and by its own run');
+    assert.match(coreWork, /syncAgain = \{ isStopped \|\| runCatching \{ syncAgain\(app\)\.result\.get\(STORE_WAIT_SECONDS, TimeUnit\.SECONDS\) \}/, 'a cancelled run queues no next one; a next run not stored retries this one (review S4a 3)');
+    assert.match(source('MindwtrApplication.kt'), /runCatching \{ CoreWork\.cancelRnSync\(this\) \}/);
+    assert.match(hostEntry, /scheduleBackgroundSync: \(on\) => \{ const bridge = native\(\); if \(bridge\.bgSyncSchedule\) checked\(bridge\.bgSyncSchedule\(on\)\); \},/);
+    const tested = spawnSync('bun', ['test', 'apps/android-native/bundle/host-sync.test.ts'], { cwd: resolve(app, '../..'), encoding: 'utf8' });
+    assert.equal(tested.status, 0, `bundle/host-sync.test.ts: ${tested.stderr.slice(-1500)}`);
+    // D8: the channel is the build's flavor, read by core as RN's isFossBuild; no host passes a fixed false any more.
+    assert.match(readFileSync(resolve(app, 'android/app/build.gradle.kts'), 'utf8'), /create\("play"\) \{\s+dimension = "channel"\s+buildConfigField\("boolean", "FOSS", "false"\)\s+\}\s+create\("foss"\) \{\s+dimension = "channel"\s+buildConfigField\("boolean", "FOSS", "true"\)/);
+    assert.match(coreHost, /engine\.globalObject\.setProperty\("__mindwtrFossBuild", BuildConfig\.FOSS\)/);
+    assert.match(hostEntry, /const isFossBuild = globalThis\.__mindwtrFossBuild === true;/);
+    const bundleHosts = ['host-sync.ts', 'host-ai.ts'].map((name) => readFileSync(resolve(app, 'bundle', name), 'utf8')).join('\n');
+    assert.doesNotMatch(bundleHosts, /isFossBuild: false/, 'every host reads the flavor');
+}
 // The queue drain (RN's startup drain; CoreWork's ingest job too): after the journal replay, before any screen, entry point or
 // sync gets the host; never while a save is owed; a failed save becomes the journal's owed retry, which drains again.
 assert.match(owner, /fun queue\(app: Application\) = File\(app\.filesDir, PendingCaptureWriter\.DIRECTORY\)/, 'the queue is RN\'s writer\'s folder');
 assert.match(owner, /private fun drain\(runtime: CoreHost, queue: File, app: Application\): StartOrder\.Drain \{\s+if \(failure != null\) return StartOrder\.Drain\.Waiting\s+(?:\/\/[^\n]*\s+)*val unswept = runCatching \{ CheckoffStore\.sweep\(app\)\.failed > 0 \}[^\n]*\.getOrDefault\(true\)\s+if \(unswept\) runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "unswept"\)\)\s+val drained = if \(unswept\) StartOrder\.Drain\.Unswept else StartOrder\.Drain\.Done\s+when \(StartOrder\.queueEmpty\(queue\.list\(\), queue\.exists\(\)\)\) \{\s+true -> return drained\s+(?:\/\/[^\n]*\s+)*null -> \{\s+runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "unreadable"\)\)\s+return StartOrder\.Drain\.Unswept\s+\}\s+false -> Unit\s+\}\s+return try \{\s+val ingested = runtime\.ingestPendingCaptures\(UUID\.randomUUID\(\)\.toString\(\)\)/, 'a failed check-off sweep is retried, the queue still drained');
-assert.match(owner, /val ingested = [^\n]+\n[^\n]+"drained"[^\n]+\n\s+drained\n/);
+assert.match(owner, /val ingested = [^\n]+\n\s+(?:\/\/[^\n]*\s+)*runCatching \{ CoreWork\.owedUploads\(app\)\.add\(ingested\) \}[^\n]+\n[^\n]+"drained"[^\n]+\n\s+drained\n/, 'what a drain stored is owed to CoreWork\'s next background run, across process death (S4a, review 2)');
+assert.match(source('CoreWork.kt'), /return host\.backgroundSync\(trigger, if \(ProcessCoreHost\.appActive\) 0 else stored\)\.also \{ owed\.settle\(stored\) \}/, 'an owed upload is settled only once its run settled');
 assert.match(owner, /\.put\("error", message\.substringBefore\(':'\)\)\)\s+StartOrder\.Drain\.Failed\(message\)/);
 // The runner's lines go through core's logger (logcat, and RN's diagnostics log file), their fields in context; a failure's code only.
 assert.match(owner, /runtime\.logLine\("Native Android queue drain", JSONObject\(\)\.put\("outcome", "drained"\)\.put\("ingested", ingested\)\)/);
@@ -2610,7 +2645,7 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     // staged and size-checked beside the database, the old WAL and SHM removed, then renamed over it; the restore proves core's value,
     // goes back to the tabs, and a failed restore exits 1.
     const lockCheck = readFileSync(resolve(app, 'scripts/check-app-lock-device.mjs'), 'utf8');
-    assert.match(lockCheck, /sh\(`am force-stop \$\{PKG\}`\);\s+await waitFor\('the app process to end', \(\) => pid\(\) === '', 10_000\);\s+changes \+= 1;\s+const original = pullDatabase\(`original-\$\{changes\}`\);/);
+    assert.match(lockCheck, /await device\.stopApp\(\);\s+changes \+= 1;\s+const original = pullDatabase\(`original-\$\{changes\}`\);/);
     assert.match(lockCheck, /const staged = Number\(runAs\(`stat -c %s \$\{next\}`\)\);\s+if \(staged !== statSync\(db\)\.size\) fail\([^\n]*\n\s+if \(pid\(\) !== ''\) fail\([^\n]*\n\s+runAs\(`rm -f files\/\$\{DB\}-wal files\/\$\{DB\}-shm`\);\s+runAs\(`mv -f \$\{next\} files\/\$\{DB\}`\);/);
     assert.doesNotMatch(lockCheck, /runAs\(`cp \$\{STAGED\} files\/\$\{DB\}`\)/, 'never copy over the live database in place');
     assert.match(lockCheck, /const now = core\('read'\)\.stored === true;\s+if \(now !== original\) fail\(/);
@@ -2822,7 +2857,8 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
             rmSync(scratch, { recursive: true, force: true });
         }
         assert.equal(gradle.match(/--allow-module-trace/g)?.length, 1, 'one place allows module hooks');
-        assert.match(gradle, /if \(name == "mergeBenchmarkTraceAssets"\) "--allow-module-trace"/, 'only benchmarkTrace\'s merged assets may carry them');
+        // Each channel's benchmarkTrace (mergePlayBenchmarkTraceAssets, mergeFossBenchmarkTraceAssets), no other variant.
+        assert.match(gradle, /if \(name\.endsWith\("BenchmarkTraceAssets"\)\) "--allow-module-trace"/, 'only benchmarkTrace\'s merged assets may carry them');
     }
     // RN's shortcuts from RN's own builder: the same ids, capabilities, labels and links, on the build's scheme; Add task opens
     // RN's quick capture dialog in the build's package, as RN's does (pass W1 brings it).
@@ -3400,8 +3436,9 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     // pass). Resume publishes through the same call, off the engine's callers.
     const ownerKt = readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/ProcessCoreHost.kt'), 'utf8');
     assert.match(ownerKt, /private fun refreshWidgets\(runtime: CoreHost\) = widgetThread\.execute \{\s+runCatching \{ runtime\.refreshWidgets\(\) \}\.onFailure \{ Log\.w\(CoreHost\.TAG, "Native Android widget refresh failed", it\) \}\s+\}/);
-    // Coming to the front and leaving it both publish (RN's resume refresh and its flush on leaving).
-    assert.match(ownerKt, /if \(state == appState\) return\s+appState = state\s+(?:\/\/[^\n]*\s+)*boot\?\.takeIf \{ it\.isDone \}\?\.let \{ task -> runCatching \{ task\.get\(\) \}\.getOrNull\(\)\?\.let\(::refreshWidgets\) \}/);
+    // Coming to the front and leaving it both publish (RN's resume refresh and its flush on leaving). Coming to the front, it
+    // waits for the screen's first content (startDeferredSync runs it) or the fallback, so a warm start draws first.
+    assert.match(ownerKt, /if \(state == appState\) return\s+appState = state\s+(?:\/\/[^\n]*\s+)*boot\?\.takeIf \{ it\.isDone \}\?\.let \{ task -> runCatching \{ task\.get\(\) \}\.getOrNull\(\) \}\?\.let \{ runtime ->\s+if \(state == "active"\) \{\s+(?:\/\/[^\n]*\s+)*val generation = deferredWidgets\.hold\(runtime\)\s+widgetThread\.schedule\(\{ deferredWidgets\.takeIf\(generation\)\?\.let \{ publishHeldWidgets\(it, "resume-fallback"\) \} \},\s+WIDGET_FALLBACK_MS, TimeUnit\.MILLISECONDS\)\s+\} else \{\s+deferredWidgets\.clear\(\)\s+refreshWidgets\(runtime\)\s+\}\s+\}/, 'a resume\'s fallback publishes only its own hold (HeldPublicationTest)');
     // Kotlin says when a publication did not reach the widgets (its store or redraw failed), so the publisher sends it again.
     const hostWidgetsKt = readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/core/HostWidgets.kt'), 'utf8');
     assert.match(hostWidgetsKt, /\.put\("stale", stale\)/);
@@ -3421,13 +3458,17 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
 }
 
 const fakeCore = `
+import { mapSqliteTaskRow as hydrateTask285 } from ${JSON.stringify(resolve(app, '../../packages/core/src/sqlite-adapter.ts'))};
+globalThis.hydrateTaskAttachments285 = (attachments) => hydrateTask285({ id: 'task285', attachments: JSON.stringify(attachments) }).attachments;
 export { planAttachmentOpen, getAttachmentResolutionMessage } from ${JSON.stringify(resolve(app, '../../packages/core/src/attachment-editor-model.ts'))};
 import { logInfo as realLogInfo, setLogger as setRealLogger } from ${JSON.stringify(resolve(app, '../../packages/core/src/logger.ts'))};
 export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLoggingEnabled } from ${JSON.stringify(resolve(app, '../../packages/core/src/diagnostics-log.ts'))};
 export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLineageV3,
+    validateNativeAttachmentDraftBeginV4, validateNativeAttachmentDraftLineageV4,
+    prepareNativeAttachmentDraftAddV4, prepareNativeAttachmentDraftRemoveV4, completeNativeAttachmentDraftAddV4,
     prepareNativeAttachmentDraftAddV3, prepareNativeAttachmentDraftRemoveV3,
     readNativeAttachmentDraftRemoveFrozen } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft.ts'))};
-export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
+export { prepareNativeAttachmentDraftDiscardCandidates, prepareNativeAttachmentDraftDiscardCandidatesV3, prepareNativeAttachmentDraftDiscardCandidatesV4 } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-attachment-draft-discard.ts'))};
 import { createOwnedEditorFileEditTaskDraftSaveMethods as createRealMixedSaveMethods } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract-owned-file-edit-save.ts'))};
 import { createNativeHostContract as createRealCompleteContract } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-host-contract.ts'))};
 import { NativeReceiptSqliteAdapter as RealCompleteAdapter } from ${JSON.stringify(resolve(app, '../../packages/core/src/native-request-receipts.ts'))};
@@ -3837,7 +3878,8 @@ const syncOnly = [...new Set([...hostSyncTs.matchAll(/^import \{([\s\S]*?)\} fro
 assert(syncOnly.includes('createMobileSyncService') && syncOnly.includes('createMobileSyncTriggers'), 'host-sync.ts\'s core imports parsed');
 // S4b final pass: core's partly-encrypted rule runs only when the host gives the sync service the location probe; without it a
 // device with encryption off would upload plain attachments beside ciphertext. The card's "Check this location again" needs recheck.
-assert(/probeLocationCiphertext: \(\) => transitions\.probeSyncLocationCiphertext\(\),/.test(hostSyncTs), 'the native sync service asks whether the location holds ciphertext');
+// The cycle names its own folder (an activation's candidate is not the stored one), passed through as it is.
+assert(/probeLocationCiphertext: \(target\) => transitions\.probeSyncLocationCiphertext\(target\),/.test(hostSyncTs), 'the native sync service asks whether the location holds ciphertext');
 assert(/recheck: \(\) => transitions\.recheckPartlyEncryptedLocation\(\),/.test(hostSyncTs), 'the native encryption card rechecks a partly encrypted location');
 const fakeCoreWithSync = `${fakeCore}\n${syncOnly.map((name) => `export const ${name} = () => { throw new Error('${name}: sync is not bound in the gates'); };`).join('\n')}\n`;
 const built = await build({
@@ -3933,6 +3975,46 @@ const poll = async (state, id) => {
     await new Promise((resolveTick) => setImmediate(resolveTick));
     return JSON.parse(state.MindwtrHost.poll(id));
 };
+// HTTP transport alone enables no KV/sync/AI binding. Its private fixed
+// receipt uses the existing forced Diagnostics writer, without request input.
+{
+    const configureHTTP = (state) => {
+        state.httpCalls = 0;
+        state.__mindwtrNative.netFetch = () => { state.httpCalls++; throw new Error('Unexpected startup network'); };
+        state.__mindwtrNative.netAbort = () => {};
+        state.__mindwtrNative.ioNext = () => '';
+        state.__mindwtrNative.ioBody = () => '';
+    };
+    const local = makeState(0, [], 'ios', configureHTTP);
+    assert.deepEqual(Object.keys(local.contractBindings), []);
+    assert.equal(typeof local.__mindwtrNative.kvMultiGet, 'undefined');
+    local.MindwtrHost.nativeHTTPDelivered();
+    assert.equal(local.logText, null, 'No preboot transport receipt');
+    assert.equal((await poll(local, local.MindwtrHost.boot())).ok, true);
+    assert.equal(local.httpCalls, 0, 'Installing transport starts no request');
+    local.settings = { diagnostics: { loggingEnabled: false } };
+    local.MindwtrHost.nativeHTTPDelivered();
+    await poll(local, local.MindwtrHost.logShare()); // Existing append/share barrier.
+    const lines = local.logText.split('\n').filter((line) => line.includes('v1.3.5/ios-http-transport'));
+    assert.equal(lines.length, 1, 'Forced marker survives disabled logging');
+    assert.deepEqual(JSON.parse(lines[0]).context, {
+        releaseCheck: 'v1.3.5/ios-http-transport', operation: 'http-transport', outcome: 'delivered',
+    });
+    const before = local.logText;
+    for (const field of ['sandbox', 'workspaceTransition']) {
+        local[field] = true; local.MindwtrHost.nativeHTTPDelivered(); local[field] = false;
+    }
+    await new Promise((tick) => setImmediate(tick));
+    assert.equal(local.logText, before, 'Unsettled workspace emits no receipt');
+    for (const platform of ['android', undefined]) {
+        const other = makeState(0, [], platform, configureHTTP);
+        assert.equal((await poll(other, other.MindwtrHost.boot())).ok, true);
+        const prior = other.logText;
+        other.MindwtrHost.nativeHTTPDelivered(); await new Promise((tick) => setImmediate(tick));
+        assert.equal(other.logText, prior, 'Invalid platform emits no transport marker');
+        assert.equal(other.httpCalls, 0);
+    }
+}
 // Production host-entry selects independent local attachment policy only for
 // complete iOS file capabilities. No kvMultiGet, sync settings, AI or backend
 // constructor is supplied; readiness and diagnostic acknowledgments are real.
@@ -4035,6 +4117,19 @@ const poll = async (state, id) => {
         assert.equal(local.logText, beforeLog);
         local.logFailure = null;
     });
+    await check(async () => {
+        local.settings = { diagnostics: { loggingEnabled: false } };
+        assert.deepEqual(await call(local, 'attachmentDraftBeginV4', begin),
+            { ok: true, value: { version: 4, taskID: 'task257', payloadJSON: opening } });
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-attachment-link-lineage', outcome: 'validated' });
+        const beforeLog = local.logText;
+        assert.equal((await call(local, 'attachmentDraftBeginV4', { ...begin, payloadJSON: '{}' })).ok, false);
+        assert.equal(local.logText, beforeLog);
+        local.logFailure = 'private log failure';
+        assert.equal((await call(local, 'attachmentDraftBeginV4', begin)).ok, true);
+        assert.equal(local.logText, beforeLog); local.logFailure = null;
+    });
     const removedReply = await call(local, 'attachmentDraftRemovePrepareV3', removeInput);
     assert.equal(removedReply.ok, true);
     const removed = removedReply.value;
@@ -4058,6 +4153,31 @@ const poll = async (state, id) => {
             { ok: true, value: { version: 3, taskID: 'task257', payloadJSON: added.afterPayloadJSON } });
         assert.deepEqual(JSON.parse(added.afterPayloadJSON).raw, JSON.parse(opening).raw);
     });
+    await check(async () => {
+        const selected = { ...lineage, version: 4 }, sha = 'a'.repeat(64);
+        const reply = await call(local, 'attachmentDraftPrepareV4', { ...addInput, ...selected, sourceSha256: sha });
+        assert.equal(reply.ok, true); const hashed = reply.value;
+        assert.equal(hashed.version, 2); assert.equal(hashed.sourceSha256, sha);
+        assert.equal(hashed.prepared.attachment.fileHash, sha); assert.equal(hashed.attachment.fileHash, sha);
+        const full = { ...selected, beforePayloadJSON: hashed.afterPayloadJSON, priorOperations: [{ kind: 'add', operation: hashed }] };
+        assert.deepEqual(await call(local, 'attachmentDraftValidateLineageV4', full),
+            { ok: true, value: { version: 4, taskID: 'task257', payloadJSON: hashed.afterPayloadJSON } });
+        assert.equal((await call(local, 'attachmentDraftValidateLineageV3', full)).ok, false);
+        assert.equal((await call(local, 'attachmentDraftPrepareV3', { ...addInput, sourceSha256: sha })).ok, false);
+        const removed = await call(local, 'attachmentDraftRemovePrepareV4', { ...full,
+            requestId: '28800000-0000-4000-8000-000000000003', attachmentId: hashed.requestId });
+        assert.equal(removed.ok, true); assert.equal(removed.value.version, 1);
+        const discarded = { version: 3, historyVersion: 4, taskID: selected.taskID, managedDirectoryURI: ROOT,
+            initialPayloadJSON: opening, checkpointPayloadJSON: removed.value.afterPayloadJSON,
+            operations: [{ kind: 'add', phase: 'checkpointed', preparedJSON: JSON.stringify(hashed) },
+                { kind: 'remove', phase: 'checkpointed', preparedJSON: JSON.stringify(removed.value) }] };
+        const planned = await call(local, 'attachmentDraftDiscardCandidatesV4', discarded);
+        assert.equal(planned.ok, true); assert.equal(planned.value.version, 3); assert.equal(planned.value.historyVersion, 4);
+        assert.deepEqual(planned.value.candidates.map((value) => value.requestId), [hashed.requestId]);
+        assert.equal((await call(local, 'attachmentDraftDiscardCandidatesV3', discarded)).ok, false);
+        const wrong = structuredClone(full); wrong.priorOperations[0].operation.sourceSha256 = 'b'.repeat(64);
+        assert.equal((await call(local, 'attachmentDraftValidateLineageV4', wrong)).ok, false);
+    });
     // Historical retry has no optional capability, current editable task or fresh clock.
     const historical = makeState(0, [], 'ios'); historical.localTaskReadOnly = true;
     historical.sandbox = true; historical.workspaceTransition = true;
@@ -4078,7 +4198,7 @@ const poll = async (state, id) => {
         if (variant === 'readOnly') state.localTaskReadOnly = true;
         if (variant === 'taskMissing') state.localTaskViewFailure = { ok: false, error: { code: 'TASK_NOT_FOUND', message: 'Not found' } };
         if (variant === 'persistence') state.persistenceFailure = { message: 'failed' };
-        for (const [method, input] of [['attachmentDraftBeginV3', begin], ['attachmentDraftPrepareV3', addInput], ['attachmentDraftRemovePrepareV3', removeInput]]) {
+        for (const [method, input] of [['attachmentDraftBeginV3', begin], ['attachmentDraftBeginV4', begin], ['attachmentDraftPrepareV3', addInput], ['attachmentDraftRemovePrepareV3', removeInput]]) {
             await check(async () => assert.equal((await call(state, method, input)).ok, false, `${variant}/${method}`));
         }
         if (variant !== 'readOnly' && variant !== 'taskMissing') {
@@ -5399,6 +5519,83 @@ const poll = async (state, id) => {
         assert.equal(local.saveCount, 0);
         assert.equal((await plan(makeState(0), request('document'), true)).ok, false);
     });
+    await check('Task settled local planning preserves original metadata and never resolves availability', async () => {
+        const local = makeState(0, [], 'ios');
+        const attachments = [
+            { id: 'document', kind: 'file', title: 'Document', uri: 'file:///old/document.txt', mimeType: 'text/plain', fileHash: 'a'.repeat(64) },
+            { id: 'image', kind: 'file', title: 'Image', uri: 'file:///old/image.png', mimeType: 'image/png' },
+            { id: 'audio', kind: 'file', title: 'Audio', uri: 'file:///old/audio.wav', mimeType: 'audio/wav' },
+        ];
+        for (const item of attachments) { item.createdAt = '2026-10-06T00:00:00Z'; item.updatedAt = item.createdAt; }
+        const saved = { id: 'task285', attachments };
+        local.ownerTaskMap = new Map([['task285', saved]]);
+        const request = (id, rows = attachments) => JSON.stringify({ owner: { kind: 'task', taskId: 'task285', attachments: rows }, attachmentId: id });
+        const plan = (state, json, available) => poll(state, state.MindwtrHost.taskLocalFileOpenPlan(json, available));
+        const before = JSON.stringify(saved);
+        for (const readOnly of [false, true]) {
+            local.localTaskReadOnly = readOnly;
+            for (const [id, kind] of [['document', 'file'], ['image', 'image'], ['audio', 'audio']]) {
+                const result = await plan(local, request(id), true);
+                assert.equal(result.ok, true); assert.equal(result.value.status, 'available');
+                assert.equal(result.value.open.kind, kind); assert.equal(result.value.update, null);
+                const selected = attachments.find((item) => item.id === id);
+                assert.equal(kind === 'file' ? result.value.open.uri : result.value.open.attachment.uri, selected.uri);
+                assert.equal('relocatedFrom' in result.value, false, 'Only Swift may produce resolved result authority');
+            }
+        }
+        const hydrated = local.hydrateTaskAttachments285(attachments);
+        assert.equal(Object.hasOwn(hydrated[0], 'cloudKey'), true); assert.equal(hydrated[0].cloudKey, undefined);
+        assert.deepEqual(JSON.parse(JSON.stringify(hydrated)), attachments, 'Actual SQLite hydration serializes to exactly the original wire metadata');
+        saved.attachments = hydrated;
+        for (const [id, kind] of [['document', 'file'], ['image', 'image'], ['audio', 'audio']]) {
+            const result = await plan(local, request(id), true);
+            assert.equal(result.ok, true, 'Hydrated own-undefined fields must not invalidate an exact original JSON selection');
+            assert.equal(result.value.open.kind, kind);
+        }
+        hydrated[0].cloudKey = null;
+        assert.equal((await plan(local, request('document'), true)).ok, false, 'Defined null remains different from an omitted field');
+        hydrated[0].cloudKey = undefined; hydrated[0].pendingContentUpload = false;
+        assert.equal((await plan(local, request('document'), true)).ok, false, 'Defined false is never discarded as undefined');
+        hydrated[0].pendingContentUpload = undefined;
+        assert.deepEqual((await plan(local, request('document'), false)).value,
+            { status: 'unavailable', message: 'attachments.missing', update: null, open: null });
+        saved.attachments = attachments;
+        for (const rows of [[{ ...attachments[0], uri: 'file:///fabricated/current.txt' }],
+            [{ ...attachments[0], fileHash: 'b'.repeat(64) }], [{ ...attachments[0], title: 'Changed' }],
+            [...attachments, { ...attachments[0] }]]) assert.equal((await plan(local, request('document', rows), true)).ok, false);
+        for (const available of [null, 1, 'true']) assert.equal((await plan(local, request('document'), available)).ok, false);
+        assert.equal((await plan(local, request('missing'), true)).ok, false);
+        assert.equal((await plan(local, JSON.stringify({ owner: { kind: 'task', taskId: 'task285', attachments }, attachmentId: 'document', extra: true }), true)).ok, false);
+        for (const field of ['deletedAt', 'purgedAt']) {
+            saved[field] = '2026-10-06T00:00:00Z'; assert.equal((await plan(local, request('document'), true)).ok, false); delete saved[field];
+        }
+        attachments[0].deletedAt = '2026-10-06T00:00:00Z';
+        assert.equal((await plan(local, request('document'), true)).ok, false); delete attachments[0].deletedAt;
+        local.ownerTaskMap = new Map(); assert.equal((await plan(local, request('document'), true)).ok, false);
+        assert.equal((await plan(makeState(0), request('document'), true)).ok, false);
+        assert.equal(JSON.stringify(saved), before);
+        assert.deepEqual(local.attachmentInputs, []); assert.deepEqual(local.fileCalls, []); assert.equal(local.saveCount, 0);
+    });
+    await check('Relocated Open markers are fixed, exportable, best effort and preserve prior markers', async () => {
+        for (const surface of ['task', 'project']) {
+            const operation = `relocated-${surface}-file-open`, local = makeState(0, [], 'ios');
+            local.settings = { diagnostics: { loggingEnabled: false } };
+            const ack = (state, name = operation, outcome = 'prepared') => poll(state, state.MindwtrHost.attachmentDraftAcknowledged(name, outcome));
+            assert.equal((await ack(local)).ok, true);
+            assert.deepEqual(JSON.parse(local.logText.trim()).context,
+                { releaseCheck: 'v1.3.5/ios-relocated-file-open', operation, outcome: 'prepared', surface });
+            const before = local.logText;
+            for (const name of ['relocated-file-open', `${operation}-extra`, 'relocated-file-open/task']) assert.equal((await ack(local, name)).ok, true);
+            for (const outcome of ['confirmed', 'replayed', '', null]) assert.equal((await ack(local, operation, outcome)).ok, true);
+            assert.equal(local.logText, before);
+            assert.deepEqual((await poll(local, local.MindwtrHost.logShare())).value, { path: 'files/logs/mindwtr.log' });
+            const exported = local.logText;
+            local.logFailure = 'private diagnostics failure'; assert.equal((await ack(local)).ok, true); assert.equal(local.logText, exported);
+            for (const platform of ['android', undefined]) {
+                const other = makeState(0, [], platform); assert.equal((await ack(other)).ok, true); assert.equal(other.logText, null);
+            }
+        }
+    });
     await check('owned resume acknowledgment is iOS-only and fixed without claiming Save or UI hydration', async () => {
         const local = makeState(0, [], 'ios');
         assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('owned-resume', 'validated'))).ok, true);
@@ -5420,9 +5617,15 @@ const poll = async (state, id) => {
     for (const [operation, releaseCheck, accepted = 'confirmed'] of [
         ['preexisting-journal-replay', 'v1.3.5/ios-preexisting-attachment-journal-replay'],
         ['container-relocation', 'v1.3.5/ios-attachment-container-recovery'],
+        ['photo-add', 'v1.3.5/ios-task-photo-add'],
+        ['audio-playback', 'v1.3.5/ios-task-audio-playback', 'started'],
         ['file-open', 'v1.3.5/ios-local-file-open', 'prepared'],
         ['project-file-open', 'v1.3.5/ios-project-local-file-open', 'prepared'],
         ['project-file-remove', 'v1.3.5/ios-project-file-remove', 'saved'],
+        ['project-file-add', 'v1.3.5/ios-project-file-add', 'saved'],
+        ['project-file-add', 'v1.3.5/ios-project-file-add', 'abandoned'],
+        ['project-file-hash', 'v1.3.5/ios-project-file-hash', 'saved'],
+        ['task-file-hash', 'v1.3.5/ios-task-file-hash', 'saved'],
     ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };

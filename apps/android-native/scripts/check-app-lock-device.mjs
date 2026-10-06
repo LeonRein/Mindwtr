@@ -31,7 +31,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -128,8 +128,7 @@ let changes = 0;
  * old WAL and SHM (the copy holds their content), and renames it over the database, all while the app is stopped; then launches.
  */
 const setLock = async (on) => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     changes += 1;
     const original = pullDatabase(`original-${changes}`);
     const db = resolve(work, `set-${changes}`, DB);

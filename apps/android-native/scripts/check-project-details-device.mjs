@@ -33,7 +33,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -62,8 +62,7 @@ const runAs = (command) => sh(`run-as ${PKG} ${command}`);
 const launch = () => device.launch(ACTIVITY);
 const logs = (processId) => device.logs(processId, TAG);
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 
 // ---- database: a host copy of .db, -wal and -shm; core runs on it in Bun ----

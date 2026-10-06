@@ -41,7 +41,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -237,22 +237,15 @@ const expectSection = async (title, section, label) => {
 
 /** Opens the editor from the Inbox, scrolling and loading more until the row appears. */
 const openFromInbox = async (title) => {
-    let nodes = await inbox();
-    for (let page = 0; page < 20; page += 1) {
-        nodes = await device.reveal(title, 20);
-        // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
-        const row = inList(nodes, title);
-        if (row) {
-            await tap(row);
-            // The Inbox list opens the Form tab (RN's defaultEditTab="task").
-            return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
-        }
-        const more = button(nodes, 'More');
-        if (!more) break;
-        await tap(more);
-        await sleep(1500);
-    }
-    return fail(`row ${title} is not in the Inbox`);
+    await inbox();
+    // The Inbox grows with every run and pages by 50: reveal scrolls to the end, loading more as it goes (one pass; a
+    // fresh pass per page went back to the top and never got past its first 20 swipes).
+    const nodes = await device.reveal(title, 400);
+    // Only a row fully inside the list: a clipped one's middle can sit on the tab bar's capture button.
+    const row = inList(nodes, title) ?? fail(`row ${title} is not in the Inbox`);
+    await tap(row);
+    // The Inbox list opens the Form tab (RN's defaultEditTab="task").
+    return waitFor(`the editor for ${title} on its Form tab`, (current) => editorShows(current, title) && isOn(withDescription(current, 'Edit')));
 };
 /** RN opens a task from Focus on its View tab (resolveTaskOpenTab); the Edit tab then shows the Form this check edits. */
 const openFromFocus = async (title) => {

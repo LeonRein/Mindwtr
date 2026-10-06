@@ -68,7 +68,7 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
     }
     private func seed(_ faults: HostIOFaults = HostIOFaults(), count: Int = 1, edited: Bool = true,
                       checklist: [[String: Any]]? = nil, lifecycle: [String: Any]? = nil, recurring: Bool = false,
-                      jobs: NativeAttachmentHostHooks? = nil) async throws -> CoreHost {
+                      jobs: NativeAttachmentHostHooks? = nil, historyVersion: Int = 3) async throws -> CoreHost {
         let boot = core(); _ = try await boot.start(); await boot.close()
         try FileManager.default.createDirectory(at: managed, withIntermediateDirectories: true)
         let attachments = (0..<count).map { baseline($0, tombstone: $0 > 0) }
@@ -85,10 +85,21 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         let snapshot = EditorDraftSnapshot(sessionID: UUID().uuidString.lowercased(), taskID: taskID, generation: 1,
             payloadJSON: try payload(attachments, base: base, edits: edits, checklist: checklist ?? items))
         try await host.checkpointEditorDraft(snapshot)
-        _ = try await host.beginAttachmentDraftV3(expectedSession: snapshot.sessionID, expectedGeneration: 1)
+        _ = try await historyVersion == 4 ? host.beginAttachmentDraftV4(expectedSession: snapshot.sessionID, expectedGeneration: 1)
+            : host.beginAttachmentDraftV3(expectedSession: snapshot.sessionID, expectedGeneration: 1)
         return host
     }
     private func add(_ host: CoreHost) async throws -> Store.Operation {
+        if try record().version == 4 {
+            let selected = root.appendingPathComponent("provider-" + UUID().uuidString + ".txt")
+            try Data("borrowed source bytes".utf8).write(to: selected)
+            let before = try latest()
+            let reply = try object(await host.addProviderAttachmentV4(selectedURL: selected, expectedSession: before.sessionID,
+                expectedGeneration: before.generation, requestId: UUID().uuidString.lowercased()))
+            XCTAssertEqual(reply["version"] as? Int, 2)
+            XCTAssertEqual(try Data(contentsOf: selected), Data("borrowed source bytes".utf8))
+            return try XCTUnwrap(NativeAttachmentDraftCoordinator.mixedSaveAdds(record()).last)
+        }
         let source = cache.appendingPathComponent("borrowed.txt"); try Data("borrowed source bytes".utf8).write(to: source)
         let before = try latest()
         _ = try await host.addAttachmentDraftV3(requestJSON: json(["version": 1, "requestId": UUID().uuidString.lowercased(),
@@ -179,6 +190,128 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
         XCTAssertEqual(try inode(managed), parent); XCTAssertEqual(try rows(), savedRows)
         if let owner { XCTAssertEqual(try Data(contentsOf: store.url), owner) } else { XCTAssertNil(try store.readMixed()) }
         return (original, arguments, result)
+    }
+
+    func testHashedDocumentAddRemoveAddChecklistSaveColdRecoversExactCompleteProofOnce() async throws {
+        let checklist: [[String: Any]] = [["id": "one", "title": "Changed", "isCompleted": true]]
+        let host = try await seed(checklist: checklist, historyVersion: 4), first = try await add(host)
+        try await remove(host, id: first.requestId); let live = try await add(host)
+        let frozen = try record(), snapshot = try latest(), raw = try request(), target = try XCTUnwrap(URL(string: live.targetURI))
+        let bytes = try Data(contentsOf: target), identity = try inode(target), other = try json(task("unrelated"))
+        XCTAssertEqual(frozen.version, 4)
+        for op in [first, live] {
+            let prepared = try object(op.preparedJSON), attachment = try XCTUnwrap(prepared["attachment"] as? [String: Any])
+            XCTAssertEqual(prepared["version"] as? Int, 2); XCTAssertEqual(prepared["sourceSha256"] as? String, op.source.sha256)
+            XCTAssertEqual(attachment["fileHash"] as? String, op.source.sha256)
+        }
+        await boundary(.afterSaveTerminal, host: host)
+        let retained = await refused({ _ = try await self.save(host, raw: raw) }, saved: true)
+        let argsJSON = try XCTUnwrap(journalObject()["argumentsJSON"] as? String)
+        let args = try XCTUnwrap(NativeJSON.jsonObject(with: Data(argsJSON.utf8)) as? [String])
+        let wrapper = try object(XCTUnwrap(args.first)), envelope = try XCTUnwrap(wrapper["envelope"] as? [String: Any])
+        XCTAssertEqual(wrapper["version"] as? Int, 4)
+        XCTAssertEqual((envelope["request"] as? [String: Any])?["version"] as? Int, 3)
+        XCTAssertEqual(try editor.read()?.snapshot, snapshot); XCTAssertEqual(try record(), frozen)
+        let savedRows = try rows(); await host.close()
+        let cold = core(noWrites()), recovered = try recovery(await cold.start())
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(object(XCTUnwrap(retained?.resultJSON))))
+        XCTAssertEqual(try rows(), savedRows); XCTAssertEqual(try json(task("unrelated")), other); try released()
+        let row = try task(), attachments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(XCTUnwrap(row["attachments"] as? String).utf8)) as? [[String: Any]])
+        XCTAssertEqual(row["rev"] as? Int, 2); XCTAssertEqual(row["title"] as? String, title)
+        XCTAssertEqual(attachments.first { $0["id"] as? String == live.requestId }?["fileHash"] as? String, live.source.sha256)
+        XCTAssertNotNil(attachments.first { $0["id"] as? String == first.requestId }?["deletedAt"])
+        XCTAssertEqual(try Data(contentsOf: target), bytes); XCTAssertEqual(try inode(target), identity)
+        let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
+        XCTAssertTrue(log.contains("v1.3.5/ios-task-file-hash")); XCTAssertFalse(log.contains(live.source.sha256))
+    }
+    func testHashedInterruptedAddColdResumeAndDiscardKeepBorrowedBytesAndUseHistory4() async throws {
+        let host = try await seed(edited: false, historyVersion: 4), before = try rows()
+        let selected = root.appendingPathComponent("borrowed-document.txt"), bytes = Data("owned v4 document".utf8)
+        try bytes.write(to: selected); let snapshot = try latest(), id = UUID().uuidString.lowercased()
+        await boundary(.afterResult, host: host)
+        await refused { _ = try await host.addProviderAttachmentV4(selectedURL: selected, expectedSession: snapshot.sessionID,
+            expectedGeneration: snapshot.generation, requestId: id) }
+        let pending = try XCTUnwrap(NativeAttachmentDraftCoordinator.mixedSaveAdds(record()).last)
+        XCTAssertEqual(pending.phase, .resultDurable); XCTAssertEqual(try record().version, 4)
+        await host.close(); let cold = core(); _ = try await cold.start()
+        _ = try await cold.recoverAttachmentDraftV3(expectedSession: snapshot.sessionID)
+        let current = try latest(), opened = try object(await cold.checkAttachmentDraftResumeV3(expectedSession: current.sessionID, expectedGeneration: current.generation))
+        XCTAssertEqual(opened["version"] as? Int, 1); XCTAssertEqual(try record().version, 4)
+        let op = try XCTUnwrap(NativeAttachmentDraftCoordinator.mixedSaveAdds(record()).last)
+        XCTAssertEqual(try object(op.replyJSON ?? "{}")["version"] as? Int, 2)
+        let discardID = UUID().uuidString.lowercased()
+        _ = try await cold.discardAttachmentDraftV3(requestJSON: json(["version": 1, "requestId": discardID,
+            "sessionID": current.sessionID, "generation": current.generation]))
+        let finished = try object(await cold.finishAttachmentDraftDiscardV3(expectedSession: current.sessionID, requestId: discardID))
+        XCTAssertEqual(finished["version"] as? Int, 6); XCTAssertEqual(finished["historyVersion"] as? Int, 4)
+        XCTAssertEqual(try rows(), before); XCTAssertEqual(try Data(contentsOf: selected), bytes); try released()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(URL(string: op.targetURI)).path))
+    }
+    func testHashedCompleteCancellationColdUndoRetainsHashAndLegacyOwnerRefusesNewProducer() async throws {
+        let host = try await seed(historyVersion: 4), live = try await add(host), cancelID = UUID().uuidString.lowercased()
+        await boundary(.afterSaveTerminal, host: host)
+        await refused({ _ = try await self.save(host, raw: self.request(intent: "cancel", requestID: cancelID)) }, saved: true)
+        await host.close(); let cold = core(); _ = try recovery(await cold.start(), requestId: cancelID)
+        let undo = try json([json(["requestId": UUID().uuidString.lowercased(), "cancelRequestId": cancelID])])
+        _ = try await cold.call("taskCancellationUndo", argumentsJSON: undo)
+        XCTAssertEqual(try task()["status"] as? String, "next")
+        let attachments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(XCTUnwrap(task()["attachments"] as? String).utf8)) as? [[String: Any]])
+        XCTAssertEqual(attachments.first { $0["id"] as? String == live.requestId }?["fileHash"] as? String, live.source.sha256)
+        try released(); await cold.close()
+        let previous = try isolate(); defer { root = previous }
+        let legacy = try await seed(), snapshot = try latest(), ownerBytes = try Data(contentsOf: store.url)
+        let selected = root.appendingPathComponent("legacy-provider.txt"); try Data("legacy".utf8).write(to: selected)
+        await refused { _ = try await legacy.addProviderAttachmentV4(selectedURL: selected, expectedSession: snapshot.sessionID,
+            expectedGeneration: snapshot.generation, requestId: UUID().uuidString.lowercased()) }
+        XCTAssertEqual(try record().version, 3); XCTAssertEqual(try Data(contentsOf: store.url), ownerBytes)
+        XCTAssertEqual(try latest(), snapshot)
+        let old = try await add(legacy); XCTAssertNil(try object(old.preparedJSON)["sourceSha256"])
+        XCTAssertNil((try object(old.preparedJSON)["attachment"] as? [String: Any])?["fileHash"])
+    }
+
+    func testActualHashedAddStoreRefusesFrozenDigestAndVersionTamperingWithoutMutation() async throws {
+        let host = try await seed(historyVersion: 4), added = try await add(host)
+        let owner = try record(), snapshot = try latest(), beforeRows = try rows()
+        let sidecarBytes = try Data(contentsOf: store.url), sidecarIdentity = try inode(store.url)
+        let editorBytes = try Data(contentsOf: editor.url), editorIdentity = try inode(editor.url)
+        let target = try XCTUnwrap(URL(string: added.targetURI)), targetBytes = try Data(contentsOf: target), targetIdentity = try inode(target)
+        let raw = try object(String(decoding: JSONEncoder().encode(owner), as: UTF8.self))
+        for field in ["version", "sourceSha256", "source.fileHash", "completed.fileHash"] {
+            var frozen = try object(added.preparedJSON)
+            if field == "version" { frozen["version"] = 1 }
+            else if field == "sourceSha256" { frozen[field] = String(repeating: "b", count: 64) }
+            else if field == "source.fileHash" {
+                var prepared = try XCTUnwrap(frozen["prepared"] as? [String: Any])
+                var source = try XCTUnwrap(prepared["attachment"] as? [String: Any])
+                source["fileHash"] = String(repeating: "b", count: 64); prepared["attachment"] = source; frozen["prepared"] = prepared
+            } else {
+                var completed = try XCTUnwrap(frozen["attachment"] as? [String: Any])
+                completed["fileHash"] = String(repeating: "b", count: 64); frozen["attachment"] = completed
+            }
+            var wrong = raw, operations = try XCTUnwrap(raw["operations"] as? [[String: Any]])
+            var entry = operations[0], operation = try XCTUnwrap(entry["operation"] as? [String: Any])
+            operation["preparedJSON"] = try json(frozen); entry["operation"] = operation; operations[0] = entry; wrong["operations"] = operations
+            let changed = try JSONDecoder().decode(Store.MixedRecord.self, from: Data(json(wrong).utf8))
+            XCTAssertThrowsError(try store.writeMixed(changed), field)
+            XCTAssertEqual(try record(), owner); XCTAssertEqual(try latest(), snapshot); XCTAssertEqual(try rows(), beforeRows)
+            XCTAssertEqual(try Data(contentsOf: store.url), sidecarBytes); XCTAssertEqual(try inode(store.url), sidecarIdentity)
+            XCTAssertEqual(try Data(contentsOf: editor.url), editorBytes); XCTAssertEqual(try inode(editor.url), editorIdentity)
+            XCTAssertEqual(try Data(contentsOf: target), targetBytes); XCTAssertEqual(try inode(target), targetIdentity)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        }
+    }
+    func testEmptyAndRemoveOnlyHashedSavesDoNotEmitLiveAddHashMarker() async throws {
+        for mode in ["empty", "baseline-remove", "removed-add"] {
+            let previous = try isolate(); defer { root = previous }
+            let host = try await seed(count: mode == "empty" ? 0 : 1, historyVersion: 4)
+            if mode == "baseline-remove" { try await remove(host) }
+            if mode == "removed-add" { let added = try await add(host); try await remove(host, id: added.requestId) }
+            _ = try await save(host); try released()
+            XCTAssertEqual(try task()["rev"] as? Int, 2)
+            let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
+            XCTAssertFalse(log.contains("v1.3.5/ios-task-file-hash"), mode)
+            await host.close()
+        }
     }
 
     func testTerminalRemoveRelocatesSameInodeContainerWithoutRewritingFrozenAuthority() async throws {

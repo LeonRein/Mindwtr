@@ -652,6 +652,8 @@ jobs:
             exit 1
           fi
 
+          python3 scripts/ci/validate-macos-private-apis.py "$APP_PATH"
+
           xcrun productbuild \
             --keychain "$KEYCHAIN_PATH" \
             --component "$APP_PATH" /Applications \
@@ -828,7 +830,7 @@ jobs:
               TARGET_VERSION_STATE="$(jq -r '.data[0].attributes.appStoreState // empty' "$TARGET_VERSION_JSON_FILE")"
               if [ -n "${TARGET_VERSION_ID}" ]; then
                 case "${TARGET_VERSION_STATE:-}" in
-                  PREPARE_FOR_SUBMISSION|DEVELOPER_REJECTED)
+                  PREPARE_FOR_SUBMISSION|DEVELOPER_REJECTED|REJECTED)
                     echo "::notice::Found reusable macOS App Store version ${APP_VERSION} in state ${TARGET_VERSION_STATE:-unknown}. Reusing the existing version record for upload."
                     echo "SKIP_APP_VERSION_UPDATE_FOR_UPLOAD=true" >> "$GITHUB_ENV"
                     ;;

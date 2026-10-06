@@ -479,13 +479,24 @@ export const createSyncEncryptionStateStore = ({
          *  defers an enabled device forever, on every cycle, for the life of the install); a
          *  `remote-encrypted-no-key` discovery whose scope matches `activeScope` (same direction
          *  as `isSyncEncryptionBlocked`, widened from #1138's "no scope at all" to "wrong scope"
-         *  too); or no persisted state — the ONLY shape "off" ever takes, `parseLocalState`
-         *  rejects a bare `{state:'off'}` blob — and `hasCompletedCycleAgainstLocation` is true
-         *  (the caller's business: a per-location fast-sync fact this module does not have).
+         *  too); or encryption off — no persisted state (`parseLocalState` rejects a bare
+         *  `{state:'off'}` blob) or off with only a remembered partly encrypted location — and
+         *  `hasCompletedCycleAgainstLocation` is true (the caller's business: a per-location
+         *  fast-sync fact this module does not have).
          *  Anything else defers. */
         isSyncEncryptionPostureUnestablished: async (activeScope, hasCompletedCycleAgainstLocation) => {
             const localState = await loadSyncEncryptionLocalState();
-            if (!localState) return !hasCompletedCycleAgainstLocation;
+            // Off with only a remembered partly encrypted location is still off: read as a discovery state it deferred
+            // every other location for good (no discovery is ever recorded there). That location itself is blocked.
+            if (!localState || (localState.state === 'off' && !localState.incompleteTransition)) {
+                if (localState?.partlyEncryptedScope && hasCompletedCycleAgainstLocation) {
+                    void Promise.resolve(log.info('Sync encryption posture read as off beside a remembered partly encrypted location', {
+                        scope: 'sync',
+                        extra: { releaseCheck: 'v1.3.5/partly-encrypted-posture-off' },
+                    })).catch(() => undefined);
+                }
+                return !hasCompletedCycleAgainstLocation;
+            }
             if (SYNC_ENCRYPTION_KEYED_STATES.includes(localState.state)) return false;
             // remote-encrypted-no-key (and any other non-keyed state): only established when this
             // exact location's discovery is on record.

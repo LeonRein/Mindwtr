@@ -14,6 +14,7 @@ import { getStorageAdapter, useTaskStore } from './store';
 import { projectFocusDateValues, type FocusDateProjection } from './task-utils';
 import { buildBulkTaskTokenUpdates } from './bulk-task-tokens';
 import { logInfo } from './logger';
+import { referenceBatchModules } from './store-reference-batch-modules';
 import { detachReferenceBatchJson, detachReferenceBatchValue, readReferenceBatchSelectionRequest,
     rawReferenceBatchScope, referenceBatchSettingsReadable,
     requiredReferenceBatchDates, referenceBatchSourcesMatch, validReferenceBatchTask,
@@ -241,3 +242,12 @@ export function createReferenceTasksRemoveTagMethods(deps: {
     };
 }
 
+// The store's Reference removeTag action reads these here: it cannot import this module (store-reference-batch-modules.ts).
+referenceBatchModules.shared = { historyRowLoadProjection, NativeReceiptSqliteAdapter };
+referenceBatchModules.removeTag = (input) => {
+    const prepared = input as NativeReferenceTasksRemoveTagPrepared;
+    return {
+        validateEnvelope: () => Boolean(readReferenceTasksRemoveTagEnvelope({ request: prepared.request, prepared })),
+        authorityMatches: (data) => referenceTasksRemoveTagAuthorityMatches(prepared, data),
+    };
+};

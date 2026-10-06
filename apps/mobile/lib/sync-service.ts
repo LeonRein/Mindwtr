@@ -149,7 +149,7 @@ const mobileSyncService = (): MobileSyncService<MobileFileSyncLease> => {
       logSyncEncryptionEvent: (event, extra, options) => logSyncEncryptionEvent(event, extra, options),
       syncEncryptionLocalState,
       // Loaded when asked: the encryption service pulls in the attachment and File Sync modules this one must not load.
-      probeLocationCiphertext: async () => (await import('./sync-encryption-service')).probeSyncLocationCiphertext(),
+      probeLocationCiphertext: async (target) => (await import('./sync-encryption-service')).probeSyncLocationCiphertext(target),
     },
     ensureWebdavCapabilityProof: (config, probe, options) => ensureWebdavCapabilityProof(config, probe, options),
     dropboxAuth: {
@@ -253,8 +253,9 @@ export const performMobileSync: MobileSyncService['performMobileSync'] = (syncPa
 
 export { setBackgroundSafeFetchDeadline as setMobileSyncRequestDeadline };
 
-export function abortMobileSync(): boolean {
-  return mobileSyncService().abortMobileSync();
+/** 'deadline' (the background run gave up) ends the cycle with no follow-up; 'lifecycle' queues one. */
+export function abortMobileSync(reason?: 'lifecycle' | 'deadline'): boolean {
+  return mobileSyncService().abortMobileSync(reason);
 }
 
 export const __mobileSyncTestUtils = {

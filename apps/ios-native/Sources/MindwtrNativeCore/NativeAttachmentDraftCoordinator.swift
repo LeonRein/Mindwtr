@@ -149,11 +149,11 @@ final class NativeAttachmentDraftCoordinator {
               let task = validated["taskID"] as? String, Self.equal(task, record.session.taskID),
               let payload = validated["payloadJSON"] as? String, Self.equal(payload, projected) else { throw Self.failure }
     }
-    private func prepared(_ op: Store.Operation) throws -> [String: Any] {
+    private func prepared(_ op: Store.Operation, version: Int = 1) throws -> [String: Any] {
         let value = try Self.object(op.preparedJSON, limit: 2 * 1024 * 1024)
         let request = try Self.request(op.requestJSON, add: true)
-        guard Set(value.keys) == Set(["version", "kind", "taskID", "requestId", "picked", "measuredSize", "managedDirectoryURI", "beforePayloadJSON", "afterPayloadJSON", "prepared", "targetURI", "attachment"]),
-              Self.integer(value["version"]) == 1, value["kind"] as? String == "prepared",
+        guard Set(value.keys) == Set(["version", "kind", "taskID", "requestId", "picked", "measuredSize", "managedDirectoryURI", "beforePayloadJSON", "afterPayloadJSON", "prepared", "targetURI", "attachment"]).union(version == 2 ? ["sourceSha256"] : []),
+              Self.integer(value["version"]) == Int64(version), value["kind"] as? String == "prepared",
               value["taskID"] as? String == op.before.taskID, value["requestId"] as? String == op.requestId,
               request.id == op.requestId, request.session == op.before.sessionID, request.generation == op.before.generation,
               Self.equal(request.json, op.requestJSON),
@@ -167,6 +167,13 @@ final class NativeAttachmentDraftCoordinator {
               let target = URL(string: op.targetURI), target.deletingLastPathComponent().absoluteString == managedURI,
               let attachment = value["attachment"] as? [String: Any], attachment["id"] as? String == op.requestId,
               attachment["uri"] as? String == op.targetURI, Self.integer(attachment["size"]) == op.source.size else { throw Self.failure }
+        if version == 2 {
+            guard let hash = value["sourceSha256"] as? String, Self.equal(hash, op.source.sha256),
+                  let source = (value["prepared"] as? [String: Any])?["attachment"] as? [String: Any],
+                  let sourceHash = source["fileHash"] as? String, Self.equal(sourceHash, hash),
+                  let completed = value["attachment"] as? [String: Any], let completedHash = completed["fileHash"] as? String,
+                  Self.equal(completedHash, hash) else { throw Self.failure }
+        }
         if let stage = op.stage {
             let expected = managedURI + ".mindwtr-install-" + op.requestId.replacingOccurrences(of: "-", with: "") + ".candidate/stage"
             guard Self.equal(stage.uri, expected) else { throw Self.failure }
@@ -203,7 +210,7 @@ final class NativeAttachmentDraftCoordinator {
             case .remove(let op): return ["kind": "remove", "requestId": op.requestId, "phase": op.phase.rawValue, "reason": NSNull()]
             }
         }
-        return try Self.json(["version": 3, "status": status, "sessionID": record.session.sessionID,
+        return try Self.json(["version": record.version, "status": status, "sessionID": record.session.sessionID,
             "checkpoint": try Self.object(String(decoding: JSONEncoder().encode(record.session.checkpoint), as: UTF8.self)),
             "operations": operations,
             "discard": record.discard.map { ["requestId": $0.requestId, "phase": $0.phase.rawValue] as Any } ?? NSNull()])
@@ -413,10 +420,10 @@ final class NativeAttachmentDraftCoordinator {
         return try Self.json(["version": 1, "status": "draftRemoved", "requestId": op.requestId,
             "sessionID": op.after.sessionID, "generation": op.after.generation, "attachmentId": request.attachmentID])
     }
-    private func mixedPrepared(_ entry: Store.MixedOperation) throws -> [String: Any] {
+    private func mixedPrepared(_ entry: Store.MixedOperation, version: Int) throws -> [String: Any] {
         switch entry {
         case .add(let op):
-            let frozen = try prepared(op)
+            let frozen = try prepared(op, version: version == 4 ? 2 : 1)
             if let reply = op.replyJSON { guard Self.equal(reply, try addReply(op)) else { throw Self.failure } }
             return ["kind": "add", "operation": frozen]
         case .remove(let op):
@@ -428,15 +435,15 @@ final class NativeAttachmentDraftCoordinator {
         }
     }
     private func mixedInput(_ record: Store.MixedRecord, payload: String) throws -> [String: Any] {
-        ["version": 3, "taskID": record.session.taskID,
+        ["version": record.version, "taskID": record.session.taskID,
          "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
-         "beforePayloadJSON": payload, "priorOperations": try record.operations.map { try mixedPrepared($0) }, "managedDirectoryURI": managedURI]
+         "beforePayloadJSON": payload, "priorOperations": try record.operations.map { try mixedPrepared($0, version: record.version) }, "managedDirectoryURI": managedURI]
     }
     private func mixedProjection(_ record: Store.MixedRecord, payload: String, binding: Store.VersionedSnapshot,
                                  cancellation: NativeAttachmentCancellation) throws {
-        let validated = try mixedInvoke("attachmentDraftValidateLineageV3", mixedInput(record, payload: payload),
+        let validated = try mixedInvoke(record.version == 4 ? "attachmentDraftValidateLineageV4" : "attachmentDraftValidateLineageV3", mixedInput(record, payload: payload),
                                         binding: binding, cancellation: cancellation)
-        guard Set(validated.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(validated["version"]) == 3,
+        guard Set(validated.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(validated["version"]) == Int64(record.version),
               let task = validated["taskID"] as? String, Self.equal(task, record.session.taskID),
               let projected = validated["payloadJSON"] as? String, Self.equal(projected, payload) else { throw Self.failure }
     }
@@ -455,7 +462,7 @@ final class NativeAttachmentDraftCoordinator {
     private func mixedRecord(_ record: Store.MixedRecord, checkpoint: EditorDraftSnapshot,
                              operations: [Store.MixedOperation]? = nil,
                              advance: Store.CheckpointAdvance? = nil) -> Store.MixedRecord {
-        Store.MixedRecord(session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
+        Store.MixedRecord(version: record.version, session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
             state: record.session.state, checkpoint: checkpoint), operations: operations ?? record.operations,
             discard: record.discard, checkpointAdvance: advance)
     }
@@ -474,7 +481,7 @@ final class NativeAttachmentDraftCoordinator {
         let request = try Self.json(["version": 1, "requestId": id, "sessionID": checkpoint.sessionID, "generation": checkpoint.generation])
         let reply = try Self.json(["version": 1, "status": "cleanupPending", "requestId": id, "sessionID": checkpoint.sessionID])
         return [Store.DiscardPhase.decided, .detached].map { phase in
-            Store.MixedRecord(session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
+            Store.MixedRecord(version: record.version, session: .init(sessionID: record.session.sessionID, taskID: record.session.taskID,
                 state: .cleanupPending, checkpoint: checkpoint), operations: record.operations,
                 discard: .init(requestId: id, requestJSON: request, expected: checkpoint, phase: phase,
                                replyJSON: phase == .detached ? reply : nil))
@@ -504,6 +511,12 @@ final class NativeAttachmentDraftCoordinator {
         try store.preflightMixed(record)
     }
     func beginV3(session: String, generation: Int, cancellation: NativeAttachmentCancellation) throws -> String {
+        try beginMixed(session: session, generation: generation, version: 3, cancellation: cancellation)
+    }
+    func beginV4(session: String, generation: Int, cancellation: NativeAttachmentCancellation) throws -> String {
+        try beginMixed(session: session, generation: generation, version: 4, cancellation: cancellation)
+    }
+    private func beginMixed(session: String, generation: Int, version: Int, cancellation: NativeAttachmentCancellation) throws -> String {
         jobs.drain(); try requireOwner(); try cancellation.check()
         guard Self.uuid(session) != nil, session.utf8.count == 36, generation > 0, generation <= 9_007_199_254_740_991,
               let value = try editor.read(), value.attempt == nil,
@@ -511,25 +524,25 @@ final class NativeAttachmentDraftCoordinator {
         let snapshot = value.snapshot, binding = try store.readVersioned()
         let existing: Store.MixedRecord?
         if let binding {
-            guard case .mixed(let record) = binding.record, record.session.state == .active, record.discard == nil,
+            guard case .mixed(let record) = binding.record, record.version == version, record.session.state == .active, record.discard == nil,
                   record.checkpointAdvance == nil, record.operations.allSatisfy({ $0.checkpointed }),
                   Self.equal(record.session.checkpoint, snapshot) else { throw Self.failure }
             try mixedHistory(record, binding: binding, cancellation: cancellation); existing = record
         } else { existing = nil }
         let initial = existing?.operations.first?.before.payloadJSON ?? snapshot.payloadJSON
-        let reply = try mixedInvoke("attachmentDraftBeginV3", ["taskID": snapshot.taskID, "payloadJSON": initial],
+        let reply = try mixedInvoke(version == 4 ? "attachmentDraftBeginV4" : "attachmentDraftBeginV3", ["taskID": snapshot.taskID, "payloadJSON": initial],
                                     binding: binding, cancellation: cancellation)
-        guard Set(reply.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(reply["version"]) == 3,
+        guard Set(reply.keys) == Set(["version", "taskID", "payloadJSON"]), Self.integer(reply["version"]) == Int64(version),
               let task = reply["taskID"] as? String, Self.equal(task, snapshot.taskID),
               let payload = reply["payloadJSON"] as? String, Self.equal(payload, initial) else { throw Self.failure }
         try current(snapshot)
         if existing == nil {
-            let record = Store.MixedRecord(session: .init(sessionID: session, taskID: snapshot.taskID, state: .active, checkpoint: snapshot), operations: [])
+            let record = Store.MixedRecord(version: version, session: .init(sessionID: session, taskID: snapshot.taskID, state: .active, checkpoint: snapshot), operations: [])
             try store.preflightMixed(record)
             _ = try writeMixed(record, binding: nil, cancellation: cancellation)
             try current(snapshot)
         } else if let binding { try requireMixed(binding, cancellation) }
-        return try Self.json(["version": 3, "status": "begun", "sessionID": session, "generation": generation])
+        return try Self.json(["version": version, "status": "begun", "sessionID": session, "generation": generation])
     }
     func removeV3(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
         let request = try Self.removeRequest(raw)
@@ -558,7 +571,7 @@ final class NativeAttachmentDraftCoordinator {
         try current(record.session.checkpoint)
         var input = try mixedInput(record, payload: record.session.checkpoint.payloadJSON)
         input["requestId"] = request.id; input["attachmentId"] = request.attachmentID
-        let frozenJSON = try mixedInvokeJSON("attachmentDraftRemovePrepareV3", input, binding: loaded.binding, cancellation: cancellation)
+        let frozenJSON = try mixedInvokeJSON(record.version == 4 ? "attachmentDraftRemovePrepareV4" : "attachmentDraftRemovePrepareV3", input, binding: loaded.binding, cancellation: cancellation)
         let frozen = try Self.object(frozenJSON, limit: 2 * 1024 * 1024)
         guard let afterPayload = frozen["afterPayloadJSON"] as? String else { throw Self.failure }
         let before = record.session.checkpoint
@@ -797,11 +810,17 @@ final class NativeAttachmentDraftCoordinator {
         try store.preflightMixed(record)
     }
     func addV3(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try addMixed(raw, version: 3, cancellation: cancellation)
+    }
+    func addV4(_ raw: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        try addMixed(raw, version: 4, cancellation: cancellation)
+    }
+    private func addMixed(_ raw: String, version: Int, cancellation: NativeAttachmentCancellation) throws -> String {
         let request = try Self.request(raw, add: true)
         guard request.id.utf8.count == 36, request.session.utf8.count == 36 else { throw Self.failure }
         jobs.drain()
         let loaded = try mixedRead(cancellation), record = loaded.record
-        guard Self.equal(record.session.sessionID, request.session) else { throw Self.failure }
+        guard record.version == version, Self.equal(record.session.sessionID, request.session) else { throw Self.failure }
         let editorBinding = try mixedAddEditor(record)
         try requireMixedAdd(loaded.binding, editorBinding, cancellation)
         try mixedHistory(record, binding: loaded.binding, cancellation: cancellation)
@@ -828,7 +847,8 @@ final class NativeAttachmentDraftCoordinator {
         let sourceProof = try JSONDecoder().decode(Store.Source.self, from: Data(Self.json(sourceValue).utf8))
         var input = try mixedInput(record, payload: record.session.checkpoint.payloadJSON)
         input["requestId"] = request.id; input["picked"] = request.picked!; input["measuredSize"] = sourceProof.size
-        let frozenJSON = try mixedInvokeJSON("attachmentDraftPrepareV3", input, binding: loaded.binding, cancellation: cancellation)
+        if record.version == 4 { input["sourceSha256"] = sourceProof.sha256 }
+        let frozenJSON = try mixedInvokeJSON(record.version == 4 ? "attachmentDraftPrepareV4" : "attachmentDraftPrepareV3", input, binding: loaded.binding, cancellation: cancellation)
         try requireMixedAdd(loaded.binding, editorBinding, cancellation)
         let frozen = try Self.object(frozenJSON, limit: 2 * 1024 * 1024)
         guard let afterPayload = frozen["afterPayloadJSON"] as? String, let target = frozen["targetURI"] as? String else { throw Self.failure }
@@ -837,7 +857,7 @@ final class NativeAttachmentDraftCoordinator {
             generation: before.generation + 1, payloadJSON: afterPayload)
         let op = Store.Operation(requestId: request.id, requestJSON: request.json, phase: .intent,
             before: before, after: after, preparedJSON: frozenJSON, targetURI: target, source: sourceProof)
-        _ = try prepared(op)
+        _ = try prepared(op, version: record.version == 4 ? 2 : 1)
         let intent = mixedRecord(record, checkpoint: before, operations: record.operations + [.add(op)])
         try preflightMixedAdd(intent, admission: true)
         try mixedHistory(intent, binding: loaded.binding, cancellation: cancellation)
@@ -934,11 +954,11 @@ final class NativeAttachmentDraftCoordinator {
                 guard try JSONDecoder().decode(Store.Published.self, from: Data(Self.json(proof).utf8)) == op.published else { throw Self.failure }
                 if op.phase == .published {
                     try mixedAddBoundary(.beforeResult, binding: binding, editorBinding: editorBinding, cancellation: cancellation)
-                    let frozen = try prepared(op)
-                    let value = try mixedInvoke("attachmentDraftResult", ["prepared": frozen], binding: binding, cancellation: cancellation)
+                    let frozen = try prepared(op, version: record.version == 4 ? 2 : 1)
+                    let value = try mixedInvoke(record.version == 4 ? "attachmentDraftResultV4" : "attachmentDraftResult", ["prepared": frozen], binding: binding, cancellation: cancellation)
                     try requireMixedAdd(binding, editorBinding, cancellation)
                     guard Set(value.keys) == Set(["version", "kind", "taskID", "requestId", "afterPayloadJSON", "attachment"]),
-                          Self.integer(value["version"]) == 1, value["kind"] as? String == "added",
+                          Self.integer(value["version"]) == (record.version == 4 ? 2 : 1), value["kind"] as? String == "added",
                           value["taskID"] as? String == op.before.taskID, value["requestId"] as? String == op.requestId,
                           let payload = value["afterPayloadJSON"] as? String, Self.equal(payload, op.after.payloadJSON),
                           Self.equal(try Self.json(value["attachment"]!), try Self.json(frozen["attachment"]!)) else { throw Self.failure }
@@ -1070,15 +1090,17 @@ final class NativeAttachmentDraftCoordinator {
         let stages: [String]
     }
     enum MixedSaveSelection {
-        case legacy, complete
-        var envelopeVersion: Int { self == .complete ? 2 : 1 }
-        var wrapperVersion: Int { self == .complete ? 3 : 2 }
-        var allowsEmptyHistory: Bool { self == .complete }
+        case legacy, complete, completeHash
+        var isComplete: Bool { self != .legacy }
+        var envelopeVersion: Int { self == .completeHash ? 3 : (isComplete ? 2 : 1) }
+        var wrapperVersion: Int { self == .completeHash ? 4 : (isComplete ? 3 : 2) }
+        var historyVersion: Int { self == .completeHash ? 4 : 3 }
+        var allowsEmptyHistory: Bool { isComplete }
     }
     static func mixedSaveLineageJSON(_ record: Store.MixedRecord, managedDirectoryURI: String,
                                     selection: MixedSaveSelection = .legacy) throws -> String {
         _ = try Store.mixedFingerprint(record)
-        guard record.session.state == .active, selection.allowsEmptyHistory || !record.operations.isEmpty, record.discard == nil,
+        guard record.version == selection.historyVersion, record.session.state == .active, selection.allowsEmptyHistory || !record.operations.isEmpty, record.discard == nil,
               record.checkpointAdvance == nil, record.operations.allSatisfy({ entry in
                   if case .add(let op) = entry { return op.phase == .checkpointed && op.reason == nil }
                   return entry.checkpointed
@@ -1089,7 +1111,7 @@ final class NativeAttachmentDraftCoordinator {
             case .remove(let op): return ["kind": "remove", "operation": try object(op.preparedJSON, limit: 2 * 1024 * 1024)]
             }
         }
-        return try json(["version": 3, "taskID": record.session.taskID,
+        return try json(["version": record.version, "taskID": record.session.taskID,
             "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
             "beforePayloadJSON": record.session.checkpoint.payloadJSON, "priorOperations": operations, "managedDirectoryURI": managedDirectoryURI])
     }
@@ -1133,11 +1155,11 @@ final class NativeAttachmentDraftCoordinator {
     func checkResumeV3(_ snapshot: EditorDraftSnapshot, cancellation: NativeAttachmentCancellation) throws -> String {
         jobs.drain()
         let loaded = try mixedRead(cancellation), record = loaded.record
-        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: .complete)
+        let lineage = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: record.version == 4 ? .completeHash : .complete)
         guard Self.equal(record.session.checkpoint, snapshot) else { throw Self.failure }
         try current(snapshot)
         let checkpoint = try Self.object(String(decoding: JSONEncoder().encode(snapshot), as: UTF8.self))
-        let request: [String: Any] = ["version": 1, "kind": "owned-editor-resume", "checkpoint": checkpoint,
+        let request: [String: Any] = ["version": record.version == 4 ? 2 : 1, "kind": "owned-editor-resume", "checkpoint": checkpoint,
                                      "ownedDraft": try Self.object(lineage)]
         // Account for Foundation's actual nested escaping before the first
         // shared invocation, including historical lineage validation.
@@ -1205,12 +1227,12 @@ final class NativeAttachmentDraftCoordinator {
                                   cancellation: NativeAttachmentCancellation) throws {
         jobs.drain(); try requireOwner(); try cancellation.check()
         _ = try Self.mixedSaveLineageJSON(record, managedDirectoryURI: managedURI, selection: selection)
-        for entry in record.operations { _ = try mixedPrepared(entry) }
+        for entry in record.operations { _ = try mixedPrepared(entry, version: record.version) }
         let envelope = try Self.object(envelopeJSON)
         guard let prepared = envelope["prepared"] as? [String: Any], Self.integer(prepared["version"]) == Int64(selection.envelopeVersion),
               let decision = prepared["decision"] as? [String: Any] else { throw Self.failure }
         let afterTasks: [[String: Any]]
-        if selection == .complete {
+        if selection.isComplete {
             guard let request = envelope["request"] as? [String: Any], let save = request["saveRequest"] as? [String: Any],
                   let id = save["id"] as? String, let proof = decision["prepared"] as? [String: Any] else { throw Self.failure }
             switch decision["kind"] as? String {
@@ -1242,7 +1264,7 @@ final class NativeAttachmentDraftCoordinator {
         for op in Self.mixedSaveAdds(record) where attachments.contains(where: {
             // Recurrence clones attachment IDs while sharing the exact file
             // URI. Complete effects must prove those child references too.
-            (selection == .complete || ($0["id"] as? String).map { Self.equal($0, op.requestId) } == true)
+            (selection.isComplete || ($0["id"] as? String).map { Self.equal($0, op.requestId) } == true)
                 && ($0["uri"] as? String).map { Self.equal($0, op.targetURI) } == true && $0["kind"] as? String == "file"
                 && ($0["deletedAt"] == nil || $0["deletedAt"] is NSNull)
         }) {
@@ -1484,9 +1506,9 @@ final class NativeAttachmentDraftCoordinator {
             "sessionID": checkpoint.sessionID])
         let session = Store.Session(sessionID: record.session.sessionID, taskID: record.session.taskID,
             state: .cleanupPending, checkpoint: checkpoint)
-        let decided = Store.MixedRecord(session: session, operations: record.operations,
+        let decided = Store.MixedRecord(version: record.version, session: session, operations: record.operations,
             discard: .init(requestId: request.id, requestJSON: request.json, expected: checkpoint, phase: .decided))
-        let detached = Store.MixedRecord(session: session, operations: record.operations,
+        let detached = Store.MixedRecord(version: record.version, session: session, operations: record.operations,
             discard: .init(requestId: request.id, requestJSON: request.json, expected: checkpoint, phase: .detached, replyJSON: reply))
         if let existing = record.discard, let retainedReply = existing.replyJSON {
             guard Self.equal(retainedReply, reply) else { throw Self.failure }
@@ -1521,7 +1543,7 @@ final class NativeAttachmentDraftCoordinator {
         jobs.drain(); try requireMixed(binding, cancellation)
         guard record.checkpointAdvance == nil else { throw Self.failure }
         let adds = try Self.mixedDiscardAdds(record)
-        for entry in record.operations { _ = try mixedPrepared(entry) }
+        for entry in record.operations { _ = try mixedPrepared(entry, version: record.version) }
         if let discard = record.discard {
             _ = try prepareMixedDiscardDecision(discard.requestJSON, record: record)
         }
@@ -1531,17 +1553,17 @@ final class NativeAttachmentDraftCoordinator {
             case .remove(let op): return ["kind": "remove", "phase": op.phase.rawValue, "preparedJSON": op.preparedJSON]
             }
         }
-        let input: [String: Any] = ["version": 2, "historyVersion": 3, "taskID": record.session.taskID,
+        let input: [String: Any] = ["version": record.version == 4 ? 3 : 2, "historyVersion": record.version, "taskID": record.session.taskID,
             "managedDirectoryURI": managedURI,
             "initialPayloadJSON": record.operations.first?.before.payloadJSON ?? record.session.checkpoint.payloadJSON,
             "checkpointPayloadJSON": record.session.checkpoint.payloadJSON, "operations": operations]
         let encoded = try Self.json(input)
         guard encoded.utf8.count <= 8 * 1024 * 1024 else { throw Self.failure }
         try requireMixed(binding, cancellation)
-        let response = try Self.object(invoke("attachmentDraftDiscardCandidatesV3", [encoded]), limit: 4 * 1024 * 1024)
+        let response = try Self.object(invoke(record.version == 4 ? "attachmentDraftDiscardCandidatesV4" : "attachmentDraftDiscardCandidatesV3", [encoded]), limit: 4 * 1024 * 1024)
         try requireMixed(binding, cancellation)
         guard Set(response.keys) == Set(["version", "kind", "historyVersion", "taskID", "candidates"]),
-              Self.integer(response["version"]) == 2, Self.integer(response["historyVersion"]) == 3,
+              Self.integer(response["version"]) == (record.version == 4 ? 3 : 2), Self.integer(response["historyVersion"]) == Int64(record.version),
               response["kind"] as? String == "owned-mixed-discard-candidates",
               let task = response["taskID"] as? String, Self.equal(task, record.session.taskID),
               let candidates = response["candidates"] as? [[String: Any]], candidates.count == adds.count else { throw Self.failure }
@@ -1556,7 +1578,7 @@ final class NativeAttachmentDraftCoordinator {
 
     func promotedMixedDiscard(_ record: Store.MixedRecord, proof: Store.Published) throws -> Store.MixedRecord {
         guard let last = record.operations.last, case .add(let op) = last, op.phase == .stageFilled else { throw Self.failure }
-        return Store.MixedRecord(session: record.session,
+        return Store.MixedRecord(version: record.version, session: record.session,
             operations: Array(record.operations.dropLast()) + [.add(advancing(op, phase: .published, published: proof, reason: op.reason))],
             discard: record.discard, checkpointAdvance: record.checkpointAdvance)
     }
@@ -1630,7 +1652,7 @@ final class NativeAttachmentDraftCoordinator {
         return try Self.summary(record)
     }
     private func addReply(_ op: Store.Operation) throws -> String {
-        try Self.json(["version": 1, "status": "added", "requestId": op.requestId, "sessionID": op.after.sessionID, "generation": op.after.generation])
+        try Self.json(["version": Self.integer(try Self.object(op.preparedJSON)["version"]) == 2 ? 2 : 1, "status": "added", "requestId": op.requestId, "sessionID": op.after.sessionID, "generation": op.after.generation])
     }
     private func replacing(_ record: Store.Record, _ op: Store.Operation) -> Store.Record {
         let checkpoint = op.phase == .checkpointed ? op.after : record.session.checkpoint

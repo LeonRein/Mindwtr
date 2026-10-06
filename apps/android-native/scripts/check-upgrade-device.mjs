@@ -28,7 +28,9 @@
 //       field of every entity and the settings equal core's plan for the backup;
 //   6   an RN user's WebDAV sync: RN v1.3.2 configures WebDAV in its own Sync screen against a local
 //       folder (sync-harness.mjs, through adb reverse); the native app finds RN's keys in RKStorage and
-//       the password in RN's secret store, shows them on its Sync screen, and syncs with them.
+//       the password in RN's secret store, shows them on its Sync screen, and syncs with them. RN's background sync
+//       worker (EXPO_BACKGROUND_WORKER in WorkManager's database) is gone after the native app's first start, and the
+//       native background sync job is scheduled once (pass S4a).
 //   7   an RN user's reminder alarms (task reminders turned on in RN's database): RN v1.3.2 sets its alarm for a task due in two hours (`dumpsys alarm`: one alarm to its
 //       library's AlarmReceiver); the native app's first start cancels it, deletes RN's alarm database and map, and sets its own
 //       alarm for the same task: RN's gone, the native one present, once each. Then the RN 154 recovery build over the native
@@ -153,8 +155,7 @@ const until = async (description, predicate, timeoutMs = 30_000) => {
     fail(`timed out waiting for ${description}`);
 };
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await until('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 const openLink = (url) => {
     const current = front();
@@ -205,10 +206,19 @@ const checkLedger = (label, after) => {
     check(entries.length > 0 && entries.every(([, id, value]) => /^\d+$/.test(id) && /^(armed|fired):\d+$/.test(value)) && other === '',
         `(${label}) the native reminder ledger holds only alarm ids and their times (${entries.length})`);
 };
+// The native app's owed-upload count (pass S4a, CoreWork.owedUploads): its own new file, written when a drain stores queued items
+// (a capture RN left), so a closed-app capture job that dies still sends them. Allowed only as a new file holding that one count.
+const OWED_UPLOADS = 'shared_prefs/mindwtr-background-sync.xml';
+const checkOwedUploads = (label, after) => {
+    if (!after.has(OWED_UPLOADS)) return;
+    const text = runAs(`cat ${OWED_UPLOADS}`);
+    const other = text.replace(/<\?xml[^>]*>|<\/?map\s*\/?>|<int name="owedUploads" value="\d+" \/>/g, '').trim();
+    check(/<int name="owedUploads" value="\d+" \/>/.test(text) && other === '', `(${label}) the native owed-upload count file holds only its count`);
+};
 const differences = (before, after, { changedOk = () => false, newOk = () => false } = {}) => [
     ...[...before].filter(([path, hash]) => !isPlatformState(path) && !changedOk(path) && after.get(path) !== hash)
         .map(([path]) => `${after.has(path) ? 'changed' : 'removed'} ${path}`),
-    ...[...after.keys()].filter((path) => !before.has(path) && !isPlatformState(path) && !newOk(path) && path !== LEDGER).map((path) => `new ${path}`),
+    ...[...after.keys()].filter((path) => !before.has(path) && !isPlatformState(path) && !newOk(path) && path !== LEDGER && path !== OWED_UPLOADS).map((path) => `new ${path}`),
 ];
 const isDatabase = (path) => /^files\/SQLite\/mindwtr\.db(-wal|-shm)?$/.test(path);
 
@@ -319,6 +329,21 @@ const pullAsyncStorage = (name) => {
     return resolve(dir, 'RKStorage');
 };
 const asyncStorage = (name) => new Map(rows(pullAsyncStorage(name), 'SELECT key, value FROM catalystLocalStorage').map(({ key, value }) => [key, value]));
+/** WorkManager's unfinished work under [name] (ENQUEUED 0, RUNNING 1, BLOCKED 4), from a pulled copy of its database. */
+const unfinishedWork = (label, name) => {
+    const dir = resolve(work, label);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    // WorkManager keeps its database in no_backup/ (RN's and the native app's alike).
+    const present = runAs('ls no_backup').split(/\s+/);
+    for (const file of ['androidx.work.workdb', 'androidx.work.workdb-wal']) {
+        if (present.includes(file)) pull(`no_backup/${file}`, resolve(dir, file));
+    }
+    return rows(resolve(dir, 'androidx.work.workdb'), `SELECT s.id FROM WorkName n JOIN WorkSpec s ON s.id = n.work_spec_id WHERE n.name = '${name}' AND s.state IN (0, 1, 4)`);
+};
+// RN's background sync worker (expo-background-task's) and the native job that replaces it (pass S4a, CoreWork.SYNC_WORK).
+const RN_SYNC_WORK = 'EXPO_BACKGROUND_WORKER';
+const NATIVE_SYNC_WORK = 'mindwtr-core-background-sync';
 // INJECTED: runs `statements` on a host copy of RKStorage, then pushes it back as one main file.
 const rewriteAsyncStorage = (name, statements) => {
     const copy = pullAsyncStorage(name);
@@ -526,6 +551,7 @@ const scenarioUpgrade = async () => {
         newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` || isAsyncStorage(path) || isRnCheckpoint(path) || isWidgetPayload(path),
     });
     checkLedger('1', after);
+    checkOwedUploads('1', after);
     check(changed.length === 0, `(1) every other non-database file is unchanged but RN's widget payload (${[...before.keys()].filter((path) => !isDatabase(path)).length} files)${shortList(changed)}`);
     verifyWidgetPayload('1', widgetsBefore, published);
     return { t, pre, queued };
@@ -829,6 +855,7 @@ const scenarioMissingWithBackup = async () => {
     });
     check(changed.length === 0, `(5b) every other file is unchanged but RN's widget payload${shortList(changed)}`);
     checkLedger('5b', after);
+    checkOwedUploads('5b', after);
     verifyWidgetPayload('5b', widgetsBefore, published);
 };
 
@@ -910,12 +937,17 @@ const scenarioSync = async () => {
         check(rnKeys.get('@mindwtr_sync_backend') === 'webdav' && rnKeys.get('@mindwtr_webdav_url') === url && rnKeys.get('@mindwtr_webdav_username') === user,
             '(6) RN stored its WebDAV backend, URL and username in RKStorage');
         check(/name="key_v1-mindwtr_webdav_password"/.test(runAs('cat shared_prefs/SecureStore.xml')), '(6) RN sealed the password in its secret store');
+        check(unfinishedWork('6-rn-workdb', RN_SYNC_WORK).length === 1, '(6) RN scheduled its background sync worker for the WebDAV backend');
 
         // The native app over it: RN's keys found in place, shown on its Sync screen, and used for a sync.
         install(APKS.native153, true);
         device.launch(NATIVE_ACTIVITY);
         await nativeScreen();
         await until('the native app to start sync', () => device.logs(pid(), TAG).includes('Native Android sync started'), 30_000);
+        // Pass S4a: the first native start cancelled RN's worker, and core's decision scheduled the native job, once.
+        await until('the native background sync job', () => unfinishedWork('6-native-workdb', NATIVE_SYNC_WORK).length === 1, 30_000);
+        check(unfinishedWork('6-native-workdb', RN_SYNC_WORK).length === 0, '(6) the native app\'s first start cancelled RN\'s background sync worker');
+        check(unfinishedWork('6-native-workdb', NATIVE_SYNC_WORK).length === 1, '(6) the native background sync job is scheduled once');
         nodes = await screen();
         const sheet = (current) => Boolean(tagged(current, 'more-sheet'));
         await tap(tab(nodes, en['tab.menu']) ?? fail('no Menu tab'));
@@ -998,8 +1030,18 @@ const scenarioAlarms = async () => {
     queue([item]);
     device.launch(RN_ACTIVITY);
     await drained([item], 'the timed capture');
+    const rnAlarmed = () => packageAlarms().some((alarm) => alarm.rn && rnMinute(alarm) === dueAt);
     try {
-        await until('RN\'s alarm for the task', () => packageAlarms().some((alarm) => alarm.rn && rnMinute(alarm) === dueAt), 60_000);
+        await until('RN\'s alarm for the task', rnAlarmed, 30_000);
+    } catch {
+        // RN 1.3.2 subscribes to its store only after its first reminder cycle, so a capture its startup import adds while that
+        // cycle runs gets no alarm (fixed in RN since, v1.3.5/reminder-startup-subscribe). Its next start arms the stored task.
+        console.log('info - RN 1.3.2 armed no alarm for the task its startup imported (its startup race); RN started once more');
+        await killWithoutStop();
+        device.launch(RN_ACTIVITY);
+    }
+    try {
+        await until('RN\'s alarm for the task', rnAlarmed, 60_000);
     } catch (error) {
         console.log(`evidence - due ${dueAt} (${item.title}); this package's alarm lines:\n${sh('dumpsys alarm').split('\n').filter((line) => line.includes(PKG) || /origWhen/.test(line)).slice(0, 30).join('\n')}`);
         console.log(`evidence - RN's map: ${asyncStorage('7-evidence').get('mindwtr:local:alarms:v1')}`);

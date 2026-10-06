@@ -40,7 +40,7 @@ if (!serial) {
 }
 const app = resolve(import.meta.dirname, '..');
 const repo = resolve(app, '../..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const bundle = resolve(app, 'android/app/src/main/assets/core-host.js');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
@@ -271,8 +271,7 @@ try {
     cloud = await startCloud({ repo, port: CLOUD_PORT, token: TOKEN, dataDir: resolve(work, `cloud-${run}`) });
     for (const port of [WEBDAV_PORT, CLOUD_PORT]) execFileSync(adbBin, ['-s', serial, 'reverse', `tcp:${port}`, `tcp:${port}`], { stdio: 'inherit' });
     execFileSync(adbBin, ['-s', serial, 'install', '-r', apk], { stdio: 'inherit' });
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     await waitFor('the Inbox', onInbox, 60_000);

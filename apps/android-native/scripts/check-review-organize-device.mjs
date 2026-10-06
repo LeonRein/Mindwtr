@@ -31,7 +31,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -365,8 +365,7 @@ const removeFixtures = async () => {
     try {
         const current = front();
         if (!current.includes(`${PKG}/`) && !current.includes(`${home}/`)) throw new Error(`another app is in front: ${current.trim()}`);
-        sh(`am force-stop ${PKG}`);
-        await waitFor('the app process to end', () => pid() === '', 10_000);
+        await device.stopApp();
         const db = pullDatabase('remove');
         const removed = core('remove', db);
         adbRaw('push', db, STAGED);
@@ -421,8 +420,7 @@ try {
     sh('settings put system accelerometer_rotation 0');
     sh('settings put system user_rotation 0');
     await waitFor('the Inbox', onInbox, 60_000);
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     const db = pullDatabase('inject');
     injected = core('inject', db);
     check(!existsSync(`${db}-wal`) || statSync(`${db}-wal`).size === 0, `the areas, project and six tasks of run ${run} are in the main database file`);

@@ -140,8 +140,9 @@ export const abandonSyncEncryptionTransition = (): Promise<SyncEncryptionTransit
     encryptionService().abandonSyncEncryptionTransition();
 
 /** Whether the sync location holds ciphertext beside plaintext (a sample of its attachments; core's probeSyncLocationCiphertext). */
-export const probeSyncLocationCiphertext = (): Promise<'plaintext' | 'encrypted' | 'mixed'> =>
-    encryptionService().probeSyncLocationCiphertext();
+export const probeSyncLocationCiphertext = (
+    target?: { webdav?: { url: string; username?: string; password?: string; allowInsecureHttp?: boolean } },
+): Promise<'plaintext' | 'encrypted' | 'mixed'> => encryptionService().probeSyncLocationCiphertext(target ?? {});
 
 /** "Check this location again" for a location held as partly encrypted (core's recheckPartlyEncryptedLocation). */
 export const recheckPartlyEncryptedLocation = (): Promise<'plaintext' | 'encrypted' | 'mixed'> =>

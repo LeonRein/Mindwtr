@@ -701,9 +701,10 @@ describe('mobile sync-service runtime', () => {
 
       expect(result.success).toBe(true);
       expect(coreMocks.webdavGetJson).toHaveBeenCalled();
-      // Only the post-merge phase ran the attachment check — the prepare phase (before the
-      // read) was skipped outright, not merely "found nothing pending".
-      expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(1);
+      // Only the post-merge phase ran an attachment pass — the prepare phase (before the read)
+      // was skipped outright. Its deferral only asked whether work is owed (once), so the
+      // unchanged-document skip cannot drop the post-merge pass (v1.3.5/deferred-attachment-pass).
+      expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(2);
       expect(attachmentSyncMocks.syncWebdavAttachments).toHaveBeenCalledTimes(1);
       const skipped = (logMocks.logInfo.mock.calls as unknown as [string, { extra?: Record<string, string> }][])
         .filter((call) => call[0] === 'Attachment pre-sync skipped');
@@ -749,9 +750,10 @@ describe('mobile sync-service runtime', () => {
         });
 
         expect(result.success).toBe(true);
-        // Only the post-merge phase ran the attachment check — the prepare phase (before the
-        // read) was skipped outright, not merely "found nothing pending".
-        expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(1);
+        // Only the post-merge phase ran an attachment pass — the prepare phase (before the read)
+        // was skipped outright. Its deferral only asked whether work is owed (once), so the
+        // unchanged-document skip cannot drop the post-merge pass (v1.3.5/deferred-attachment-pass).
+        expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(2);
         expect(attachmentSyncMocks.syncFileAttachments).toHaveBeenCalledTimes(1);
         const skipped = (logMocks.logInfo.mock.calls as unknown as [string, { extra?: Record<string, string> }][])
           .filter((call) => call[0] === 'Attachment pre-sync skipped');
@@ -2617,5 +2619,85 @@ describe('mobile sync-service runtime', () => {
       'Sync aborted by app lifecycle transition',
       expect.objectContaining({ scope: 'sync' }),
     );
+  });
+
+  it('keeps a background deadline stop through a lifecycle abort during its cleanup: a failure, no follow-up (review S4a 1)', async () => {
+    const dataWithAttachment: AppData = {
+      tasks: [
+        {
+          id: 'task-attachment',
+          title: 'Attachment task',
+          status: 'inbox',
+          tags: [],
+          contexts: [],
+          createdAt: '2026-05-01T00:00:00.000Z',
+          updatedAt: '2026-05-01T00:00:00.000Z',
+          attachments: [
+            {
+              id: 'att-lifecycle',
+              kind: 'file',
+              title: 'large.txt',
+              uri: 'file://document/attachments/large.txt',
+              localStatus: 'available',
+              createdAt: '2026-05-01T00:00:00.000Z',
+              updatedAt: '2026-05-01T00:00:00.000Z',
+            },
+          ],
+        },
+      ],
+      projects: [],
+      sections: [],
+      areas: [],
+      settings: {},
+    };
+    let uploadSignal: AbortSignal | undefined;
+    let uploadFenceAssertion: ((minRemainingMs?: number) => Promise<void>) | undefined;
+    let releaseUploadStart!: () => void;
+    const uploadStarted = new Promise<void>((resolve) => {
+      releaseUploadStart = resolve;
+    });
+
+    asyncStorageMocks.getItem.mockImplementation(async (key: string) => {
+      const values: Record<string, string | null> = {
+        '@mindwtr_sync_backend': 'cloud',
+        '@mindwtr_cloud_provider': 'selfhosted',
+        '@mindwtr_cloud_url': 'https://cloud.example/v1/data',
+        '@mindwtr_cloud_token': 'token',
+      };
+      return values[key] ?? null;
+    });
+    storageMocks.getData.mockResolvedValue(dataWithAttachment);
+    coreMocks.getInMemoryAppDataSnapshot.mockReturnValue(dataWithAttachment);
+    coreMocks.cloudGetJson.mockResolvedValue(emptyData);
+    attachmentSyncMocks.hasPendingAttachmentSyncWork.mockResolvedValue(true);
+    attachmentSyncMocks.syncCloudAttachments.mockImplementation(async (_data, _config, _baseUrl, options) => {
+      uploadSignal = options?.signal;
+      uploadFenceAssertion = options?.assertRemoteMutationFenceHeld;
+      releaseUploadStart();
+      await new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () => reject(new Error('Upload aborted by lifecycle')), { once: true });
+      });
+      return false;
+    });
+
+    const syncPromise = syncServiceModule.performMobileSync();
+    await uploadStarted;
+
+    expect(uploadSignal?.aborted).toBe(false);
+    expect(uploadFenceAssertion).toBeTypeOf('function');
+    // The background run's deadline, then the app closing while the cycle winds down.
+    expect(syncServiceModule.abortMobileSync('deadline')).toBe(true);
+    expect(syncServiceModule.abortMobileSync()).toBe(true);
+
+    const result = await syncPromise;
+
+    expect(uploadSignal?.aborted).toBe(true);
+    expect(result.success).toBe(false);
+    expect(coreMocks.cloudGetJson).not.toHaveBeenCalled();
+    expect(logMocks.logInfo).toHaveBeenCalledWith(
+      'Sync aborted at the background run\'s deadline',
+      expect.objectContaining({ scope: 'sync' }),
+    );
+    expect(logMocks.logInfo).not.toHaveBeenCalledWith('Sync aborted by app lifecycle transition', expect.anything());
   });
 });

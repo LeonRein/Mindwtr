@@ -38,7 +38,7 @@ if (!serial) {
 }
 const app = resolve(import.meta.dirname, '..');
 const repo = resolve(app, '../..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const bundle = resolve(app, 'android/app/src/main/assets/core-host.js');
 const adbBin = process.env.ADB ?? '/opt/android-sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
@@ -258,9 +258,8 @@ try {
     lost = await serveWebdav({ port: LOST_PORT, username: USER, password: PASSWORD });
     for (const port of [WEBDAV_PORT, WEAK_PORT, LOST_PORT]) execFileSync(adbBin, ['-s', serial, 'reverse', `tcp:${port}`, `tcp:${port}`], { stdio: 'inherit' });
     execFileSync(adbBin, ['-s', serial, 'install', '-r', apk], { stdio: 'inherit' });
-    sh(`am force-stop ${PKG}`);
     sh(`setprop debug.mindwtr.native.crypto_delay_ms ${DELAY_MS}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     await waitFor('the Inbox', onInbox, 60_000);
@@ -388,8 +387,7 @@ try {
 
     // (5) A restart: the key stays sealed on the phone, so sync goes on with no passphrase.
     const argonTotal = argonTimes();
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await second.capture(titles.restart);
     await second.syncNow('webdav', { ...fields(WEBDAV_PORT), password: null });
     device.launch(ACTIVITY);

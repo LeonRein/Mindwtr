@@ -25,7 +25,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -112,7 +112,11 @@ const sheetShowing = async (description) => {
         return r > l && b > t && t >= box(sheet)[1] && b <= box(sheet)[3];
     };
     let nodes = await screen();
-    for (let step = 0; step < 6 && !shown(nodes); step += 1) {
+    // The sheet lists every context and tag first, so a long-used library needs many swipes: stop once a swipe moves nothing.
+    for (let step = 0, last = ''; step < 60 && !shown(nodes); step += 1) {
+        const seen = nodes.map((node) => `${node.text}|${node.bounds}`).join(';');
+        if (seen === last) break;
+        last = seen;
         // The sheet's column starts under its "Filters" heading; the results list behind it starts higher.
         const heading = nodes.find((node) => node.text === en['filters.label'] && node.class === 'android.widget.TextView') ?? fail('no filter sheet');
         const sheet = nodes.filter((node) => node.scrollable === 'true' && box(node)[1] >= box(heading)[3])

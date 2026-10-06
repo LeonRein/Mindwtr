@@ -1199,9 +1199,9 @@ export async function startLocalMobileNotifications(): Promise<void> {
   }
 
   attachNativeEventListeners();
-  await queueRescheduleCycle(api, { deleteStale: true });
-  logNotificationInfo('Service started');
-
+  // Subscribed before the first cycle: a task the startup import adds while that cycle awaits the native module would
+  // otherwise get no alarm until some later store change.
+  let startupCycleRunning = true;
   storeSubscription?.();
   storeSubscription = useTaskStore.subscribe(nameNotifyListener('notification-reschedule', (state, prevState) => {
     // Reschedule cycles only read tasks, projects, and a handful of settings
@@ -1212,12 +1212,23 @@ export async function startLocalMobileNotifications(): Promise<void> {
     if (!shouldRescheduleReminderAlarms(state, prevState)) {
       return;
     }
+    if (startupCycleRunning) {
+      logNotificationInfo('Store changed during the startup cycle; reschedule queued', {
+        releaseCheck: 'v1.3.5/reminder-startup-subscribe',
+      });
+    }
     clearRescheduleTimer();
     rescheduleTimer = setTimeout(() => {
       rescheduleTimer = null;
       enqueueReschedule(api);
     }, REMINDER_STORE_RESCHEDULE_DELAY_MS);
   }));
+  try {
+    await queueRescheduleCycle(api, { deleteStale: true });
+  } finally {
+    startupCycleRunning = false;
+  }
+  logNotificationInfo('Service started');
 }
 
 // AlarmManager decides exact vs inexact when the alarm is *created*, so alarms

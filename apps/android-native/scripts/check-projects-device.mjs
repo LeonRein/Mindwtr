@@ -53,7 +53,7 @@ if (!serial || cliArgs.some((arg) => arg.startsWith('--') && arg !== '--prune-ol
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -109,8 +109,7 @@ const goHome = async () => {
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
 };
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 
 // ---- UI (core's English labels: nav.projects, projects.closed, common.back, common.done, common.more, common.close) ----
@@ -276,7 +275,8 @@ const core = (db, mode, extra = {}) => JSON.parse(execFileSync('bun', ['-e', `
             // injected task and the 2-3 of its two captures), entry points 77 (plus the 1 of its shared text; 2 to 8 are never saved),
             // the capture screen 79 (plus the 0-8 of its captures; 3 and 4 are never saved),
             // the runner 80 (plus the 1-9 of its captures), the widgets 94 (plus the 1-6 of its captures),
-            // sync 93 (plus the 1-4 of its four captures) and its two emoji titles (a 12-digit run id after them), attachments 94.
+            // sync 93 (plus the 1-4 of its four captures) and its two emoji titles (a 12-digit run id after them), attachments 94,
+            // reminders 87 (plus one digit; its recurring task's next instance stays due, under Focus's Today, after every run).
             // No other title matches. [0-9], not \\d: this code sits in a template literal, which drops the backslash.
             const shapes = {
                 lifecycle: /^8[1-6][0-9]{12}$/,
@@ -297,6 +297,7 @@ const core = (db, mode, extra = {}) => JSON.parse(execFileSync('bun', ['-e', `
                 runner: /^80[0-9]{12}[1-9]$/,
                 attachments: /^94[0-9]{12}$/,
                 widgets: /^94[0-9]{12}[1-6]$/,
+                reminders: /^87[0-9]{12}[0-9]$/,
             };
             for (const [check, shape] of Object.entries(shapes)) {
                 const ids = live(store()._allTasks).filter((item) => shape.test(item.title)).map((item) => item.id);

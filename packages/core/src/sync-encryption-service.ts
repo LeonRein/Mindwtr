@@ -777,9 +777,9 @@ export const createSyncEncryptionService = <Lease>(deps: SyncEncryptionServiceDe
         return result;
     };
 
-    const createWebdavRemotePort = async (appData: AppData | null): Promise<TransitionRemotePort> => {
+    const createWebdavRemotePort = async (appData: AppData | null, override?: SyncEncryptionWebDavConfig): Promise<TransitionRemotePort> => {
         void appData;
-        const config = await deps.loadWebDavConfig();
+        const config = override ?? await deps.loadWebDavConfig();
         if (!config?.url) throw new Error('WebDAV is not configured');
         const baseSyncUrl = getBaseSyncUrl(config.url);
         const requestOptions = {
@@ -879,8 +879,11 @@ export const createSyncEncryptionService = <Lease>(deps: SyncEncryptionServiceDe
      * transition seals or opens attachments one at a time in that order, so one it cut off leaves the first sealed and the
      * last not (enable) or the other way round (disable). `full` reads every artifact.
      */
-    const probeSyncLocationCiphertext = async (options: { full?: boolean } = {}): Promise<SyncLocationCiphertext> => {
-        const target = await resolveTransitionTarget(null);
+    const probeSyncLocationCiphertext = async (
+        options: { full?: boolean; webdav?: SyncEncryptionWebDavConfig } = {},
+    ): Promise<SyncLocationCiphertext> => {
+        const target = options.webdav ? { kind: 'remote' as const, port: await createWebdavRemotePort(null, options.webdav) }
+            : await resolveTransitionTarget(null);
         if (target.kind !== 'remote') return 'plaintext';
         return runWithFileTransitionLease(target, async (port) => {
             const entries = await port.list();

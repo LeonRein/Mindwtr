@@ -3,6 +3,7 @@ import UIKit
 import LinkPresentation
 import UniformTypeIdentifiers
 import QuickLook
+import PhotosUI
 
 private struct TaskDraftDirection: ViewModifier {
     let direction: LayoutDirection
@@ -100,6 +101,8 @@ struct TaskViewSheet: View {
                 Group {
                     if presentation.kind == .file {
                         AttachmentFileActivitySheet(presentation: presentation)
+                    } else if presentation.kind == .audio {
+                        TaskAttachmentAudioSheet(model: model, palette: palette, presentationID: presentation.id)
                     } else {
                         NavigationStack {
                             AttachmentFileQuickLookSheet(presentation: presentation)
@@ -119,14 +122,24 @@ struct TaskViewSheet: View {
             }
         .sheet(item: Binding(
             get: {
-                guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented else { return nil }
-                return TaskDocumentPickerClaim(id: pickerID)
+                guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented,
+                      let kind = model.taskFileImporterKind else { return nil }
+                return TaskAttachmentPickerClaim(id: pickerID, kind: kind)
             },
-            set: { (claim: TaskDocumentPickerClaim?) in
+            set: { (claim: TaskAttachmentPickerClaim?) in
                 if claim == nil { model.setTaskFileImporterPresented(false, pickerID: pickerID) }
             })) { claim in
-                TaskDocumentPicker(pickerID: claim.id) { result, capturedID in
-                    Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
+                Group {
+                    switch claim.kind {
+                    case .file:
+                        NativeDocumentPicker(pickerID: claim.id) { result, capturedID in
+                            Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
+                        }
+                    case .photo:
+                        NativePhotoPicker(pickerID: claim.id) { result, capturedID in
+                            Task { await model.completeTaskPhotoImport(result, pickerID: capturedID) }
+                        }
+                    }
                 }
                 .id(claim.id)
                 .interactiveDismissDisabled()
@@ -1242,22 +1255,38 @@ struct TaskViewSheet: View {
             } label: {
                 Label(strings.text("attachments.addLink"), systemImage: "link")
                     .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(palette.tint)
             .accessibilityIdentifier("task-attachment-add-link")
             Button {
                 endEditingBeforeAction()
                 Task {
-                    guard let id = await model.prepareTaskFileImport() else { return }
+                    guard let id = await model.prepareTaskFileImport(), id == model.taskFileImporterID else { return }
                     fileImporterID = id
                 }
             } label: {
                 Label(strings.text("attachments.addFile"), systemImage: "paperclip")
                     .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(palette.tint)
             .disabled(frozen || !model.canAddTaskFile)
             .accessibilityIdentifier("task-attachment-add-file")
+            Button {
+                endEditingBeforeAction()
+                Task {
+                    guard let id = await model.prepareTaskPhotoImport(), id == model.taskFileImporterID else { return }
+                    fileImporterID = id
+                }
+            } label: {
+                Label(strings.text("attachments.addPhoto"), systemImage: "photo")
+                    .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(palette.tint)
+            .disabled(frozen || !model.canAddTaskFile)
+            .accessibilityIdentifier("task-attachment-add-photo")
         }
     }
 
@@ -1401,11 +1430,58 @@ struct TaskViewSheet: View {
 
 }
 
-private struct TaskDocumentPickerClaim: Identifiable {
+private struct TaskAttachmentPickerClaim: Identifiable {
+    let id: UUID
+    let kind: CoreModel.TaskAttachmentPickerKind
+}
+
+private struct NativePhotoPicker: UIViewControllerRepresentable {
+    let pickerID: UUID
+    let completion: (Result<[NSItemProvider], Error>, UUID) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(pickerID: pickerID, completion: completion) }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration()
+        configuration.filter = .images
+        configuration.selectionLimit = 1
+        configuration.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: configuration)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let pickerID: UUID
+        let completion: (Result<[NSItemProvider], Error>, UUID) -> Void
+        private var delivered = false
+
+        init(pickerID: UUID, completion: @escaping (Result<[NSItemProvider], Error>, UUID) -> Void) {
+            self.pickerID = pickerID
+            self.completion = completion
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard !delivered else { return }
+            delivered = true
+            guard !results.isEmpty else {
+                completion(.failure(CocoaError(.userCancelled)), pickerID)
+                return
+            }
+            // Retain the selected provider; its temporary representation is
+            // acquired and captured only by the typed native facade.
+            completion(.success(results.map(\.itemProvider)), pickerID)
+        }
+    }
+}
+
+struct NativeDocumentPickerClaim: Identifiable {
     let id: UUID
 }
 
-private struct TaskDocumentPicker: UIViewControllerRepresentable {
+struct NativeDocumentPicker: UIViewControllerRepresentable {
     let pickerID: UUID
     let completion: (Result<[URL], Error>, UUID) -> Void
 
@@ -2840,6 +2916,55 @@ struct AttachmentFileActivitySheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: [presentation.url], applicationActivities: nil)
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+private struct TaskAttachmentAudioSheet: View {
+    @ObservedObject var model: CoreModel
+    let palette: AppPalette
+    let presentationID: UUID
+
+    private var playback: TaskAudioPlaybackState? {
+        guard model.taskAudioPlayback?.presentationID == presentationID else { return nil }
+        return model.taskAudioPlayback
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                Text(playback?.title ?? model.label("quickAdd.audioNoteTitle"))
+                    .rnFont(20, .bold).fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.center).accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier("task-audio-title")
+                Text(playback.map { audioTime($0.elapsed) + " / " + audioTime($0.duration) }
+                    ?? model.label("audio.loading"))
+                    .rnFont(16).monospacedDigit().foregroundStyle(palette.secondary)
+                    .accessibilityIdentifier("task-audio-time")
+                Button {
+                    model.toggleTaskAudioPlayback(presentationID: presentationID)
+                } label: {
+                    Text(model.label(playback?.playing == true ? "common.pause" : "common.play"))
+                        .rnFont(16, .semibold).frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered).disabled(playback?.canToggle != true)
+                .accessibilityIdentifier("task-audio-toggle")
+                Button {
+                    model.dismissTaskFileOpen(presentationID: presentationID)
+                } label: {
+                    Text(model.label("common.close"))
+                        .rnFont(16, .semibold).frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered).accessibilityIdentifier("task-audio-close")
+            }
+            .padding(24).frame(maxWidth: .infinity)
+        }
+        .foregroundStyle(palette.text).background(palette.card).tint(palette.tint)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("task-audio-player")
+    }
+
+    private func audioTime(_ value: TimeInterval) -> String {
+        let seconds = value.isFinite ? Int(min(Double(Int.max / 2), max(0, value))) : 0
+        return String(seconds / 60) + ":" + String(format: "%02d", seconds % 60)
+    }
 }
 
 struct AttachmentFileQuickLookSheet: UIViewControllerRepresentable {

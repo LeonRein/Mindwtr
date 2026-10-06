@@ -13,13 +13,16 @@
  *   and core's encryption transitions (sync-encryption-service.ts) as RN's lib/sync-encryption-service.ts binds them, with
  *   RN's WebDAV XML parser (@xmldom/xmldom).
  *
- * Not on this host yet, and refused the way core refuses an unbound port: Dropbox (S4), File Sync's folder (S5) and the
- * background job (S4). The fence owner stays `mindwtr-mobile` and the device keys keep RN's names,
- * so an upgraded RN user's configuration and deviceId carry over.
+ * - the background job (S4a): core's background runner (mobile-background-sync.ts: its deadline, failure cooldown, capture
+ *   run and quiesce), which CoreWork's jobs call after the app's start order; core decides whether the job is scheduled.
+ *
+ * Not on this host yet, and refused the way core refuses an unbound port: Dropbox (S4) and File Sync's folder (S5). The fence
+ * owner stays `mindwtr-mobile` and the device keys keep RN's names, so an upgraded RN user's configuration and deviceId carry over.
  */
 import { DOMParser } from '@xmldom/xmldom';
 import { createNativeAttachments, nativeFileChannels } from './host-attachments';
 import {
+    MOBILE_BACKGROUND_SYNC_DEADLINE_MS,
     SETTINGS_SYNC_BADGE_COLORS,
     SYNC_BACKEND_KEY,
     SyncCryptoAuthError,
@@ -27,6 +30,7 @@ import {
     buildDiagnosticsLogEntry,
     classifySyncFailure,
     coerceSupportedBackend,
+    createMobileBackgroundSyncRunner,
     createMobileSyncService,
     createMobileSyncTriggers,
     createSecureSyncConfigStore,
@@ -46,9 +50,11 @@ import {
     resolveBackend,
     resolveSyncBadgeState,
     sanitizeLogMessage,
+    shouldScheduleMobileBackgroundSync,
     useTaskStore,
     type AppData,
     type DiagnosticsLogEntry,
+    type MobileBackgroundSyncTrigger,
     type MobileSyncNetworkState,
     type MobileSyncTriggers,
     type NativeSyncSettingsHost,
@@ -82,6 +88,10 @@ export type NativeSyncBindings = {
     emit: (event: Record<string, unknown>) => void;
     /** A logcat line (the device checks read the badge's changes there). */
     trace: (line: string) => void;
+    /** Core's answer whether the background job runs (BackgroundSync.kt schedules it, or cancels it). */
+    scheduleBackgroundSync: (on: boolean) => void;
+    /** The build's flavor (BuildConfig.FOSS): a FOSS build hides Dropbox, as RN's FOSS_BUILD does. */
+    isFossBuild: boolean;
 };
 
 /** host-polyfills.js's sync crypto call (HostCrypto.kt); absent where the host has no crypto (the gates' stand-in). */
@@ -124,6 +134,21 @@ export const createHostSyncCrypto = (call: HostCryptoCall | undefined): SyncCryp
 const EXTERNAL_CALENDARS_KEY = 'mindwtr-external-calendars';
 
 type ExternalCalendar = NonNullable<AppData['settings']['externalCalendars']>[number];
+
+/**
+ * RN's background-safe fetch deadline (setMobileSyncRequestDeadline): while the background run's deadline is set, no sync request
+ * starts past it. A request in flight at the deadline is aborted by the runner's own deadline (its abort), whose timer this host
+ * runs in the background too (CoreHost's idle pump), unlike RN's paused JS timers.
+ */
+export const createDeadlineFetch = (send: typeof fetch) => {
+    let deadline: number | null = null;
+    return {
+        setDeadline: (at: number | null) => { deadline = at; },
+        fetch: ((input, init) => (deadline !== null && Date.now() >= deadline
+            ? Promise.reject(Object.assign(new Error('The background sync deadline passed'), { name: 'AbortError' }))
+            : send(input, init))) as typeof fetch,
+    };
+};
 
 const unavailable = (what: string) => async (): Promise<never> => {
     throw new Error(`${what} is not available on this build yet`);
@@ -200,10 +225,11 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
         },
     }, channels) : null;
 
+    const syncFetch = createDeadlineFetch((input, init) => fetch(input, init));
     const service = createMobileSyncService<never>({
         storage,
         getSecureConfigValue: (key) => secureConfig.getSecureConfigValue(key),
-        platform: { os: () => 'android', isFossBuild: false, dropboxAppKey: () => '' },
+        platform: { os: () => 'android', isFossBuild: bindings.isFossBuild, dropboxAppKey: () => '' },
         network: {
             getState: async () => bindings.networkState(),
             subscribe: (listener) => {
@@ -254,7 +280,7 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
                 await keyValue.set(EXTERNAL_CALENDARS_KEY, JSON.stringify(sanitized));
             },
         },
-        fetch: (input, init) => fetch(input, init),
+        fetch: syncFetch.fetch,
         crypto,
         encryption: {
             flushSyncEncryptionLocalState: () => encryptionState.flushSyncEncryptionLocalState(),
@@ -266,7 +292,7 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
             logSyncEncryptionEvent: (event, extra, options) => encryptionState.logSyncEncryptionEvent(event, extra, options),
             syncEncryptionLocalState: encryptionState.syncEncryptionLocalState,
             // A WebDAV attachment pass with no key first asks whether the location holds ciphertext (core's rule).
-            probeLocationCiphertext: () => transitions.probeSyncLocationCiphertext(),
+            probeLocationCiphertext: (target) => transitions.probeSyncLocationCiphertext(target),
         },
         ensureWebdavCapabilityProof: (config, probe, options) => capabilityProof.ensureWebdavCapabilityProof(config, probe, options),
         dropboxAuth: {
@@ -346,10 +372,60 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
         }
     };
 
+    // ---- The background job (CoreWork's sync and capture jobs; RN's lib/background-sync-task.ts) ----
+
+    /**
+     * RN's syncMobileBackgroundSyncRegistration: core's decision (a configured WebDAV or cloud backend) handed to Kotlin, which
+     * keeps a scheduled or running job (KEEP) or cancels it. Called where RN reconciles: the triggers' start, resume and leave,
+     * and a Sync screen change.
+     */
+    const backgroundSyncWanted = async () => {
+        const { backend, configured } = await service.getMobileSyncConfigurationStatus();
+        return shouldScheduleMobileBackgroundSync({ schedulerAvailable: true, configured, backend });
+    };
+    const reconcileBackgroundSync = async () => {
+        void refreshConfigured();
+        const on = await backgroundSyncWanted();
+        // Kotlin answers once WorkManager stored it (bounded); a refusal throws to the caller, and the next reconcile tries again.
+        bindings.scheduleBackgroundSync(on);
+        bindings.trace(`Native Android background sync schedule=${on ? 'on' : 'off'}`);
+    };
+    const appStateListeners = new Set<(state: string) => void>();
+    /** What Kotlin's start order stored from the capture queue since the last run took it (core's drain port). */
+    let imported = 0;
+    /** A debug build's shorter run deadline (CoreWork's `bgsync_deadline_ms`, for the device check); null: core's 4 minutes. */
+    let shortDeadlineMs: number | null = null;
+    const runner = createMobileBackgroundSyncRunner({
+        storage,
+        log: { info: (message, context) => logLine('info', message, context), warn: (message, context) => logLine('warn', message, context) },
+        sync: {
+            getConfigurationStatus: () => service.getMobileSyncConfigurationStatus(),
+            performSync: () => performSync(undefined, {}),
+            // The run's own abort: the cycle ends with no follow-up (a lifecycle abort would queue one that outlives the job).
+            abort: () => service.abortMobileSync('deadline'),
+            setRequestDeadline: syncFetch.setDeadline,
+        },
+        flushPendingSave: () => flushPendingSave(),
+        // The queue was drained before the job (ProcessCoreHost.recovered, the app's start order); this reports what it stored.
+        drainPendingCaptures: async () => {
+            const count = imported;
+            imported = 0;
+            return count;
+        },
+        // Native writes are synchronous FULL commits: a debounced store save is the only deferred write.
+        quiesceStorage: () => flushPendingSave(),
+        timersPaused: () => false,
+        deadlineMs: () => shortDeadlineMs ?? MOBILE_BACKGROUND_SYNC_DEADLINE_MS,
+        onAppStateChange: (listener) => {
+            appStateListeners.add(listener);
+            return { remove: () => { appStateListeners.delete(listener); } };
+        },
+    });
+
     // ---- Settings › Sync's device (native-host-contract-settings-sync.ts) ----
 
     const settingsHost: NativeSyncSettingsHost = {
-        platform: { os: 'android', isFossBuild: false, dropboxAppKey: '' },
+        platform: { os: 'android', isFossBuild: bindings.isFossBuild, dropboxAppKey: '' },
         storage: {
             multiGet: (keys) => keyValue.multiGet(keys),
             setItem: (key, value) => keyValue.set(key, value),
@@ -363,11 +439,7 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
         },
         performSync,
         clearSyncConfigCache: () => service.clearMobileSyncConfigCache(),
-        // The background job comes with S4; the configuration changed, so the badge reads it again.
-        reconcileBackgroundSync: async () => {
-            void refreshConfigured();
-            return { action: 'unchanged' };
-        },
+        reconcileBackgroundSync,
         rememberWebdavCapabilityProof: (config) => capabilityProof.rememberWebdavCapabilityProof(config),
         encryption: {
             getStatus: () => encryptionState.getSyncEncryptionStatus(),
@@ -431,7 +503,7 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
                 },
                 abortSync: () => service.abortMobileSync(),
                 flushPendingSave: () => flushPendingSave(),
-                reconcileBackgroundSync: () => { void refreshConfigured(); },
+                reconcileBackgroundSync: () => { void reconcileBackgroundSync().catch((error) => logError(error, { scope: 'sync' })); },
                 readStoredBackend: () => keyValue.get(SYNC_BACKEND_KEY),
                 resolveSupportedBackend: (raw) => coerceSupportedBackend(resolveBackend(raw), false),
                 getSyncChangeFingerprint: () => getInMemorySyncChangeFingerprint(),
@@ -458,7 +530,22 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
         /** RN's AppState change ('active', 'background'). */
         appState(next: string) {
             triggers?.handleAppStateChange(next);
+            for (const listener of Array.from(appStateListeners)) listener(next);
             return state();
+        },
+        /**
+         * One background run (core's runner), after Kotlin's start order drained the queue: `trigger` 'scheduled' (the periodic
+         * job) or 'capture' (a capture stored while the app was closed, #1257), `stored` what those drains stored (0 while the app
+         * shows: the foreground triggers send it). It resolves once the run settled (synced, failed and recorded, skipped, or
+         * abandoned at core's deadline; `deadlineMs` shortens it, debug builds only, 0 for core's). `schedule`: whether the job
+         * should run again.
+         */
+        async backgroundSync(trigger: MobileBackgroundSyncTrigger, stored: number, deadlineMs = 0) {
+            imported += stored;
+            shortDeadlineMs = deadlineMs > 0 && deadlineMs < MOBILE_BACKGROUND_SYNC_DEADLINE_MS ? deadlineMs : null;
+            if (trigger === 'capture') await runner.runCapture();
+            else await runner.run('scheduled');
+            return { schedule: await backgroundSyncWanted() };
         },
         /**
          * The device's network changed (expo-network's listener): a running cycle stops when it went offline. Coming back

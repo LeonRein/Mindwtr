@@ -26,7 +26,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -278,8 +278,10 @@ const placeForDrop = async (title, header) => {
         if (attempt === 8) break;
         const x = Math.round(lx1 + (lx2 - lx1) * 0.8);
         const middle = Math.round((listTop + listBottom) / 2);
-        // Too high: the list moves down; the column below not in reach: the list moves up.
-        const by = box(card)[1] < listTop + margin ? -(listTop + margin - box(card)[1] + 60) : below ? box(below)[3] + 40 - (listBottom - margin) + 60 : 300;
+        // Too high: the list moves down; the column below not in reach: the list moves up. At least 200 px: a shorter slow swipe
+        // (S23 10-06: the card 9 px too high, 69 px swipes) never moved the list, and every pass saw the same screen.
+        const need = box(card)[1] < listTop + margin ? -(listTop + margin - box(card)[1] + 60) : below ? box(below)[3] + 40 - (listBottom - margin) + 60 : 300;
+        const by = Math.sign(need) * Math.max(Math.abs(need), 200);
         requireAppFront();
         sh(`input swipe ${x} ${middle} ${x} ${middle - by} 1500`);
         await sleep(800);

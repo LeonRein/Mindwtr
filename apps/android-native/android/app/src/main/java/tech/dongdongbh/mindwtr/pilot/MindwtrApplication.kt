@@ -5,7 +5,7 @@ import java.util.concurrent.TimeUnit
 import tech.dongdongbh.mindwtr.androidwidget.CaptureSyncHeadlessService
 
 /**
- * Sets, before any component of this process runs, the hook through which RN's widget module (the quick capture dialog, the
+ * Cancels RN's background sync worker, and sets, before any component of this process runs, the hook through which RN's widget module (the quick capture dialog, the
  * capture intent receiver, a widget check-off queued by RN's CheckoffStore) has the pending-captures queue stored now: CoreWork's
  * ingest job, where RN started its headless task.
  */
@@ -14,6 +14,8 @@ class MindwtrApplication : Application() {
         super.onCreate()
         // The wake returns once WorkManager stored the job: a process started only for a capture may end soon after.
         CaptureSyncHeadlessService.install(this) { context -> CoreWork.enqueue(context, CoreJob.INGEST).result.get(DURABLE_WAIT_SECONDS, TimeUnit.SECONDS) }
+        // RN's background sync worker goes on the first start after the upgrade (a no-op later): the native job replaces it.
+        runCatching { CoreWork.cancelRnSync(this) }
     }
 
     private companion object {
