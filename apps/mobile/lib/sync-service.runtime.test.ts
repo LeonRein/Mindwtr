@@ -701,9 +701,10 @@ describe('mobile sync-service runtime', () => {
 
       expect(result.success).toBe(true);
       expect(coreMocks.webdavGetJson).toHaveBeenCalled();
-      // Only the post-merge phase ran the attachment check — the prepare phase (before the
-      // read) was skipped outright, not merely "found nothing pending".
-      expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(1);
+      // Only the post-merge phase ran an attachment pass — the prepare phase (before the read)
+      // was skipped outright. Its deferral only asked whether work is owed (once), so the
+      // unchanged-document skip cannot drop the post-merge pass (v1.3.5/deferred-attachment-pass).
+      expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(2);
       expect(attachmentSyncMocks.syncWebdavAttachments).toHaveBeenCalledTimes(1);
       const skipped = (logMocks.logInfo.mock.calls as unknown as [string, { extra?: Record<string, string> }][])
         .filter((call) => call[0] === 'Attachment pre-sync skipped');
@@ -749,9 +750,10 @@ describe('mobile sync-service runtime', () => {
         });
 
         expect(result.success).toBe(true);
-        // Only the post-merge phase ran the attachment check — the prepare phase (before the
-        // read) was skipped outright, not merely "found nothing pending".
-        expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(1);
+        // Only the post-merge phase ran an attachment pass — the prepare phase (before the read)
+        // was skipped outright. Its deferral only asked whether work is owed (once), so the
+        // unchanged-document skip cannot drop the post-merge pass (v1.3.5/deferred-attachment-pass).
+        expect(attachmentSyncMocks.hasPendingAttachmentSyncWork).toHaveBeenCalledTimes(2);
         expect(attachmentSyncMocks.syncFileAttachments).toHaveBeenCalledTimes(1);
         const skipped = (logMocks.logInfo.mock.calls as unknown as [string, { extra?: Record<string, string> }][])
           .filter((call) => call[0] === 'Attachment pre-sync skipped');
