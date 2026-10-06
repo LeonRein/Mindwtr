@@ -1,18 +1,23 @@
-# Mindwtr Dev test build: one notification per task
+# Mindwtr Dev test build: reminder notifications and buttons
 
-`mindwtr-dev-1.3.3-reminder-replace-arm64.apk` is built from branch `claude/keen-bell-2l93tt` (commit 7576e14).
+`mindwtr-dev-1.3.3-reminders-buttons-arm64.apk` is built from branch `claude/keen-bell-2l93tt` (commit 36bbd46).
 
-Each task now keeps a single notification: its start reminder, due reminder and every
-repeat (e.g. every 10 minutes) replace it and alert again, instead of adding another one.
+What changed:
+- **One notification per task.** A task's start reminder, due reminder and every repeat (e.g. every
+  10 minutes) replace its notification and alert again, instead of adding another one.
+- **Snooze** always snoozes (it used to just close the notification once the app had run since the
+  reminder fired).
+- **Done** cancels the task's remaining repeats straight away, even with the app in the background,
+  and is remembered if the app was closed, then applied the next time you open the app.
+- **Dismiss** and swiping away remove only the current notification; the next repeat still comes.
 
-- App name **Mindwtr Dev**, app ID `tech.dongdongbh.mindwtr.dev`. It installs next to your
-  normal Mindwtr and has its own, empty data.
-- Release build with the JavaScript bundled (no dev server needed), arm64 only, signed with a debug key.
-- SHA-256: `27742d4d5a1613584770a667fbd9a767e80cf660d7900480ee22733c3cffdb69`
+Install:
+- App name **Mindwtr Dev**, app ID `tech.dongdongbh.mindwtr.dev`, installs next to your normal Mindwtr.
+- Same signing key as the previous test build, so it installs over it and keeps its data.
+- Release build with the JavaScript bundled, arm64 only, signed with a debug key.
+- SHA-256: `a5a962a1964a9e463052ebadeb9d81e053a8e56ed3c033b257f0609ac36ee0ac`
 
-## Install
-1. On the phone, tap the APK file above, then **View raw** or **Download**.
-2. Open the downloaded file and allow installing from this source if Android asks.
-3. In Mindwtr Dev, allow notifications (and "Alarms & reminders" if prompted).
+1. On the phone, tap the APK file above, then **Download** (or **View raw**).
+2. Open the downloaded file; allow installing from this source if Android asks.
 
 This branch only carries the test build; delete it when you are done.
