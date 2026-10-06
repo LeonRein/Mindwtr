@@ -62,8 +62,7 @@ const runAs = (command) => sh(`run-as ${PKG} ${command}`);
 const launch = () => device.launch(ACTIVITY);
 const logs = (processId) => device.logs(processId, TAG);
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 
 // ---- database: a host copy of .db, -wal and -shm; core runs on it in Bun ----

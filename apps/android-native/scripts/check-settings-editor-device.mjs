@@ -280,8 +280,7 @@ try {
     sh('settings put system accelerometer_rotation 0');
     sh('settings put system user_rotation 0');
     await waitFor('the Inbox', onInbox, 60_000);
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     const db = pullDatabase('inject');
     const injected = core('inject', db);
     check(!existsSync(`${db}-wal`) || statSync(`${db}-wal`).size === 0, `the Done list task ${names.task} is in the main database file`);

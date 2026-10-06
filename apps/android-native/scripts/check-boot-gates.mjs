@@ -2610,7 +2610,7 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     // staged and size-checked beside the database, the old WAL and SHM removed, then renamed over it; the restore proves core's value,
     // goes back to the tabs, and a failed restore exits 1.
     const lockCheck = readFileSync(resolve(app, 'scripts/check-app-lock-device.mjs'), 'utf8');
-    assert.match(lockCheck, /sh\(`am force-stop \$\{PKG\}`\);\s+await waitFor\('the app process to end', \(\) => pid\(\) === '', 10_000\);\s+changes \+= 1;\s+const original = pullDatabase\(`original-\$\{changes\}`\);/);
+    assert.match(lockCheck, /await device\.stopApp\(\);\s+changes \+= 1;\s+const original = pullDatabase\(`original-\$\{changes\}`\);/);
     assert.match(lockCheck, /const staged = Number\(runAs\(`stat -c %s \$\{next\}`\)\);\s+if \(staged !== statSync\(db\)\.size\) fail\([^\n]*\n\s+if \(pid\(\) !== ''\) fail\([^\n]*\n\s+runAs\(`rm -f files\/\$\{DB\}-wal files\/\$\{DB\}-shm`\);\s+runAs\(`mv -f \$\{next\} files\/\$\{DB\}`\);/);
     assert.doesNotMatch(lockCheck, /runAs\(`cp \$\{STAGED\} files\/\$\{DB\}`\)/, 'never copy over the live database in place');
     assert.match(lockCheck, /const now = core\('read'\)\.stored === true;\s+if \(now !== original\) fail\(/);

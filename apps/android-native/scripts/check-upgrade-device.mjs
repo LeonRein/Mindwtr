@@ -153,8 +153,7 @@ const until = async (description, predicate, timeoutMs = 30_000) => {
     fail(`timed out waiting for ${description}`);
 };
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await until('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 const openLink = (url) => {
     const current = front();

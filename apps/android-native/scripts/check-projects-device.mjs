@@ -109,8 +109,7 @@ const goHome = async () => {
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
 };
 const stopApp = async () => {
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
 };
 
 // ---- UI (core's English labels: nav.projects, projects.closed, common.back, common.done, common.more, common.close) ----

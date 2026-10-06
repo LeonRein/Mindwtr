@@ -365,8 +365,7 @@ const removeFixtures = async () => {
     try {
         const current = front();
         if (!current.includes(`${PKG}/`) && !current.includes(`${home}/`)) throw new Error(`another app is in front: ${current.trim()}`);
-        sh(`am force-stop ${PKG}`);
-        await waitFor('the app process to end', () => pid() === '', 10_000);
+        await device.stopApp();
         const db = pullDatabase('remove');
         const removed = core('remove', db);
         adbRaw('push', db, STAGED);
@@ -421,8 +420,7 @@ try {
     sh('settings put system accelerometer_rotation 0');
     sh('settings put system user_rotation 0');
     await waitFor('the Inbox', onInbox, 60_000);
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     const db = pullDatabase('inject');
     injected = core('inject', db);
     check(!existsSync(`${db}-wal`) || statSync(`${db}-wal`).size === 0, `the areas, project and six tasks of run ${run} are in the main database file`);
