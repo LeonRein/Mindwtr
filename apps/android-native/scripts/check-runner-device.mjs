@@ -394,8 +394,11 @@ try {
         check(queued().length === earlier.length + 8, '(4) eight files wait: the held capture and the seven written through run-as');
         const jobIds = () => [...new Set([...sh('dumpsys jobscheduler').matchAll(new RegExp(`JOB #u\\d+a\\d+/(\\d+): \\w+ ${PKG.replace(/\./g, '\\.')}/androidx\\.work\\.impl\\.background\\.systemjob\\.SystemJobService`, 'g'))]
             .map((m) => m[1]))];
+        // A Quick Settings tile the shade bound (step 3 opened it) is rebound by SystemUI 5 s after its process dies, which
+        // starts the app again while the files above are written: end that process too, so the job meets no running app.
+        await killApp();
         const held = jobIds();
-        check(held.length >= 1 && !pid(), `(4) JobScheduler holds CoreWork's job (${held.join(', ')}), and the app is not running`);
+        check(held.length >= 1 && !pid(),`(4) JobScheduler holds CoreWork's job (${held.join(', ')}), and the app is not running`);
         const jobs = count(allLogs(), ...INGESTED);
         try {
             // A WorkManager that starts can move its jobs to new ids: each round forces the ids JobScheduler holds then.
