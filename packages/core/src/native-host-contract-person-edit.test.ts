@@ -221,10 +221,12 @@ describe('prepared native Person edit', () => {
 
     it('normal load preserves legacy terminal focus in durable baselines through failed saves and cold original-request replay', async () => {
         let failing = false;
+        // A day old: a done task older than the auto-archive window would be archived (and saved) on load.
+        const stamp = new Date(Date.now() - 86_400_000).toISOString();
         const legacy = ['done', 'archived'].map((status, index) => ({ id: `legacy-${index}`, title: 'Retained task', status,
             assignedTo: person().name, tags: ['#keep'], contexts: ['@keep'], description: 'Keep metadata',
-            createdAt: '2026-09-29T12:00:00.000Z', updatedAt: '2026-09-29T12:00:00.000Z',
-            completedAt: '2026-09-29T12:00:00.000Z', focusOrder: 9, isFocusedToday: false,
+            createdAt: stamp, updatedAt: stamp,
+            completedAt: stamp, focusOrder: 9, isFocusedToday: false,
             rev: 9, revBy: 'before-device' } as Task));
         const env = await open({ tasks: legacy }, () => failing);
         env.setData({ settings: env.matureSettings });
