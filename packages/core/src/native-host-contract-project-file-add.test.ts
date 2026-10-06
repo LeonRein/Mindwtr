@@ -554,4 +554,91 @@ describe('prepared Project-owned file Add foundation', () => {
                 .toEqual({ result: { ok: true, value: frozen.prepared.result }, wrote: false, receipts: false });
         } finally { await env.close(); }
     });
+
+    it('selects hash-bearing v4 only for the strict version-2 request and preserves historical v3', async () => {
+        const env = await open();
+        const digest = 'a'.repeat(64);
+        const frozen = await env.prepare(env.request({ version: 2, sourceSha256: digest }));
+        expect(frozen.prepared.version).toBe(4);
+        expect(frozen.prepared.request).toEqual(frozen.request);
+        expect(frozen.prepared.prepared.attachment.fileHash).toBe(digest);
+        expect(frozen.prepared.attachment.fileHash).toBe(digest);
+        expect(frozen.prepared.effect.project.after.attachments!.at(-1)!.fileHash).toBe(digest);
+        expect(env.methods.validatePreparedProjectFileAddWrite(frozen)).toEqual({ ok: true, value: frozen.prepared.result });
+        const historical = await env.prepare();
+        expect(historical.prepared.version).toBe(3);
+        expect(historical.request).not.toHaveProperty('version');
+        expect(historical.prepared.attachment).not.toHaveProperty('fileHash');
+        expect(env.methods.validatePreparedProjectFileAddWrite(historical)).toEqual({ ok: true, value: historical.prepared.result });
+        expect(env.saves()).toBe(0);
+        for (const fields of [
+            { version: 1, sourceSha256: digest }, { version: 2 }, { sourceSha256: digest },
+            ...[null, '', 'A'.repeat(64), 'a'.repeat(63), 'g'.repeat(64), 1].map((sourceSha256) => ({ version: 2, sourceSha256 })),
+        ]) {
+            expect(await env.methods.prepareProjectFileAddWrite({ ...env.request(), ...fields } as NativeProjectFileAddWriteRequest))
+                .toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+        }
+    });
+
+    it('rejects new-version pair and frozen metadata/effect hash tampering without applying rows', async () => {
+        const env = await open();
+        const frozen = await env.prepare(env.request({ version: 2, sourceSha256: 'a'.repeat(64) }));
+        const before = structuredClone(env.data());
+        const changes = [
+            (value: typeof frozen) => { value.prepared.version = 3; },
+            (value: typeof frozen) => { delete (value.request as { version?: number }).version; },
+            (value: typeof frozen) => { value.prepared.attachment.fileHash = 'b'.repeat(64); },
+            (value: typeof frozen) => { value.prepared.prepared = { ...value.prepared.prepared,
+                attachment: { ...value.prepared.prepared.attachment, fileHash: 'b'.repeat(64) } }; },
+            (value: typeof frozen) => { value.prepared.effect.project.after.attachments!.at(-1)!.fileHash = 'b'.repeat(64); },
+            (value: typeof frozen) => { (value.request as { sourceSha256: string }).sourceSha256 = 'b'.repeat(64);
+                (value.prepared.request as { sourceSha256: string }).sourceSha256 = 'b'.repeat(64); },
+        ];
+        for (const mutate of changes) {
+            const bad = structuredClone(frozen); mutate(bad);
+            expect(env.methods.validatePreparedProjectFileAddWrite(bad)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+            expect(await env.methods.commitPreparedProjectFileAddWrite(bad)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+        }
+        const bad = structuredClone(frozen.prepared); bad.attachment.fileHash = 'b'.repeat(64);
+        const durable = await readAreaDurableData(false, true);
+        if (!durable.ok) throw new Error(durable.error.code);
+        expect(await useTaskStore.getState().commitPreparedProjectFileAddWrite(bad, durable.value.authority)).toMatchObject({ success: false });
+        expect(env.data()).toEqual(before); expect(env.saves()).toBe(0);
+    });
+
+    it('persists a new hash through actual SQLite cold replay and refuses saved hash drift without writing', async () => {
+        const env = await openSqliteHost({ projects: [project(), project('other')], tasks: [task], sections: [section], settings: { deviceId: 'files-device' } });
+        try {
+            const options = env.host.getProjectAttachmentEditOptions({ projectId: 'target' });
+            if (!options.ok) throw new Error(options.error.code);
+            const { id: _id, ...expected } = options.value.project;
+            const digest = 'a'.repeat(64);
+            const request: NativeProjectFileAddWriteRequest = json({ version: 2, sourceSha256: digest,
+                requestId, projectId: 'target', expected, picked: { uri: 'file:///provider/Picked.PDF', name: 'Picked.PDF', mimeType: 'application/pdf', size: null },
+                measuredSize: 27, managedDirectoryURI: directory });
+            const plan = await env.host.prepareProjectFileAddWrite(request);
+            if (!plan.ok || plan.value.kind !== 'prepared') throw new Error(plan.ok ? plan.value.kind : plan.error.code);
+            const frozen = { request, prepared: plan.value.prepared }, exact = JSON.stringify(frozen);
+            const others = await env.sql('SELECT * FROM projects WHERE id != ?', ['target']);
+            const children = await env.sql('SELECT * FROM tasks');
+            expect(await env.host.commitPreparedProjectFileAddWrite(frozen)).toEqual({ ok: true, value: frozen.prepared.result });
+            const saved = await env.sql<{ rev: number; attachments: string }>('SELECT rev, attachments FROM projects WHERE id = ?', ['target']);
+            expect(saved[0].rev).toBe(4);
+            const attachments = JSON.parse(saved[0].attachments) as Attachment[];
+            expect(attachments.at(-1)!.fileHash).toBe(digest);
+            const policy = vi.spyOn(uploadPolicy, 'validateAttachmentForUpload').mockRejectedValue(new Error('Exact AFTER must not prepare again'));
+            expect(await env.replay((host) => host.commitPreparedProjectFileAddWrite(frozen)))
+                .toEqual({ result: { ok: true, value: frozen.prepared.result }, wrote: false, receipts: false });
+            expect(policy).not.toHaveBeenCalled();
+            expect(await env.sql('SELECT * FROM projects WHERE id != ?', ['target'])).toEqual(others);
+            expect(await env.sql('SELECT * FROM tasks')).toEqual(children);
+            attachments.at(-1)!.fileHash = 'b'.repeat(64);
+            await env.client().run('UPDATE projects SET attachments = ? WHERE id = ?', [JSON.stringify(attachments), 'target']);
+            const changed = await env.replay((host) => host.commitPreparedProjectFileAddWrite(frozen));
+            expect(changed.result).toMatchObject({ ok: false, error: { code: 'STALE_REVISION' } });
+            expect(changed.wrote).toBe(false); expect(changed.receipts).toBe(false);
+            expect(JSON.stringify(frozen)).toBe(exact);
+        } finally { await env.close(); }
+    });
+
 });

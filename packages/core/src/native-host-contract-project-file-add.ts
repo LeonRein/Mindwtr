@@ -18,10 +18,12 @@ import { projectFileAddLiveRowMatches, projectFileAddScalarCellsMatchWriter, pro
 import type { PreparedProjectFileAddWrite } from './store-types';
 import type { Attachment, Project } from './types';
 
-export type NativeProjectFileAddWriteRequest = {
+type HistoricalProjectFileAddWriteRequest = {
     requestId: string; projectId: string; expected: NativeProjectAttachmentWriteToken;
     picked: NativeAttachmentDraftPicked; measuredSize: number; managedDirectoryURI: string;
 };
+export type NativeProjectFileAddWriteRequest = HistoricalProjectFileAddWriteRequest
+    | (HistoricalProjectFileAddWriteRequest & { version: 2; sourceSha256: string });
 export type NativeProjectFileAddWriteResult = NativeProjectAttachmentWriteResult;
 export type NativePreparedProjectFileAddWrite = PreparedProjectFileAddWrite & {
     request: NativeProjectFileAddWriteRequest; result: NativeProjectFileAddWriteResult;
@@ -35,6 +37,7 @@ type Envelope = { request: NativeProjectFileAddWriteRequest; prepared: NativePre
 
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const same = taskEditValuesEqual;
+const hash = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const id = (value: unknown): value is string => typeof value === 'string' && !!value && value.length <= 500;
 const size = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const fail = (code: 'INVALID_INPUT' | 'STALE_REVISION' | 'SAVE_FAILED' | 'ACTION_FAILED', message: string): NativeHostResult<never> =>
@@ -64,7 +67,9 @@ const validPicked = (value: unknown): value is NativeAttachmentDraftPicked => re
     && (value.size === null || typeof value.size === 'number' && Number.isFinite(value.size) && value.size >= 0);
 const readRequest = (value: unknown): NativeProjectFileAddWriteRequest | null => {
     const input = detach<Record<string, unknown>>(value);
-    return input && exact(input, ['requestId', 'projectId', 'expected', 'picked', 'measuredSize', 'managedDirectoryURI'])
+    return input && (input.version === 2
+        ? exact(input, ['version', 'sourceSha256', 'requestId', 'projectId', 'expected', 'picked', 'measuredSize', 'managedDirectoryURI']) && hash(input.sourceSha256)
+        : exact(input, ['requestId', 'projectId', 'expected', 'picked', 'measuredSize', 'managedDirectoryURI']))
         && typeof input.requestId === 'string' && UUID.test(input.requestId) && id(input.projectId)
         && isProjectAttachmentWriteToken(input.expected) && validPicked(input.picked)
         && size(input.measuredSize) && fileURI(input.managedDirectoryURI, true)
@@ -74,6 +79,7 @@ const sourceMetadata = (request: NativeProjectFileAddWriteRequest, now: string):
     id: request.requestId, kind: 'file', title: request.picked.name || 'file', uri: request.picked.uri,
     ...(request.picked.mimeType === null ? {} : { mimeType: request.picked.mimeType }), size: request.measuredSize,
     createdAt: now, updatedAt: now, localStatus: 'available',
+    ...('version' in request ? { fileHash: request.sourceSha256 } : {}),
 });
 // Node edit options use the display codec; JSC may expose the raw JSON attachment list.
 // This equivalence is token-only: ownership checks always compare the raw before/after rows.
@@ -89,7 +95,7 @@ const readPrepared = (value: unknown): NativePreparedProjectFileAddWrite | null 
     const raw = envelope.prepared;
     if (!request || !exact(raw, ['version', 'kind', 'request', 'scope', 'effect', 'deviceIdBefore',
         'deviceIdToInitialize', 'updateAt', 'result', 'prepared', 'targetURI', 'attachment'])
-        || raw.version !== 3 || raw.kind !== 'project-file-add' || !same(raw.request, request)
+        || raw.version !== ('version' in request ? 4 : 3) || raw.kind !== 'project-file-add' || !same(raw.request, request)
         || !record(raw.scope) || !exact(raw.scope, ['project'])
         || !record(raw.effect) || !exact(raw.effect, ['project']) || !record(raw.effect.project)
         || !exact(raw.effect.project, ['before', 'after'])
@@ -192,8 +198,9 @@ export function createProjectFileAddWriteMethods(deps: {
                 || (checkedData.settings.deviceId ?? null) !== (useTaskStore.getState().settings.deviceId ?? null))
                 return fail('STALE_REVISION', 'Project changed while preparing a file');
             if (picked.kind === 'refused') return { ok: true, value: { kind: 'refused', result: { message: picked.message } } };
-            const prepared = detach<PreparedPickedAttachment>(JSON.parse(JSON.stringify(picked)));
+            let prepared = detach<PreparedPickedAttachment>(JSON.parse(JSON.stringify(picked)));
             if (!prepared) return invalid();
+            if ('version' in request) prepared = { ...prepared, attachment: { ...prepared.attachment, fileHash: request.sourceSha256 } };
             const targetURI = request.managedDirectoryURI + getManagedAttachmentFileName(prepared.attachment);
             if (!fileURI(targetURI)) return invalid();
             // RN persistPreparedPickedAttachment refuses a copy whose URI is unchanged.
@@ -204,7 +211,7 @@ export function createProjectFileAddWriteMethods(deps: {
             const effect = projectFileAddWriteEffect(project, attachment, device.deviceId, updateAt);
             if (!effect || effect.project.after.rev! <= (project.rev ?? 0)) return invalid();
             const frozen = detach<NativePreparedProjectFileAddWrite>(JSON.parse(JSON.stringify({
-                version: 3, kind: 'project-file-add', request, ...captured, effect,
+                version: 'version' in request ? 4 : 3, kind: 'project-file-add', request, ...captured, effect,
                 deviceIdToInitialize: device.updated ? device.deviceId : null,
                 updateAt, result: { id: project.id, attachmentIds: [request.requestId] }, prepared, targetURI, attachment,
             })));

@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import Darwin
+import CryptoKit
 @testable import MindwtrNativeCore
 
 final class ProjectFileAddHostTests: XCTestCase {
@@ -139,6 +140,7 @@ final class ProjectFileAddHostTests: XCTestCase {
         XCTAssertEqual(reply["id"] as? String, projectID); XCTAssertEqual(reply["attachmentIds"] as? [String], [id])
         let attachment = try XCTUnwrap(stored().first), target = try XCTUnwrap(URL(string: XCTUnwrap(attachment["uri"] as? String)))
         XCTAssertEqual(attachment["size"] as? Int, bytes.count); XCTAssertEqual(attachment["title"] as? String, "picked.txt")
+        XCTAssertEqual(attachment["fileHash"] as? String, SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
         XCTAssertEqual(try Data(contentsOf: target), bytes); XCTAssertEqual(try Data(contentsOf: picked), bytes)
         XCTAssertEqual(try inode(picked), originalIdentity); XCTAssertEqual(try otherRows(), before)
         XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path)); try assertNoTaskOwner(); XCTAssertEqual(try markers(), 1)
@@ -574,4 +576,132 @@ final class ProjectFileAddHostTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: picked), bytes); XCTAssertEqual(try inode(picked), originalIdentity)
         try assertNoTaskOwner()
     }
+
+    private func hashMarkers() throws -> Int {
+        let log = root.appendingPathComponent("logs/mindwtr.log")
+        guard FileManager.default.fileExists(atPath: log.path) else { return 0 }
+        return try String(contentsOf: log).components(separatedBy: "v1.3.5/ios-project-file-hash").count - 1
+    }
+    private func replaceFixtureState(_ state: [String: Any]) throws {
+        var outer = try object(String(contentsOf: journal))
+        outer["argumentsJSON"] = try json([json(state)])
+        let encoded = Data(try json(outer).utf8)
+        XCTAssertLessThanOrEqual(encoded.count, 8 * 1024 * 1024)
+        try encoded.write(to: journal)
+    }
+    // Build the sealed historical counterpart of a real retained publication.
+    // This fixture changes no native source/stage/publication descriptor proof.
+    private func historicalFixture(_ original: [String: Any]) throws -> [String: Any] {
+        var state = original, envelope = try object(XCTUnwrap(state["envelopeJSON"] as? String))
+        var request = try XCTUnwrap(envelope["request"] as? [String: Any])
+        request.removeValue(forKey: "version"); request.removeValue(forKey: "sourceSha256")
+        var prepared = try XCTUnwrap(envelope["prepared"] as? [String: Any])
+        prepared["version"] = 3; prepared["request"] = request
+        var source = try XCTUnwrap(prepared["prepared"] as? [String: Any])
+        var sourceAttachment = try XCTUnwrap(source["attachment"] as? [String: Any])
+        sourceAttachment.removeValue(forKey: "fileHash"); source["attachment"] = sourceAttachment; prepared["prepared"] = source
+        var attachment = try XCTUnwrap(prepared["attachment"] as? [String: Any])
+        attachment.removeValue(forKey: "fileHash"); prepared["attachment"] = attachment
+        var effect = try XCTUnwrap(prepared["effect"] as? [String: Any]), project = try XCTUnwrap(effect["project"] as? [String: Any])
+        var after = try XCTUnwrap(project["after"] as? [String: Any])
+        after["attachments"] = [attachment]; project["after"] = after; effect["project"] = project; prepared["effect"] = effect
+        envelope["request"] = request; envelope["prepared"] = prepared
+        state["version"] = 1; state["envelopeJSON"] = try json(envelope)
+        return state
+    }
+
+    func testNewHashBearingLostCommitAcknowledgmentColdRecoveryThenRelocationKeepsExactRowsAndBytes() async throws {
+        let oldID = UUID().uuidString.lowercased(), libraryID = UUID().uuidString.lowercased()
+        let picked = try await seed("Application/" + oldID + "/Library/" + libraryID), host = core(); _ = try await host.start()
+        let input = try await request(host), id = try XCTUnwrap(input["requestId"] as? String), fired = await inject(host, .afterCommit)
+        await refused { _ = try await host.addProviderProjectAttachment(selectedURL: picked, requestJSON: self.json(input)) }
+        XCTAssertTrue(fired()); let captured = try state(), file = try target(captured), identity = try inode(file)
+        let envelope = try object(XCTUnwrap(captured["envelopeJSON"] as? String)), request = try XCTUnwrap(envelope["request"] as? [String: Any])
+        let prepared = try XCTUnwrap(envelope["prepared"] as? [String: Any]), sourceProof = try XCTUnwrap(captured["source"] as? [String: Any])
+        let publication = try XCTUnwrap(captured["published"] as? [String: Any]), digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(captured["version"] as? Int, 2); XCTAssertEqual(request["version"] as? Int, 2); XCTAssertEqual(prepared["version"] as? Int, 4)
+        XCTAssertEqual(request["sourceSha256"] as? String, digest); XCTAssertEqual(sourceProof["sha256"] as? String, digest)
+        XCTAssertEqual(publication["sha256"] as? String, digest); XCTAssertEqual(try stored().first?["fileHash"] as? String, digest)
+        XCTAssertEqual(try stored().first?["id"] as? String, id)
+        let rows = try projectRows(), others = try otherRows(), exactEnvelope = try XCTUnwrap(captured["envelopeJSON"] as? String)
+        XCTAssertEqual(try hashMarkers(), 0); try FileManager.default.removeItem(at: picked); await host.close()
+        let faults = HostIOFaults(); var domainWrites = 0
+        faults.beforeSQL = { statement in
+            let sql = statement.uppercased()
+            if ["INSERT", "UPDATE", "DELETE"].contains(where: { sql.hasPrefix($0) }) && (sql.contains("PROJECTS") || sql.contains("TASKS")) {
+                domainWrites += 1; throw Injected.boundary
+            }
+        }
+        let cold = core(faults); try await retainedStart(cold)
+        XCTAssertEqual(try state()["envelopeJSON"] as? String, exactEnvelope)
+        let reply = try object(await cold.recoverProjectFileAdd(requestId: id))
+        XCTAssertEqual(reply["attachmentIds"] as? [String], [id]); XCTAssertEqual(domainWrites, 0)
+        XCTAssertEqual(try projectRows(), rows); XCTAssertEqual(try otherRows(), others)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes)
+        XCTAssertEqual(try markers(), 1); XCTAssertEqual(try hashMarkers(), 1); XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        await cold.close()
+        let oldContainer = fixtureRoot.appendingPathComponent("Application/" + oldID, isDirectory: true)
+        let next = oldContainer.deletingLastPathComponent().appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+        try FileManager.default.moveItem(at: oldContainer, to: next)
+        root = next.appendingPathComponent("Library/" + libraryID, isDirectory: true)
+        let relocated = core(); _ = try await relocated.start()
+        let opened = try object(await relocated.prepareProjectFileOpen(requestJSON: json(["projectId": projectID, "attachmentId": id])))
+        XCTAssertEqual(opened["status"] as? String, "available"); XCTAssertEqual(opened["relocatedFrom"] as? String, file.absoluteString)
+        let plan = try XCTUnwrap(opened["open"] as? [String: Any]), uri = try XCTUnwrap(plan["uri"] as? String), current = try XCTUnwrap(URL(string: uri))
+        XCTAssertNotEqual(uri, file.absoluteString); XCTAssertEqual(try inode(current), identity); XCTAssertEqual(try Data(contentsOf: current), bytes)
+        XCTAssertEqual(try projectRows(), rows); XCTAssertEqual(try otherRows(), others)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldContainer.path)); try assertNoTaskOwner()
+    }
+
+    func testHistoricalHashlessVersionOneJournalRecoversWithoutBackfillOrNewMarker() async throws {
+        let oldID = UUID().uuidString.lowercased(), libraryID = UUID().uuidString.lowercased()
+        let picked = try await seed("Application/" + oldID + "/Library/" + libraryID), host = core(); _ = try await host.start()
+        let input = try await request(host), id = try XCTUnwrap(input["requestId"] as? String), fired = await inject(host, .afterPublicationProof)
+        await refused { _ = try await host.addProviderProjectAttachment(selectedURL: picked, requestJSON: self.json(input)) }; XCTAssertTrue(fired())
+        let original = try state(), file = try target(original), identity = try inode(file); await host.close()
+        let historical = try historicalFixture(original); try replaceFixtureState(historical)
+        let exactEnvelope = try XCTUnwrap(historical["envelopeJSON"] as? String), others = try otherRows()
+        let cold = core(); try await retainedStart(cold)
+        XCTAssertEqual(try state()["envelopeJSON"] as? String, exactEnvelope)
+        let reply = try object(await cold.recoverProjectFileAdd(requestId: id))
+        XCTAssertEqual(reply["attachmentIds"] as? [String], [id]); XCTAssertNil(try stored().first?["fileHash"])
+        XCTAssertEqual(try hashMarkers(), 0); XCTAssertEqual(try markers(), 1)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try otherRows(), others)
+        let rows = try projectRows(); await cold.close()
+        let oldContainer = fixtureRoot.appendingPathComponent("Application/" + oldID, isDirectory: true)
+        let next = oldContainer.deletingLastPathComponent().appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+        try FileManager.default.moveItem(at: oldContainer, to: next); root = next.appendingPathComponent("Library/" + libraryID, isDirectory: true)
+        let relocated = core(); _ = try await relocated.start()
+        await refused { _ = try await relocated.prepareProjectFileOpen(requestJSON: self.json(["projectId": self.projectID, "attachmentId": id])) }
+        XCTAssertEqual(try projectRows(), rows); XCTAssertEqual(try otherRows(), others); XCTAssertEqual(try hashMarkers(), 0)
+        let current = managed.appendingPathComponent(file.lastPathComponent)
+        XCTAssertEqual(try inode(current), identity); XCTAssertEqual(try Data(contentsOf: current), bytes)
+    }
+
+    func testNewHashJournalMismatchNeverFallsBackOrDeletesRetainedProofBytes() async throws {
+        for change in ["missing-input", "prepared-hash", "publication-hash", "cross-version"] {
+            let picked = try await seed(change), host = core(); _ = try await host.start()
+            let input = try await request(host), id = try XCTUnwrap(input["requestId"] as? String), fired = await inject(host, .afterPublicationProof)
+            await refused { _ = try await host.addProviderProjectAttachment(selectedURL: picked, requestJSON: self.json(input)) }; XCTAssertTrue(fired())
+            var captured = try state(); let file = try target(captured), borrowed = try source(captured), identity = try inode(file), rows = try projectRows(), others = try otherRows()
+            await host.close()
+            var envelope = try object(XCTUnwrap(captured["envelopeJSON"] as? String)), request = try XCTUnwrap(envelope["request"] as? [String: Any])
+            var prepared = try XCTUnwrap(envelope["prepared"] as? [String: Any])
+            if change == "missing-input" { request.removeValue(forKey: "sourceSha256"); envelope["request"] = request; prepared["request"] = request }
+            if change == "prepared-hash" { var attachment = try XCTUnwrap(prepared["attachment"] as? [String: Any]); attachment["fileHash"] = String(repeating: "b", count: 64); prepared["attachment"] = attachment }
+            if change == "publication-hash" { var proof = try XCTUnwrap(captured["published"] as? [String: Any]); proof["sha256"] = String(repeating: "b", count: 64); captured["published"] = proof }
+            if change == "cross-version" { captured["version"] = 1 }
+            envelope["prepared"] = prepared; captured["envelopeJSON"] = try json(envelope); try replaceFixtureState(captured)
+            let exactJournal = try Data(contentsOf: journal), journalIdentity = try inode(journal), cold = core()
+            await refused { _ = try await cold.projectFileAddSummary() }
+            await refused { _ = try await cold.start() }
+            await refused { _ = try await cold.recoverProjectFileAdd(requestId: id) }
+            XCTAssertEqual(try Data(contentsOf: journal), exactJournal); XCTAssertEqual(try inode(journal), journalIdentity)
+            XCTAssertEqual(try projectRows(), rows); XCTAssertEqual(try otherRows(), others)
+            XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes)
+            XCTAssertEqual(try Data(contentsOf: borrowed), bytes); XCTAssertEqual(try Data(contentsOf: picked), bytes)
+            XCTAssertEqual(try hashMarkers(), 0); try assertNoTaskOwner(); await cold.close()
+        }
+    }
+
 }

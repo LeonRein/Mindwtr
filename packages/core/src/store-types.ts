@@ -197,7 +197,7 @@ export type PreparedProjectFileRemoveWrite = PreparedProjectAttachmentWrite & { 
 
 /** Frozen Project file Add metadata; native publication proof grants byte authority separately. */
 export type PreparedProjectFileAddWrite = PreparedProjectAttachmentWrite & {
-    version: 3;
+    version: 3 | 4;
     kind: 'project-file-add';
     attachment: Attachment;
 };
@@ -733,7 +733,7 @@ export interface TaskStore {
     commitPreparedProjectTagsWrite: (input: PreparedProjectTagsWrite & { request: { projectId: string; intent: import('./project-tags').ProjectTagsIntent } }) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectAttachmentWrite: (input: PreparedProjectAttachmentWrite & { request: { projectId: string; requestId: string; intent: ProjectAttachmentIntent }; result: { id: string; attachmentIds: string[] } }) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectFileRemoveWrite: (input: PreparedProjectFileRemoveWrite & { request: { projectId: string; requestId: string; intent: ProjectFileRemoveIntent }; result: { id: string; attachmentIds: string[] } }) => Promise<PreparedTaskEditResult>;
-    commitPreparedProjectFileAddWrite: (input: PreparedProjectFileAddWrite & { request: { projectId: string; requestId: string }; result: { id: string; attachmentIds: string[] } }, authority: PreparedAreaAuthority) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectFileAddWrite: (input: PreparedProjectFileAddWrite & { request: { projectId: string; requestId: string; version?: 2; sourceSha256?: string }; result: { id: string; attachmentIds: string[] } }, authority: PreparedAreaAuthority) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectStatus: (input: PreparedProjectStatus & { request: { projectId: string; status: 'active' | 'waiting' | 'someday' } }) => Promise<PreparedTaskEditResult>;
     commitPreparedTrashProjectRestore: (input: PreparedTrashProjectRestore) => Promise<PreparedTaskEditResult>;
     commitPreparedProjectDelete: (input: PreparedProjectDelete) => Promise<PreparedTaskEditResult>;

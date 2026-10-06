@@ -5506,6 +5506,7 @@ const poll = async (state, id) => {
         ['project-file-remove', 'v1.3.5/ios-project-file-remove', 'saved'],
         ['project-file-add', 'v1.3.5/ios-project-file-add', 'saved'],
         ['project-file-add', 'v1.3.5/ios-project-file-add', 'abandoned'],
+        ['project-file-hash', 'v1.3.5/ios-project-file-hash', 'saved'],
     ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };

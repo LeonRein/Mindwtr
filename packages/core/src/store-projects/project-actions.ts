@@ -911,7 +911,11 @@ export const createProjectCoreActions = ({
     commitPreparedProjectFileAddWrite: async (input, authority): Promise<PreparedTaskEditResult> => {
         let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
             error: 'Prepared Project file Add conflicts with current data' };
-        if (input.version !== 3 || input.kind !== 'project-file-add'
+        if ((input.version !== 3 && input.version !== 4) || input.kind !== 'project-file-add'
+            || input.version === 3 && ('version' in input.request || 'sourceSha256' in input.request)
+            || input.version === 4 && (input.request.version !== 2
+                || typeof input.request.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(input.request.sourceSha256)
+                || input.attachment.fileHash !== input.request.sourceSha256)
             || input.attachment.id !== input.request.requestId || input.result.id !== input.request.projectId
             || !taskEditValuesEqual(input.result.attachmentIds, [input.request.requestId])) return result;
         const planned = projectFileAddWriteEffect(input.scope.project, input.attachment,

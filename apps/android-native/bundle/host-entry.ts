@@ -3499,11 +3499,12 @@ globalThis.MindwtrHost = {
             const relocatedOpen = ['relocated-task-file-open', 'relocated-project-file-open'].includes(operation) && outcome === 'prepared';
             const projectFileRemove = operation === 'project-file-remove' && outcome === 'saved';
             const projectFileAdd = operation === 'project-file-add' && ['saved', 'abandoned'].includes(outcome);
+            const projectFileHash = operation === 'project-file-hash' && outcome === 'saved';
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !relocatedOpen && !projectFileRemove && !projectFileAdd
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !relocatedOpen && !projectFileRemove && !projectFileAdd && !projectFileHash
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || relocatedOpen || projectFileRemove || projectFileAdd)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || relocatedOpen || projectFileRemove || projectFileAdd || projectFileHash)) return {};
             try {
                 if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
                     ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
@@ -3520,6 +3521,7 @@ globalThis.MindwtrHost = {
                         : relocatedOpen ? { releaseCheck: 'v1.3.5/ios-relocated-file-open', surface: operation === 'relocated-task-file-open' ? 'task' : 'project' }
                         : projectFileRemove ? { releaseCheck: 'v1.3.5/ios-project-file-remove' }
                         : projectFileAdd ? { releaseCheck: 'v1.3.5/ios-project-file-add' }
+                        : projectFileHash ? { releaseCheck: 'v1.3.5/ios-project-file-hash' }
                         : containerRecovery ? { releaseCheck: 'v1.3.5/ios-attachment-container-recovery' }
                         : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }

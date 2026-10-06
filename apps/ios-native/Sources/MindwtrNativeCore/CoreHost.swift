@@ -14701,7 +14701,7 @@ private final class Engine: @unchecked Sendable {
         let state = try JSONDecoder().decode(ProjectAddState.self, from: Data(values[0].utf8))
         let request = try Self.projectObject(state.requestJSON, maximum: 4 * 1024 * 1024)
         let envelope = try Self.projectObject(state.envelopeJSON)
-        guard state.version == 1, Set(request.keys) == Set(["requestId", "projectId", "expected"]),
+        guard [1, 2].contains(state.version), Set(request.keys) == Set(["requestId", "projectId", "expected"]),
               let id = Self.ownedDiscardUUID(request["requestId"]), let project = request["projectId"] as? String,
               !project.isEmpty, project.utf8.count <= 2_000, request["expected"] is [String: Any],
               Set(envelope.keys) == Set(["request", "prepared"]), let enriched = envelope["request"] as? [String: Any],
@@ -14711,7 +14711,7 @@ private final class Engine: @unchecked Sendable {
               enriched["managedDirectoryURI"] as? String == (try projectManagedURI()),
               let picked = enriched["picked"] as? [String: Any], picked["uri"] as? String == state.source.sourceURI,
               Self.isInteger(enriched["measuredSize"]) && (enriched["measuredSize"] as? NSNumber)?.int64Value == state.source.size,
-              prepared["version"] as? Int == 3, prepared["kind"] as? String == "project-file-add",
+              prepared["version"] as? Int == (state.version == 2 ? 4 : 3), prepared["kind"] as? String == "project-file-add",
               let target = prepared["targetURI"] as? String,
               target.utf8.count <= 16 * 1024, let targetURL = URL(string: target),
               Self.ownedEqual(targetURL.deletingLastPathComponent().absoluteString, try projectManagedURI()),
@@ -14722,6 +14722,15 @@ private final class Engine: @unchecked Sendable {
               state.source.sha256.utf8.count == 64,
               state.source.sha256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               [state.source.identity, state.source.cacheRootIdentity, state.source.parentIdentity].allSatisfy(Self.projectToken) else { throw Self.projectFileAddFailure }
+        if state.version == 2 {
+            guard Set(enriched.keys) == Set(["version", "sourceSha256", "requestId", "projectId", "expected", "picked", "measuredSize", "managedDirectoryURI"]),
+                  enriched["version"] as? Int == 2, enriched["sourceSha256"] as? String == state.source.sha256,
+                  let attachment = prepared["attachment"] as? [String: Any], attachment["fileHash"] as? String == state.source.sha256,
+                  let pickedPreparation = prepared["prepared"] as? [String: Any],
+                  let sourceAttachment = pickedPreparation["attachment"] as? [String: Any], sourceAttachment["fileHash"] as? String == state.source.sha256 else { throw Self.projectFileAddFailure }
+        } else {
+            guard Set(enriched.keys) == Set(["requestId", "projectId", "expected", "picked", "measuredSize", "managedDirectoryURI"]) else { throw Self.projectFileAddFailure }
+        }
         let root = URL(string: try projectManagedURI())!.deletingLastPathComponent().deletingLastPathComponent()
         let cache = root.appendingPathComponent("cache", isDirectory: true)
         guard let sourceURL = URL(string: state.source.sourceURI),
@@ -14938,13 +14947,14 @@ private final class Engine: @unchecked Sendable {
             let source = try JSONDecoder().decode(ProjectSource.self, from: Data(Self.ownedJSON(sourceValue).utf8))
             guard receipt.matches(projectSource(source)) else { throw Self.projectFileAddFailure }
             let picked: [String: Any] = ["uri": receipt.sourceURI, "name": receipt.fileName, "mimeType": receipt.mimeType as Any? ?? NSNull(), "size": receipt.size]
-            let enriched: [String: Any] = ["requestId": request["requestId"]!, "projectId": projectID, "expected": request["expected"]!,
+            let enriched: [String: Any] = ["version": 2, "sourceSha256": source.sha256,
+                "requestId": request["requestId"]!, "projectId": projectID, "expected": request["expected"]!,
                 "picked": picked, "measuredSize": receipt.size, "managedDirectoryURI": try projectManagedURI()]
             let preparation = try Self.projectObject(invoke("projectFileAddWritePrepare", arguments: [Self.ownedJSON(enriched)], localCancellation: cancellation))
             try requireProjectFileAddTurn(); try turn.jobs.requireProviderSource(receipt)
             guard preparation["kind"] as? String == "prepared", let prepared = preparation["prepared"] as? [String: Any] else { throw Self.projectFileAddFailure }
             let envelope = try Self.ownedJSON(["request": enriched, "prepared": prepared])
-            var state = ProjectAddState(version: 1, requestJSON: requestJSON, envelopeJSON: envelope, source: source,
+            var state = ProjectAddState(version: 2, requestJSON: requestJSON, envelopeJSON: envelope, source: source,
                                         managedDirectoryIdentity: turn.managedDirectoryIdentity)
             try projectPreflight(state)
             _ = try invoke("projectFileAddWriteValidate", arguments: [envelope])
@@ -15200,6 +15210,10 @@ private final class Engine: @unchecked Sendable {
         try requireProjectFileAddTurn()
         _ = try? invoke("attachmentDraftAcknowledged", arguments: ["project-file-add", state.abandoned ? "abandoned" : "saved"])
         try requireProjectFileAddTurn()
+        if state.version == 2 && !state.abandoned {
+            _ = try? invoke("attachmentDraftAcknowledged", arguments: ["project-file-hash", "saved"])
+            try requireProjectFileAddTurn()
+        }
         projectFileAddTurn = nil
         let envelope = try Self.projectObject(state.envelopeJSON), prepared = envelope["prepared"] as! [String: Any]
         return state.abandoned ? "{\"abandoned\":true}" : try Self.ownedJSON(prepared["result"]!)
