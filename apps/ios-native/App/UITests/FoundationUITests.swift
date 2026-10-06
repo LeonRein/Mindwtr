@@ -1646,7 +1646,9 @@ final class FoundationUITests: XCTestCase {
         if details.value as? String == "Expand" { boardTap(app, "task-editor-section-details") }
         let add = app.buttons["task-attachment-add-file"]
         revealPagedElement(app, add, in: scroll, outerEdge: true)
-        boardEnabled(add); XCTAssertEqual(add.label, "Add file"); add.tap()
+        boardEnabled(add); XCTAssertEqual(add.label, "Add file")
+        XCTAssertGreaterThanOrEqual(add.frame.height, 44)
+        add.tap()
         // The system document picker owns this Cancel, not editor Discard.
         let cancel = app.navigationBars.buttons["Cancel"].firstMatch
         boardEnabled(cancel, timeout: 30); cancel.tap()
@@ -1658,6 +1660,50 @@ final class FoundationUITests: XCTestCase {
         boardEnabled(app.buttons["Attachment picker preserved"], timeout: 30)
         app.terminate(); app.launch()
         boardEnabled(app.buttons["Attachment picker preserved"], timeout: 30)
+        XCTAssertFalse(app.buttons["task-recovery-open"].exists)
+        app.terminate()
+    }
+
+    func testTaskPhotoPickerCancellationPreservesEditedTitleThroughSaveAndRestart() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        let library = UUID().uuidString.lowercased()
+        app.launchArguments = ["--native-ui-test-library", library]
+        print("Photo picker cancellation isolated library: " + library)
+        app.launch()
+        boardTap(app, "capture-open")
+        let capture = app.textViews["capture-input"]
+        boardEnabled(capture); capture.tap(); capture.typeText("Photo picker draft")
+        boardTap(app, "capture-save")
+        let row = app.buttons["Photo picker draft"]
+        boardEnabled(row, timeout: 30); row.tap(); boardTap(app, "task-mode-edit")
+        replaceProjectNotesText(app.textFields["task-editor-title"], with: "Photo picker preserved")
+        let scroll = app.scrollViews["task-editor-scroll"]
+        let details = app.buttons["task-editor-section-details"]
+        revealPagedElement(app, details, in: scroll, outerEdge: true)
+        if details.value as? String == "Expand" { boardTap(app, "task-editor-section-details") }
+        let rows = app.otherElements.matching(NSPredicate(format: "identifier BEGINSWITH %@", "task-attachment-row-"))
+        XCTAssertEqual(rows.count, 0)
+        let add = app.buttons["task-attachment-add-photo"]
+        revealPagedElement(app, add, in: scroll, outerEdge: true)
+        boardEnabled(add); XCTAssertEqual(add.label, "Add photo")
+        XCTAssertGreaterThanOrEqual(add.frame.height, 44)
+        add.tap()
+        // This is the actual selected-access Photos picker, not editor Discard.
+        let cancel = app.navigationBars.buttons["Cancel"].firstMatch
+        boardEnabled(cancel, timeout: 30); cancel.tap()
+        revealAttachmentTestTitle(app)
+        boardEnabled(app.textFields["task-editor-title"], timeout: 30)
+        XCTAssertEqual(app.textFields["task-editor-title"].value as? String, "Photo picker preserved")
+        XCTAssertFalse(app.staticTexts["task-attachment-error"].exists)
+        revealPagedElement(app, add, in: scroll, outerEdge: true)
+        boardEnabled(add, timeout: 30)
+        XCTAssertEqual(rows.count, 0)
+        revealAttachmentTestTitle(app)
+        boardTap(app, "task-editor-save")
+        boardEnabled(app.buttons["Photo picker preserved"], timeout: 30)
+        app.terminate(); app.launch()
+        boardEnabled(app.buttons["Photo picker preserved"], timeout: 30)
         XCTAssertFalse(app.buttons["task-recovery-open"].exists)
         app.terminate()
     }

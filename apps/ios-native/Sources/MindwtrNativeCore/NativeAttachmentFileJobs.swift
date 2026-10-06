@@ -4,7 +4,18 @@ import Foundation
 final class NativeAttachmentCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
-    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    private var cancellationHandler: (() -> Void)?
+    func cancel() {
+        lock.lock()
+        let first = !cancelled; cancelled = true
+        let callback = first ? cancellationHandler : nil
+        lock.unlock()
+        callback?()
+    }
+    func setCancellationHandler(_ callback: (() -> Void)?) {
+        lock.lock(); cancellationHandler = callback; let alreadyCancelled = cancelled; lock.unlock()
+        if alreadyCancelled { callback?() }
+    }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     func check() throws { if isCancelled { throw NativeAttachmentFileJobsError.cancelled } }
 }
@@ -14,9 +25,8 @@ final class NativeAttachmentLocalRequests: @unchecked Sendable {
     private var tokens: [UUID: NativeAttachmentCancellation] = [:]
     private var closing = false
     func register(_ token: NativeAttachmentCancellation, id: UUID) {
-        lock.lock(); defer { lock.unlock() }
-        if closing { token.cancel() }
-        tokens[id] = token
+        lock.lock(); let shouldCancel = closing; tokens[id] = token; lock.unlock()
+        if shouldCancel { token.cancel() }
     }
     func remove(_ id: UUID) { lock.lock(); tokens.removeValue(forKey: id); lock.unlock() }
     func close() {
@@ -429,6 +439,16 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
             try cancellation.check()
             mutationLock.lock(); defer { mutationLock.unlock() }
             return try files.copyProviderSource(url, checkCancellation: cancellation.check)
+        }
+    }
+    func copyPhotoProviderSource(_ url: URL, selection: NativeAttachmentPhotoSelection,
+                                 cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentFiles.ProviderCacheCopyReceipt {
+        try queue.sync {
+            lock.lock(); let ready = accepting; lock.unlock()
+            guard ready else { throw NativeAttachmentFileJobsError.unavailable }
+            try cancellation.check()
+            mutationLock.lock(); defer { mutationLock.unlock() }
+            return try files.copyPhotoProviderSource(url, selection: selection, checkCancellation: cancellation.check)
         }
     }
     func requireProviderSource(_ receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt) throws {

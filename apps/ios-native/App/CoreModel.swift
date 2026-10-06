@@ -786,6 +786,7 @@ final class CoreModel: ObservableObject {
     }
     enum TaskOwnedMenuAction: String { case delete, duplicate, promote }
     enum TaskOwnedMenuDisposition: Equatable { case save, discard, cancel }
+    enum TaskAttachmentPickerKind: Equatable { case file, photo }
     @Published private(set) var taskAttachmentState: TaskAttachmentState = .none
     @Published private(set) var taskAttachmentError: String?
     @Published private(set) var taskAttachmentWorking = false
@@ -799,6 +800,7 @@ final class CoreModel: ObservableObject {
     private var taskAttachmentDiscardRequest: String?
     private struct TaskFileImportClaim {
         let id: UUID
+        let kind: TaskAttachmentPickerKind
         let host: CoreHost
         let taskID: String
         let session: String
@@ -807,6 +809,12 @@ final class CoreModel: ObservableObject {
     }
     private var taskFileImportClaim: TaskFileImportClaim?
     private var taskFileImportTask: Task<Void, Never>?
+    private var taskFileImportAdmission = UUID()
+    var taskFileImporterKind: TaskAttachmentPickerKind? { taskFileImportClaim?.kind }
+    private enum TaskAttachmentImportSource {
+        case file(URL)
+        case photo(NSItemProvider)
+    }
     private struct TaskOwnedMenuSelection {
         let host: CoreHost
         let action: TaskOwnedMenuAction
@@ -2523,11 +2531,12 @@ final class CoreModel: ObservableObject {
         try await refreshTaskAttachmentRows()
     }
 
-    private func beginTaskAttachmentOwner(_ currentHost: CoreHost) async throws {
+    private func beginTaskAttachmentOwner(_ currentHost: CoreHost, importAdmission: UUID? = nil) async throws {
         let session = taskRecoverySession, taskID = viewedTaskID
         func requireClaim() throws {
             guard host === currentHost, taskPresented, taskRecoverySession == session, viewedTaskID == taskID,
-                  !appLock.concealed, !Task.isCancelled else { throw CancellationError() }
+                  !appLock.concealed, !Task.isCancelled,
+                  importAdmission == nil || taskFileImportAdmission == importAdmission else { throw CancellationError() }
         }
         try await resolveTaskEditorInputs()
         try requireClaim()
@@ -2548,25 +2557,42 @@ final class CoreModel: ObservableObject {
     }
 
     func prepareTaskFileImport() async -> UUID? {
+        await prepareTaskAttachmentImport(kind: .file)
+    }
+
+    func prepareTaskPhotoImport() async -> UUID? {
+        await prepareTaskAttachmentImport(kind: .photo)
+    }
+
+    private func prepareTaskAttachmentImport(kind: TaskAttachmentPickerKind) async -> UUID? {
         guard canAddTaskFile, let currentHost = host else { return nil }
+        // Closing, concealment or backgrounding can cancel before a picker ID
+        // exists. Fence every preparation await for both Files and Photos.
+        let admission = taskFileImportAdmission
+        let session = taskRecoverySession, taskID = viewedTaskID
         busy = true
         taskAttachmentWorking = true
         taskAttachmentError = nil
         defer { taskAttachmentWorking = false; finishOperation() }
         do {
-            try await beginTaskAttachmentOwner(currentHost)
-            guard host === currentHost, taskHasActiveAttachmentOwner, taskAttachmentState == .active,
-                  !appLock.concealed, taskPresented else { throw CancellationError() }
+            try await beginTaskAttachmentOwner(currentHost, importAdmission: admission)
+            guard taskFileImportAdmission == admission, host === currentHost,
+                  taskRecoverySession == session, viewedTaskID == taskID,
+                  taskHasActiveAttachmentOwner, taskAttachmentState == .active,
+                  !appLock.concealed, taskPresented, !Task.isCancelled else { throw CancellationError() }
             let id = UUID()
-            taskFileImportClaim = TaskFileImportClaim(id: id, host: currentHost, taskID: viewedTaskID,
-                session: taskRecoverySession, generation: taskRecoveryGeneration,
+            taskFileImportClaim = TaskFileImportClaim(id: id, kind: kind, host: currentHost, taskID: taskID,
+                session: session, generation: taskRecoveryGeneration,
                 requestID: UUID().uuidString.lowercased())
             taskFileImporterID = id
             taskFileImporterPresented = true
             return id
         } catch {
-            taskAttachmentError = error.localizedDescription
-            try? await readTaskAttachmentInventory(currentHost)
+            if taskFileImportAdmission == admission, host === currentHost,
+               taskRecoverySession == session, viewedTaskID == taskID, !Task.isCancelled {
+                taskAttachmentError = error.localizedDescription
+                try? await readTaskAttachmentInventory(currentHost)
+            }
             return nil
         }
     }
@@ -2577,6 +2603,7 @@ final class CoreModel: ObservableObject {
     }
 
     func cancelTaskFileImport() {
+        taskFileImportAdmission = UUID()
         taskFileImporterID = nil
         taskFileImporterPresented = false
         taskFileImportClaim = nil
@@ -2586,14 +2613,32 @@ final class CoreModel: ObservableObject {
     }
 
     func completeTaskFileImport(_ result: Result<[URL], Error>, pickerID: UUID) async {
+        guard taskFileImportClaim?.id == pickerID, taskFileImportClaim?.kind == .file else { return }
+        let selection: Result<TaskAttachmentImportSource?, Error> = result.map { urls in
+            guard urls.count == 1, let url = urls.first else { return nil }
+            return .file(url)
+        }
+        await completeTaskAttachmentImport(selection, pickerID: pickerID)
+    }
+
+    func completeTaskPhotoImport(_ result: Result<[NSItemProvider], Error>, pickerID: UUID) async {
+        guard taskFileImportClaim?.id == pickerID, taskFileImportClaim?.kind == .photo else { return }
+        let selection: Result<TaskAttachmentImportSource?, Error> = result.map { providers in
+            guard providers.count == 1, let provider = providers.first else { return nil }
+            return .photo(provider)
+        }
+        await completeTaskAttachmentImport(selection, pickerID: pickerID)
+    }
+
+    private func completeTaskAttachmentImport(_ result: Result<TaskAttachmentImportSource?, Error>, pickerID: UUID) async {
         guard let claim = taskFileImportClaim, claim.id == pickerID else { return }
         guard taskAttachmentClaimIsCurrent(claim) else { cancelTaskFileImport(); return }
         taskFileImporterPresented = false
-        let url: URL
+        let source: TaskAttachmentImportSource
         switch result {
-        case .success(let urls):
-            guard urls.count == 1, let selection = urls.first else { cancelTaskFileImport(); return }
-            url = selection
+        case .success(let selection):
+            guard let selection else { cancelTaskFileImport(); return }
+            source = selection
         case .failure(let failure):
             let value = failure as NSError
             if value.domain != NSCocoaErrorDomain || value.code != NSUserCancelledError { taskAttachmentError = failure.localizedDescription }
@@ -2612,8 +2657,16 @@ final class CoreModel: ObservableObject {
                 finishOperation()
             }
             do {
-                let reply = try decode(try await claim.host.addProviderAttachmentV3(selectedURL: url,
-                    expectedSession: claim.session, expectedGeneration: claim.generation, requestId: claim.requestID))
+                let encoded: String
+                switch source {
+                case .file(let url):
+                    encoded = try await claim.host.addProviderAttachmentV3(selectedURL: url,
+                        expectedSession: claim.session, expectedGeneration: claim.generation, requestId: claim.requestID)
+                case .photo(let provider):
+                    encoded = try await claim.host.addPhotoProviderAttachmentV3(itemProvider: provider,
+                        expectedSession: claim.session, expectedGeneration: claim.generation, requestId: claim.requestID)
+                }
+                let reply = try decode(encoded)
                 guard taskAttachmentClaimIsCurrent(claim, requireGeneration: false),
                       reply.text("requestId") == claim.requestID, reply.text("sessionID") == claim.session,
                       reply.text("status") == "added" else { throw CancellationError() }
@@ -21138,7 +21191,7 @@ final class CoreModel: ObservableObject {
                     "recurrence.lastDay", "recurrence.lastDayOfMonth", "recurrence.onDayOfMonth", "recurrence.onNthWeekday",
                     "recurrence.weekdayMonFri", "recurrence.ordinal.first", "recurrence.ordinal.second",
                     "recurrence.ordinal.third", "recurrence.ordinal.fourth", "recurrence.ordinal.last",
-                    "attachments.title", "attachments.addLink", "attachments.addFile", "attachments.remove",
+                    "attachments.title", "attachments.addLink", "attachments.addFile", "attachments.addPhoto", "attachments.remove",
                     "attachments.linkPlaceholder", "attachments.linkBatchHint", "common.edit", "common.ok"]
         keys += options.objects("recurrences").map { $0.text("labelKey") }
         keys += (options["statuses"] as? [String] ?? []).map { "status." + $0 }

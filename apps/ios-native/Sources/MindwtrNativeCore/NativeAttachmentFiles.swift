@@ -333,6 +333,14 @@ final class NativeAttachmentFiles {
     }
 
     func copyProviderSource(_ selectedURL: URL, checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
+        try copyProviderSource(selectedURL, photo: nil, checkCancellation: checkCancellation)
+    }
+    func copyPhotoProviderSource(_ selectedURL: URL, selection: NativeAttachmentPhotoSelection,
+                                 checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
+        try copyProviderSource(selectedURL, photo: selection, checkCancellation: checkCancellation)
+    }
+    private func copyProviderSource(_ selectedURL: URL, photo: NativeAttachmentPhotoSelection?,
+                                    checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
         guard selectedURL.isFileURL else { throw NativeAttachmentFilesError.invalidRequest }
         _ = try Self.filePath(selectedURL.absoluteString)
         try checkCancellation()
@@ -341,7 +349,7 @@ final class NativeAttachmentFiles {
         var coordinationError: NSError?
         var result: Result<ProviderCacheCopyReceipt, Error>?
         NSFileCoordinator().coordinate(readingItemAt: selectedURL, options: .withoutChanges, error: &coordinationError) { url in
-            result = Result { try self.copyCoordinatedProviderSource(url, fallbackName: selectedURL.lastPathComponent,
+            result = Result { try self.copyCoordinatedProviderSource(url, fallbackName: selectedURL.lastPathComponent, photo: photo,
                                                                    checkCancellation: checkCancellation) }
         }
         if coordinationError != nil {
@@ -355,7 +363,7 @@ final class NativeAttachmentFiles {
         catch { throw NativeAttachmentFilesError.unavailable }
     }
 
-    private func copyCoordinatedProviderSource(_ url: URL, fallbackName: String,
+    private func copyCoordinatedProviderSource(_ url: URL, fallbackName: String, photo: NativeAttachmentPhotoSelection?,
                                              checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
         try checkCancellation()
         let sourcePath = try Self.filePath(url.absoluteString)
@@ -379,7 +387,7 @@ final class NativeAttachmentFiles {
         let input = try openSource(); defer { Darwin.close(input) }
         let before = try Self.regular(input)
         guard before.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
-        guard before.st_size <= Self.maximumProviderBytes else { throw NativeAttachmentFilesError.providerTooLarge }
+        guard before.st_size <= (photo == nil ? Self.maximumProviderBytes : NativeAttachmentPhotoEncoder.maximumInputBytes) else { throw NativeAttachmentFilesError.providerTooLarge }
         func validateSource() throws {
             guard try sourceParentIdentity() == parentIdentity else { throw NativeAttachmentFilesError.unavailable }
             let named = try openSource(); defer { Darwin.close(named) }
@@ -389,10 +397,32 @@ final class NativeAttachmentFiles {
                   try sourceParentIdentity() == parentIdentity else { throw NativeAttachmentFilesError.unavailable }
         }
         let metadata = try? url.resourceValues(forKeys: [.nameKey, .contentTypeKey])
-        let fileName = metadata?.name.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
-        let mimeType = metadata?.contentType?.preferredMIMEType
+        var fileName = metadata?.name.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
+        var mimeType = metadata?.contentType?.preferredMIMEType
         try validateSource()
+        var encodedPhoto: NativeAttachmentPhotoEncoder.Encoded?
+        if let photo {
+            var borrowed = Data()
+            let read = try hashContents(input, checkCancellation: {
+                try validateSource(); try checkCancellation()
+            }) { bytes in
+                guard Int64(borrowed.count) <= NativeAttachmentPhotoEncoder.maximumInputBytes - Int64(bytes.count) else {
+                    throw NativeAttachmentFilesError.providerTooLarge
+                }
+                borrowed.append(bytes)
+            }
+            guard read.size == before.st_size else { throw NativeAttachmentFilesError.unavailable }
+            try validateSource(); try checkCancellation()
+            encodedPhoto = try NativeAttachmentPhotoEncoder.encode(borrowed, selection: photo) {
+                try validateSource(); try checkCancellation()
+            }
+            try validateSource(); try checkCancellation()
+        }
         let leaf = UUID().uuidString.lowercased(), partial = UUID().uuidString.lowercased()
+        if let photo, let encodedPhoto {
+            fileName = (photo.suggestedName ?? leaf) + "." + encodedPhoto.fileExtension
+            mimeType = encodedPhoto.mimeType
+        }
         let path = Reference(cache: true, components: [leaf]), partialPath = Reference(cache: true, components: [partial])
         let parent = try openParent(path); defer { Darwin.close(parent.fd) }
         let output = Darwin.openat(parent.fd, partial, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
@@ -453,14 +483,25 @@ final class NativeAttachmentFiles {
         #endif
         try check()
         var written: Int64 = 0
-        let content = try hashContents(input, checkCancellation: check) { bytes in
-            guard written <= Self.maximumProviderBytes - Int64(bytes.count) else {
-                throw NativeAttachmentFilesError.providerTooLarge
+        let content: AttachmentStageContent
+        if let encodedPhoto {
+            var digest = SHA256()
+            for offset in stride(from: 0, to: encodedPhoto.bytes.count, by: 64 * 1024) {
+                let bytes = encodedPhoto.bytes.subdata(in: offset..<min(offset + 64 * 1024, encodedPhoto.bytes.count))
+                try check(); try Self.write(output, bytes); written += Int64(bytes.count); digest.update(data: bytes)
             }
-            try check(); try Self.write(output, bytes); written += Int64(bytes.count)
+            content = AttachmentStageContent(sha256: digest.finalize().map { String(format: "%02x", $0) }.joined(), size: written)
+        } else {
+            content = try hashContents(input, checkCancellation: check) { bytes in
+                guard written <= Self.maximumProviderBytes - Int64(bytes.count) else {
+                    throw NativeAttachmentFilesError.providerTooLarge
+                }
+                try check(); try Self.write(output, bytes); written += Int64(bytes.count)
+            }
+            guard content.size == before.st_size else { throw NativeAttachmentFilesError.unavailable }
         }
         try check()
-        guard content.size == before.st_size, written == content.size else { throw NativeAttachmentFilesError.unavailable }
+        guard written == content.size else { throw NativeAttachmentFilesError.unavailable }
         #if DEBUG
         try beforeStageSync?()
         #endif

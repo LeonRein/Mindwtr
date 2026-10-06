@@ -3,6 +3,7 @@ import UIKit
 import LinkPresentation
 import UniformTypeIdentifiers
 import QuickLook
+import PhotosUI
 
 private struct TaskDraftDirection: ViewModifier {
     let direction: LayoutDirection
@@ -119,14 +120,24 @@ struct TaskViewSheet: View {
             }
         .sheet(item: Binding(
             get: {
-                guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented else { return nil }
-                return NativeDocumentPickerClaim(id: pickerID)
+                guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented,
+                      let kind = model.taskFileImporterKind else { return nil }
+                return TaskAttachmentPickerClaim(id: pickerID, kind: kind)
             },
-            set: { (claim: NativeDocumentPickerClaim?) in
+            set: { (claim: TaskAttachmentPickerClaim?) in
                 if claim == nil { model.setTaskFileImporterPresented(false, pickerID: pickerID) }
             })) { claim in
-                NativeDocumentPicker(pickerID: claim.id) { result, capturedID in
-                    Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
+                Group {
+                    switch claim.kind {
+                    case .file:
+                        NativeDocumentPicker(pickerID: claim.id) { result, capturedID in
+                            Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
+                        }
+                    case .photo:
+                        NativePhotoPicker(pickerID: claim.id) { result, capturedID in
+                            Task { await model.completeTaskPhotoImport(result, pickerID: capturedID) }
+                        }
+                    }
                 }
                 .id(claim.id)
                 .interactiveDismissDisabled()
@@ -1242,22 +1253,38 @@ struct TaskViewSheet: View {
             } label: {
                 Label(strings.text("attachments.addLink"), systemImage: "link")
                     .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(palette.tint)
             .accessibilityIdentifier("task-attachment-add-link")
             Button {
                 endEditingBeforeAction()
                 Task {
-                    guard let id = await model.prepareTaskFileImport() else { return }
+                    guard let id = await model.prepareTaskFileImport(), id == model.taskFileImporterID else { return }
                     fileImporterID = id
                 }
             } label: {
                 Label(strings.text("attachments.addFile"), systemImage: "paperclip")
                     .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(palette.tint)
             .disabled(frozen || !model.canAddTaskFile)
             .accessibilityIdentifier("task-attachment-add-file")
+            Button {
+                endEditingBeforeAction()
+                Task {
+                    guard let id = await model.prepareTaskPhotoImport(), id == model.taskFileImporterID else { return }
+                    fileImporterID = id
+                }
+            } label: {
+                Label(strings.text("attachments.addPhoto"), systemImage: "photo")
+                    .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(palette.tint)
+            .disabled(frozen || !model.canAddTaskFile)
+            .accessibilityIdentifier("task-attachment-add-photo")
         }
     }
 
@@ -1399,6 +1426,53 @@ struct TaskViewSheet: View {
         }
     }
 
+}
+
+private struct TaskAttachmentPickerClaim: Identifiable {
+    let id: UUID
+    let kind: CoreModel.TaskAttachmentPickerKind
+}
+
+private struct NativePhotoPicker: UIViewControllerRepresentable {
+    let pickerID: UUID
+    let completion: (Result<[NSItemProvider], Error>, UUID) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(pickerID: pickerID, completion: completion) }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration()
+        configuration.filter = .images
+        configuration.selectionLimit = 1
+        configuration.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: configuration)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let pickerID: UUID
+        let completion: (Result<[NSItemProvider], Error>, UUID) -> Void
+        private var delivered = false
+
+        init(pickerID: UUID, completion: @escaping (Result<[NSItemProvider], Error>, UUID) -> Void) {
+            self.pickerID = pickerID
+            self.completion = completion
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard !delivered else { return }
+            delivered = true
+            guard !results.isEmpty else {
+                completion(.failure(CocoaError(.userCancelled)), pickerID)
+                return
+            }
+            // Retain the selected provider; its temporary representation is
+            // acquired and captured only by the typed native facade.
+            completion(.success(results.map(\.itemProvider)), pickerID)
+        }
+    }
 }
 
 struct NativeDocumentPickerClaim: Identifiable {

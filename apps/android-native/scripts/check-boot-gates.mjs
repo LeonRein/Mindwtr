@@ -5420,6 +5420,7 @@ const poll = async (state, id) => {
     for (const [operation, releaseCheck, accepted = 'confirmed'] of [
         ['preexisting-journal-replay', 'v1.3.5/ios-preexisting-attachment-journal-replay'],
         ['container-relocation', 'v1.3.5/ios-attachment-container-recovery'],
+        ['photo-add', 'v1.3.5/ios-task-photo-add'],
         ['file-open', 'v1.3.5/ios-local-file-open', 'prepared'],
         ['project-file-open', 'v1.3.5/ios-project-local-file-open', 'prepared'],
         ['project-file-remove', 'v1.3.5/ios-project-file-remove', 'saved'],

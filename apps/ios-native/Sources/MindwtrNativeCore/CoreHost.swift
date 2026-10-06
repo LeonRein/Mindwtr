@@ -194,6 +194,29 @@ public final class CoreHost: @unchecked Sendable {
                 expectedGeneration: expectedGeneration, requestId: requestId, cancellation: token) }
         }, onCancel: { token.cancel() })
     }
+    /// Captures and processes one selected photo before its provider callback lease ends.
+    public func addPhotoProviderAttachmentV3(itemProvider: NSItemProvider, expectedSession: String,
+                                             expectedGeneration: Int, requestId: String) async throws -> String {
+        let selection = try NativeAttachmentPhotoSelection(provider: itemProvider)
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            let capture = try await perform { try $0.beginPhotoProviderAttachmentV3(selection: selection,
+                expectedSession: expectedSession, expectedGeneration: expectedGeneration, requestId: requestId, cancellation: token) }
+            do {
+                // No JS binding crosses this await. The callback retains its temporary URL
+                // until capture finishes, including a cancellation that arrives during copy.
+                let receipt = try await capture.load(itemProvider)
+                return try await perform { try $0.finishPhotoProviderAttachmentV3(captureID: capture.id,
+                    receipt: receipt, expectedGeneration: expectedGeneration, cancellation: token) }
+            } catch {
+                try? await perform { $0.abortPhotoProviderAttachmentV3(captureID: capture.id) }
+                throw HostFailure("Attachment draft operation could not be confirmed; retained evidence requires exact recovery")
+            }
+        }, onCancel: { token.cancel() })
+    }
     /// Finishes only the retained V3 Add, Remove or checkpoint advance for this session.
     public func recoverAttachmentDraftV3(expectedSession: String) async throws -> String {
         let id = UUID(), token = NativeAttachmentCancellation()
@@ -642,7 +665,8 @@ private final class Engine: @unchecked Sendable {
     private var attachmentJobs: NativeAttachmentFileJobs?
     private var attachmentGeneration: UInt64 = 0
     private struct ProviderCopyTurn {
-        let receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt
+        var receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt?
+        var photoCaptureID: UUID? = nil
         let session: String
         let requestId: String
         let generation: UInt64
@@ -2016,7 +2040,8 @@ private final class Engine: @unchecked Sendable {
 
     private func attachmentDraftCoordinator() throws -> NativeAttachmentDraftCoordinator {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard started, !closed, pending == nil, !recoveryActivationPending, let jobs = attachmentJobs else {
+        guard providerCopy?.receipt != nil || providerCopy == nil,
+              started, !closed, pending == nil, !recoveryActivationPending, let jobs = attachmentJobs else {
             throw HostFailure("Attachment draft recovery is not ready")
         }
         let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs) { [unowned self] method, arguments in
@@ -2031,7 +2056,8 @@ private final class Engine: @unchecked Sendable {
                                                additionalOwner: (() throws -> Void)? = nil) throws -> NativeAttachmentDraftCoordinator {
         dispatchPrecondition(condition: .onQueue(queue))
         try cancellation.check()
-        guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0, try ownedJournalIsAbsent(),
+        guard providerCopy?.receipt != nil || providerCopy == nil,
+              started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0, try ownedJournalIsAbsent(),
               let runtime = context, let jobs = attachmentJobs else { throw HostFailure("Attachment draft recovery is not ready") }
         let generation = attachmentGeneration
         let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs, requireOwner: { [unowned self] in
@@ -2107,6 +2133,7 @@ private final class Engine: @unchecked Sendable {
               turn.beforeEditor.matches(editor) else { throw HostFailure("Attachment provider owner is unavailable") }
     }
     private func finishProviderCopy(_ turn: ProviderCopyTurn, completed: Bool, recovered: Bool = false) throws {
+        guard let receipt = turn.receipt else { throw HostFailure("Attachment provider cleanup is unavailable") }
         turn.jobs.drain(); try requireProviderOwner(turn)
         let store = NativeAttachmentDraftStore(databaseURL: databaseURL)
         guard let binding = try store.readVersioned(), case .mixed(let record) = binding.record,
@@ -2121,7 +2148,7 @@ private final class Engine: @unchecked Sendable {
         if completed {
             if let entry = record.operations.first(where: { $0.requestId == turn.requestId }) {
                 guard case .add(let op) = entry, op.phase == .checkpointed, op.replyJSON != nil,
-                      turn.receipt.matches(.init(sourceURI: op.source.sourceURI, sha256: op.source.sha256,
+                      receipt.matches(.init(sourceURI: op.source.sourceURI, sha256: op.source.sha256,
                         size: op.source.size, identity: op.source.identity, cacheRootIdentity: op.source.cacheRootIdentity,
                         parentIdentity: op.source.parentIdentity)) else { throw HostFailure("Attachment provider cleanup is unavailable") }
             } else {
@@ -2142,7 +2169,7 @@ private final class Engine: @unchecked Sendable {
                 throw HostFailure("Attachment provider cleanup is unavailable")
             }
         }
-        _ = try turn.jobs.retireProviderSource(turn.receipt, requireOwner: check)
+        _ = try turn.jobs.retireProviderSource(receipt, requireOwner: check)
         providerCopy = nil
     }
     func addProviderAttachmentV3(selectedURL: URL, expectedSession: String, expectedGeneration: Int,
@@ -2169,31 +2196,77 @@ private final class Engine: @unchecked Sendable {
             let turn = ProviderCopyTurn(receipt: receipt, session: expectedSession, requestId: requestId,
                 generation: generation, runtime: runtime, jobs: jobs, beforeRecord: before, beforeEditor: editor)
             providerCopy = turn
-            do {
-                try cancellation.check(); try requireProviderBefore(turn)
-                try jobs.requireProviderSource(receipt)
-                let request = try Self.ownedJSON(["version": 1, "requestId": requestId, "sessionID": expectedSession,
-                    "generation": expectedGeneration, "picked": ["uri": receipt.sourceURI, "name": receipt.fileName,
-                        "mimeType": receipt.mimeType as Any? ?? NSNull(), "size": receipt.size] as [String: Any]])
-                let ownedAdd = try attachmentDraftCoordinatorV3(cancellation: cancellation,
-                    additionalOwner: { try jobs.requireProviderSource(receipt) })
-                let reply = try ownedAdd.addV3(request, cancellation: cancellation)
-                // Preserve the returned durable Add acknowledgment, including
-                // cancellation or lost sync ACK during optional scratch cleanup.
-                try? finishProviderCopy(turn, completed: true)
-                providerCopy = nil
-                // No diagnostic JSC callback may replace evidence between the
-                // trusted Add acknowledgment and cleanup's exact binding capture.
-                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["provider-add", "confirmed"])
-                return reply
-            } catch {
-                // Exact unchanged bytes/inodes, not catch text, prove no intent.
-                // Unknown/post-checkpoint outcomes keep the receipt for recovery.
-                try? finishProviderCopy(turn, completed: false)
-                throw error
-            }
+            return try addCapturedProviderAttachmentV3(turn, expectedGeneration: expectedGeneration,
+                cancellation: cancellation, acknowledgment: "provider-add")
         }
     }
+    func beginPhotoProviderAttachmentV3(selection: NativeAttachmentPhotoSelection, expectedSession: String,
+                                         expectedGeneration: Int, requestId: String,
+                                         cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentPhotoCapture {
+        try cancellation.check()
+        guard expectedSession.utf8.count == 36, requestId.utf8.count == 36,
+              UUID(uuidString: expectedSession)?.uuidString.lowercased() == expectedSession,
+              UUID(uuidString: requestId)?.uuidString.lowercased() == requestId,
+              expectedGeneration > 0, expectedGeneration < 9_007_199_254_740_990,
+              providerCopy == nil else { throw HostFailure("Attachment provider admission is unavailable") }
+        let coordinator = try attachmentDraftCoordinatorV3(cancellation: cancellation)
+        _ = try coordinator.beginV3(session: expectedSession, generation: expectedGeneration, cancellation: cancellation)
+        guard let before = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned(), case .mixed(let record) = before.record,
+              record.session.state == .active, record.discard == nil, record.checkpointAdvance == nil,
+              record.operations.allSatisfy({ $0.checkpointed }), !record.operations.contains(where: { $0.requestId == requestId }),
+              let editor = try editorDrafts.readOwnedCheckpoint(), editor.attempt == nil,
+              Self.ownedEqual(editor.snapshot, record.session.checkpoint),
+              let runtime = context, let jobs = attachmentJobs else { throw HostFailure("Attachment provider admission is unavailable") }
+        let captureID = UUID()
+        let turn = ProviderCopyTurn(receipt: nil, photoCaptureID: captureID, session: expectedSession, requestId: requestId,
+            generation: attachmentGeneration, runtime: runtime, jobs: jobs, beforeRecord: before, beforeEditor: editor)
+        try requireProviderBefore(turn)
+        providerCopy = turn
+        return NativeAttachmentPhotoCapture(id: captureID, jobs: jobs, cancellation: cancellation, selection: selection)
+    }
+    func abortPhotoProviderAttachmentV3(captureID: UUID) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        // A finished no-receipt load created no native scratch authority.
+        if let turn = providerCopy, turn.photoCaptureID == captureID, turn.receipt == nil { providerCopy = nil }
+    }
+    func finishPhotoProviderAttachmentV3(captureID: UUID, receipt: NativeAttachmentFiles.ProviderCacheCopyReceipt,
+                                          expectedGeneration: Int, cancellation: NativeAttachmentCancellation) throws -> String {
+        try attachmentDraftOperation {
+            guard var turn = providerCopy, turn.photoCaptureID == captureID, turn.receipt == nil else {
+                throw HostFailure("Attachment provider owner is unavailable")
+            }
+            // Bind successful creation before checking cancellation, so its exact
+            // receipt remains available for conservative pre-intent cleanup.
+            turn.receipt = receipt; providerCopy = turn
+            return try addCapturedProviderAttachmentV3(turn, expectedGeneration: expectedGeneration,
+                cancellation: cancellation, acknowledgment: "photo-add")
+        }
+    }
+    private func addCapturedProviderAttachmentV3(_ turn: ProviderCopyTurn, expectedGeneration: Int,
+                                                  cancellation: NativeAttachmentCancellation, acknowledgment: String) throws -> String {
+        guard let receipt = turn.receipt else { throw HostFailure("Attachment provider owner is unavailable") }
+        do {
+            try cancellation.check(); try requireProviderBefore(turn)
+            try turn.jobs.requireProviderSource(receipt)
+            let request = try Self.ownedJSON(["version": 1, "requestId": turn.requestId, "sessionID": turn.session,
+                "generation": expectedGeneration, "picked": ["uri": receipt.sourceURI, "name": receipt.fileName,
+                    "mimeType": receipt.mimeType as Any? ?? NSNull(), "size": receipt.size] as [String: Any]])
+            let ownedAdd = try attachmentDraftCoordinatorV3(cancellation: cancellation,
+                additionalOwner: { try self.requireProviderOwner(turn); try turn.jobs.requireProviderSource(receipt) })
+            let reply = try ownedAdd.addV3(request, cancellation: cancellation)
+            // The durable Add reply survives optional scratch cleanup failure.
+            let cleaned = (try? finishProviderCopy(turn, completed: true)) != nil
+            providerCopy = nil
+            if acknowledgment == "provider-add" || cleaned {
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: [acknowledgment, "confirmed"])
+            }
+            return reply
+        } catch {
+            try? finishProviderCopy(turn, completed: false)
+            throw error
+        }
+    }
+
     func recoverAttachmentDraftV3(expectedSession: String, cancellation: NativeAttachmentCancellation) throws -> String {
         try attachmentDraftOperation {
             let reply = try attachmentDraftCoordinatorV3(cancellation: cancellation).recoverV3(session: expectedSession, cancellation: cancellation)
@@ -2864,6 +2937,7 @@ private final class Engine: @unchecked Sendable {
     private func saveAttachmentDraftMixed(saveRequestJSON: String, expectedSession: String, expectedGeneration: Int,
                                          selection: NativeAttachmentDraftCoordinator.MixedSaveSelection,
                                          cancellation: NativeAttachmentCancellation) throws -> String {
+        guard providerCopy?.receipt != nil || providerCopy == nil else { throw HostFailure("Attachment provider is loading") }
         do {
             let prepared = try attachmentDraftCoordinatorV3(cancellation: cancellation).prepareMixedSave(saveRequestJSON,
                 session: expectedSession, generation: expectedGeneration, selection: selection, cancellation: cancellation)
@@ -3523,6 +3597,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     func discardAttachmentDraftV3(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        guard providerCopy?.receipt != nil || providerCopy == nil else { throw HostFailure("Attachment provider is loading") }
         dispatchPrecondition(condition: .onQueue(queue))
         do {
             guard started, !closed, !recoveryActivationPending, pending == nil, lockFD >= 0,
@@ -4314,6 +4389,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     func checkpointEditorDraft(_ snapshot: EditorDraftSnapshot) throws {
+        guard providerCopy?.receipt != nil || providerCopy == nil else { throw HostFailure("Attachment provider is loading") }
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor draft is not ready") }
         if attachmentDraftEvidence {
@@ -4350,6 +4426,7 @@ private final class Engine: @unchecked Sendable {
     }
 
     func discardEditorDraft(expectedSession: String) throws {
+        guard providerCopy?.receipt != nil || providerCopy == nil else { throw HostFailure("Attachment provider is loading") }
         dispatchPrecondition(condition: .onQueue(queue))
         guard started, !closed, pending == nil else { throw HostFailure("Editor Save must settle before discard") }
         let owns = try beginRetainedOrdinaryTurn()
@@ -15738,6 +15815,7 @@ private final class Engine: @unchecked Sendable {
         attachmentIdlePump?.cancel(); attachmentIdlePump = nil
         // No file/installer worker survives release of the library lock.
         attachmentJobs?.shutdown(); attachmentJobs = nil
+        providerCopy = nil
         started = false
         recoveryActivationPending = false
         startupBoardResult = nil
