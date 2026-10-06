@@ -634,13 +634,21 @@ export function ProjectsView() {
             showToast(tFallback(t, 'projects.taskMoveFailed', 'Failed to move task'), 'error');
         };
         void Promise.resolve(updateTask(taskId, updates))
-            .then((result) => {
+            .then(async (result) => {
                 if (result && result.success === false) {
                     throw new Error(result.error || 'Failed to move task');
                 }
+                await flushPendingSave();
                 const message = formatI18nTemplate(tFallback(t, 'projects.taskMovedTo', 'Moved to {{name}}'), { name: destinationName });
                 const undo = () => {
-                    void Promise.resolve(updateTask(taskId, previous)).catch(failTaskMove);
+                    void Promise.resolve(updateTask(taskId, previous))
+                        .then(async (result) => {
+                            if (result && result.success === false) {
+                                throw new Error(result.error || 'Failed to move task');
+                            }
+                            await flushPendingSave();
+                        })
+                        .catch(failTaskMove);
                 };
                 if (settings?.undoNotificationsEnabled === false) {
                     // Undo toasts are off, but Ctrl+Z should still work, and

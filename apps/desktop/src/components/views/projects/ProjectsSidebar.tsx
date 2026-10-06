@@ -711,6 +711,7 @@ export function ProjectsSidebar({
                                                                 </div>
                                                                 <span className="flex-1 truncate font-medium" title={project.title}>
                                                                     {project.title}
+                                                                    {isTaskOver && <span className="ml-2 text-xs text-primary">{t('task.moveTo')}</span>}
                                                                 </span>
                                                                 <button
                                                                     data-project-selection-ignore="true"
@@ -837,6 +838,7 @@ export function ProjectsSidebar({
                                                                             </div>
                                                                             <span className="flex-1 truncate font-medium" title={project.title}>
                                                                                 {project.title}
+                                                                    {isTaskOver && <span className="ml-2 text-xs text-primary">{t('task.moveTo')}</span>}
                                                                             </span>
                                                                             <span className="text-[10px] px-2 py-0.5 rounded-full bg-muted/60 text-muted-foreground uppercase">
                                                                                 {tFallback(t, `status.${project.status}`, project.status)}

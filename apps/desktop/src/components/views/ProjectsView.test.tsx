@@ -1,19 +1,29 @@
 import type { ReactNode } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { KeyboardSensor } from '@dnd-kit/core';
+import { KeyboardSensor, type DragEndEvent } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
-import { useTaskStore, type Area, type Project } from '@mindwtr/core';
+import { AREA_FILTER_NONE, flushPendingSave, getStorageAdapter, setStorageAdapter, useTaskStore, type Area, type Project, type Task } from '@mindwtr/core';
+import { registerUndoableAction, showUndoToast } from '../../lib/undo-registry';
 
 import { ProjectsView } from './ProjectsView';
 
 const initialTaskState = useTaskStore.getState();
+const dndCallbacks = vi.hoisted(() => ({ current: null as null | { onDragEnd?: (event: DragEndEvent) => void } }));
+vi.mock('@mindwtr/core', async () => {
+    const actual = await vi.importActual<typeof import('@mindwtr/core')>('@mindwtr/core');
+    return { ...actual, flushPendingSave: vi.fn(actual.flushPendingSave) };
+});
 const dndSensorCalls: Array<{ sensor: unknown; options: unknown }> = [];
 
 vi.mock('@dnd-kit/core', async () => {
     const actual = await vi.importActual<typeof import('@dnd-kit/core')>('@dnd-kit/core');
     return {
         ...actual,
+        DndContext: (props: React.ComponentProps<typeof actual.DndContext>) => {
+            dndCallbacks.current = props;
+            return <actual.DndContext {...props} />;
+        },
         useSensor: (sensor: unknown, options: unknown) => {
             dndSensorCalls.push({ sensor, options });
             return actual.useSensor(sensor as never, options as never);
@@ -148,6 +158,8 @@ vi.mock('./projects/ProjectToSectionDialog', () => ({
     </div>,
 }));
 
+vi.mock('../../lib/report-error', () => ({ reportError: vi.fn() }));
+
 vi.mock('../../lib/undo-registry', () => ({ registerUndoableAction: vi.fn(), showUndoToast: vi.fn() }));
 
 vi.mock('../../contexts/language-context', () => ({
@@ -246,6 +258,10 @@ describe('ProjectsView', () => {
         showToast.mockReset();
         requestConfirmation.mockReset();
         dndSensorCalls.length = 0;
+        dndCallbacks.current = null;
+        vi.mocked(flushPendingSave).mockReset().mockResolvedValue(undefined);
+        vi.mocked(registerUndoableAction).mockReset();
+        vi.mocked(showUndoToast).mockReset();
         resizeObserverCallback = null;
         animationFrameId = 0;
         queuedAnimationFrames.clear();
@@ -286,6 +302,146 @@ describe('ProjectsView', () => {
             writable: true,
             value: ResizeObserverMock,
         });
+    });
+
+    const taskDropEvent = (sortable: boolean, targetId: string, targetData: Record<string, unknown>): DragEndEvent => ({
+        active: { id: 'task-1', data: { current: { type: 'task', sortable } }, rect: { current: { initial: null, translated: null } } },
+        over: { id: targetId, data: { current: targetData }, rect: new DOMRect(), disabled: false },
+        activatorEvent: new Event('pointerdown'), collisions: null, delta: { x: 0, y: 0 },
+    });
+    const dropTask = (sortable = true, section = 'active', projectId = 'project-2') => {
+        act(() => dndCallbacks.current?.onDragEnd?.(taskDropEvent(sortable, projectId, { type: 'project', section })));
+    };
+
+    const setupTaskMove = (overrides: Record<string, unknown> = {}) => {
+        const now = '2026-10-06T12:00:00.000Z';
+        const source: Project = { id: 'project-1', title: 'Source', status: 'active', color: '#f00', order: 0, tagIds: [], createdAt: now, updatedAt: now };
+        const destination: Project = { ...source, id: 'project-2', title: 'Destination' };
+        const task: Task = { id: 'task-1', title: 'Keep this title', status: 'waiting', projectId: source.id, sectionId: 'source-section', order: 4, orderNum: 4, tags: ['keep'], contexts: ['@keep'], createdAt: now, updatedAt: now };
+        const updateTask = vi.fn().mockResolvedValue({ success: true });
+        projectsViewStoreOverrides.current = { projects: [source, destination], allTasks: [task], updateTask, ...overrides };
+        render(<ProjectsView />);
+        return { task, updateTask };
+    };
+
+    it.each([true, false])('routes the task grip from sortable=%s to the sidebar without changing status', async (sortable) => {
+        const { task, updateTask } = setupTaskMove();
+        dropTask(sortable);
+        await waitFor(() => expect(showUndoToast).toHaveBeenCalled());
+
+        expect(updateTask).toHaveBeenCalledExactlyOnceWith(task.id, { projectId: 'project-2' });
+        expect(flushPendingSave).toHaveBeenCalledOnce();
+        const undo = vi.mocked(showUndoToast).mock.calls[0][1];
+        act(() => undo());
+        await waitFor(() => expect(flushPendingSave).toHaveBeenCalledTimes(2));
+        expect(updateTask).toHaveBeenLastCalledWith(task.id, {
+            projectId: task.projectId, sectionId: task.sectionId, areaId: task.areaId,
+            order: task.order, orderNum: task.orderNum,
+        });
+    });
+
+    it('routes a task grip to an Area through the same store update path', async () => {
+        const { task, updateTask } = setupTaskMove();
+        act(() => dndCallbacks.current?.onDragEnd?.(taskDropEvent(false, `project-area:active:${AREA_FILTER_NONE}`, {
+            zone: 'projectArea', section: 'active', areaId: AREA_FILTER_NONE,
+        })));
+        await waitFor(() => expect(showUndoToast).toHaveBeenCalledOnce());
+        expect(updateTask).toHaveBeenCalledExactlyOnceWith(task.id, { projectId: undefined, areaId: undefined });
+    });
+
+    it('waits for durable persistence before confirming a project move', async () => {
+        const saved = createDeferred<void>();
+        vi.mocked(flushPendingSave).mockReturnValueOnce(saved.promise);
+        setupTaskMove();
+        dropTask();
+        await waitFor(() => expect(flushPendingSave).toHaveBeenCalledOnce());
+        expect(showUndoToast).not.toHaveBeenCalled();
+        await act(async () => saved.resolve());
+        await waitFor(() => expect(showUndoToast).toHaveBeenCalledOnce());
+    });
+
+    it.each(['result', 'persistence'])('shows failure and registers no undo for a failed %s', async (failure) => {
+        const updateTask = vi.fn().mockResolvedValue(failure === 'result' ? { success: false, error: 'Move refused' } : { success: true });
+        if (failure === 'persistence') vi.mocked(flushPendingSave).mockRejectedValueOnce(new Error('Disk unavailable'));
+        setupTaskMove({ updateTask });
+        dropTask();
+        await waitFor(() => expect(showToast).toHaveBeenCalledWith('Failed to move task', 'error'));
+        expect(showUndoToast).not.toHaveBeenCalled();
+        expect(registerUndoableAction).not.toHaveBeenCalled();
+    });
+
+    it('uses the core store to clear the old section and restores only placement on undo', async () => {
+        const actual = await vi.importActual<typeof import('@mindwtr/core')>('@mindwtr/core');
+        vi.mocked(flushPendingSave).mockImplementation(actual.flushPendingSave);
+        const { task } = setupTaskMove({ updateTask: initialTaskState.updateTask });
+        const projects = projectsViewStoreOverrides.current.projects as Project[];
+        const originalStorage = getStorageAdapter();
+        const saveData = vi.fn().mockResolvedValue(undefined);
+        setStorageAdapter({ getData: async () => ({ tasks: [], projects: [], sections: [], areas: [], people: [], settings: {} }), saveData });
+        try {
+            act(() => useTaskStore.setState({
+                _allTasks: [task], _allProjects: projects,
+                _allSections: [{ id: 'source-section', projectId: task.projectId!, title: 'Source section', order: 0, createdAt: task.createdAt, updatedAt: task.updatedAt }],
+                settings: { ...initialTaskState.settings, deviceId: 'test-device' },
+            }));
+            dropTask();
+            await waitFor(() => expect(showUndoToast).toHaveBeenCalledOnce());
+            expect(useTaskStore.getState()._tasksById.get(task.id)).toMatchObject({ projectId: 'project-2', status: 'waiting', contexts: ['@keep'], order: 4, orderNum: 4 });
+            expect(useTaskStore.getState()._tasksById.get(task.id)?.sectionId).toBeUndefined();
+            expect(saveData).toHaveBeenCalled();
+
+            await act(async () => {
+                await initialTaskState.updateTask(task.id, { title: 'Edited after moving', contexts: ['@new'] });
+                await actual.flushPendingSave();
+            });
+            act(() => vi.mocked(showUndoToast).mock.calls[0][1]());
+            await waitFor(() => expect(useTaskStore.getState()._tasksById.get(task.id)?.projectId).toBe(task.projectId));
+            await actual.flushPendingSave();
+            expect(useTaskStore.getState()._tasksById.get(task.id)).toMatchObject({
+                projectId: task.projectId, sectionId: task.sectionId, order: 4, orderNum: 4,
+                title: 'Edited after moving', contexts: ['@new'], status: 'waiting',
+            });
+        } finally {
+            await actual.flushPendingSave();
+            setStorageAdapter(originalStorage);
+        }
+    });
+
+    it('reports an unsuccessful structured result from undo', async () => {
+        const { updateTask } = setupTaskMove();
+        dropTask();
+        await waitFor(() => expect(showUndoToast).toHaveBeenCalledOnce());
+        updateTask.mockResolvedValueOnce({ success: false, error: 'Section removed' });
+        act(() => vi.mocked(showUndoToast).mock.calls[0][1]());
+        await waitFor(() => expect(showToast).toHaveBeenCalledWith('Failed to move task', 'error'));
+        expect(flushPendingSave).toHaveBeenCalledOnce();
+    });
+
+    it('reports durable undo failure', async () => {
+        setupTaskMove();
+        dropTask();
+        await waitFor(() => expect(showUndoToast).toHaveBeenCalledOnce());
+        vi.mocked(flushPendingSave).mockRejectedValueOnce(new Error('Disk unavailable'));
+        act(() => vi.mocked(showUndoToast).mock.calls[0][1]());
+        await waitFor(() => expect(showToast).toHaveBeenCalledWith('Failed to move task', 'error'));
+    });
+
+    it('keeps keyboard undo when undo notifications are disabled', async () => {
+        setupTaskMove({ settings: { undoNotificationsEnabled: false } });
+        dropTask();
+        await waitFor(() => expect(registerUndoableAction).toHaveBeenCalledOnce());
+        expect(showToast).toHaveBeenCalledWith('Moved to Destination', 'success');
+        expect(showUndoToast).not.toHaveBeenCalled();
+    });
+
+    it.each(['archived', 'deleted', 'same'])('ignores %s project targets', async (kind) => {
+        const now = '2026-10-06T12:00:00.000Z';
+        const target: Project = { id: 'project-2', title: 'Target', status: kind === 'archived' ? 'archived' : 'active', deletedAt: kind === 'deleted' ? now : undefined, color: '#f00', order: 0, tagIds: [], createdAt: now, updatedAt: now };
+        const { updateTask } = setupTaskMove(kind === 'same' ? {} : { projects: [target] });
+        dropTask(true, kind === 'archived' ? 'archived' : 'active', kind === 'same' ? 'project-1' : target.id);
+        await act(async () => { await Promise.resolve(); });
+        expect(updateTask).not.toHaveBeenCalled();
+        expect(showUndoToast).not.toHaveBeenCalled();
     });
 
     it('registers keyboard coordinates for project and task reordering', () => {

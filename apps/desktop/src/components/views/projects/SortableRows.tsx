@@ -168,6 +168,7 @@ export function SortableProjectTaskRow({
     sequenceCue,
     availableSequenceLabel,
     laterSequenceLabel,
+    dragLabel,
     narrow,
     interactionDisabled = false,
 }: {
@@ -177,6 +178,7 @@ export function SortableProjectTaskRow({
     sequenceCue?: ProjectSequenceTaskCue;
     availableSequenceLabel: string;
     laterSequenceLabel: string;
+    dragLabel: string;
     narrow?: boolean;
     interactionDisabled?: boolean;
 }) {
@@ -219,7 +221,8 @@ export function SortableProjectTaskRow({
                             {...listeners}
                             onClick={(event) => event.stopPropagation()}
                             className="h-6 w-6 rounded-md border border-transparent text-muted-foreground/80 hover:text-foreground hover:bg-muted/70 hover:border-border/70 flex items-center justify-center transition-colors"
-                            title="Drag"
+                            title={dragLabel}
+                            aria-label={dragLabel}
                         >
                             <GripVertical className="w-3 h-3" />
                         </button>
@@ -239,6 +242,7 @@ export function DraggableProjectTaskRow({
     sequenceCue,
     availableSequenceLabel,
     laterSequenceLabel,
+    dragLabel,
     narrow,
     interactionDisabled = false,
 }: {
@@ -248,6 +252,7 @@ export function DraggableProjectTaskRow({
     sequenceCue?: ProjectSequenceTaskCue;
     availableSequenceLabel: string;
     laterSequenceLabel: string;
+    dragLabel: string;
     narrow?: boolean;
     interactionDisabled?: boolean;
 }) {
@@ -284,7 +289,8 @@ export function DraggableProjectTaskRow({
                             {...listeners}
                             onClick={(event) => event.stopPropagation()}
                             className="h-6 w-6 rounded-md border border-transparent text-muted-foreground/80 hover:text-foreground hover:bg-muted/70 hover:border-border/70 flex items-center justify-center transition-colors"
-                            title="Drag"
+                            title={dragLabel}
+                            aria-label={dragLabel}
                         >
                             <GripVertical className="w-3 h-3" />
                         </button>

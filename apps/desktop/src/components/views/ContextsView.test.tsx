@@ -1,6 +1,7 @@
 import { act, fireEvent, render } from '@testing-library/react';
 import type { Area, Project, Task } from '@mindwtr/core';
 import { safeFormatDate, useTaskStore } from '@mindwtr/core';
+import * as core from '@mindwtr/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LanguageProvider } from '../../contexts/language-context';
 import { ContextsView } from './ContextsView';
@@ -9,11 +10,14 @@ import { selectToolbarOption } from '../../test/toolbar-select';
 import { expectScrolledEndGap } from '../../test/list-end-gap';
 import * as dataTransfer from '../../lib/data-transfer';
 import { useUiStore } from '../../store/ui-store';
+import { CALENDAR_TASK_DRAG_MIME, setCalendarTaskDragData } from '../../lib/calendar-task-drag';
+import { clearUndoableAction, takeUndoableAction } from '../../lib/undo-registry';
 
 // Its own key, separate from the view state above: see the note in ContextsView.
 const CONTEXTS_GROUP_COLLAPSE_STORAGE_KEY = 'mindwtr:view:contexts:groups:v1';
 
 const initialTaskState = useTaskStore.getState();
+const initialShowToast = useUiStore.getState().showToast;
 const now = '2026-05-12T12:00:00.000Z';
 
 const makeTask = (id: string, overrides: Partial<Task>): Task => ({
@@ -35,10 +39,13 @@ const renderContextsView = () => render(
 
 describe('ContextsView', () => {
     beforeEach(() => {
+        vi.restoreAllMocks();
+        clearUndoableAction();
         window.localStorage.clear();
         useTaskStore.setState(initialTaskState, true);
         useUiStore.setState((state) => ({
             ...state,
+            showToast: initialShowToast,
             expandedTaskIds: {},
             listOptions: { ...state.listOptions, showDetails: false },
         }));
@@ -61,6 +68,166 @@ describe('ContextsView', () => {
             areas: [],
             settings: {},
         });
+    });
+
+    const taskDrag = (id: string) => {
+        const values: Record<string, string> = {};
+        const transfer = {
+            types: [] as string[],
+            effectAllowed: 'none' as DataTransfer['effectAllowed'],
+            dropEffect: 'none' as DataTransfer['dropEffect'],
+            getData: (type: string) => values[type] ?? '',
+            setData: (type: string, value: string) => {
+                values[type] = value;
+                transfer.types.push(type);
+            },
+        };
+        setCalendarTaskDragData(transfer, id);
+        return transfer;
+    };
+    const mockContextWrite = () => {
+        const updateTask = vi.fn(async (id: string, updates: Partial<Task>) => {
+            const tasks = useTaskStore.getState()._allTasks.map((task) => task.id === id ? { ...task, ...updates } : task);
+            useTaskStore.setState({ _allTasks: tasks });
+            return { success: true };
+        });
+        useTaskStore.setState({ updateTask });
+        return updateTask;
+    };
+
+    it('adds the dropped context only after a durable save and undoes only that addition', async () => {
+        const updateTask = mockContextWrite();
+        let finishSave!: () => void;
+        const save = vi.spyOn(core, 'flushPendingSave').mockImplementationOnce(() => new Promise<void>((resolve) => {
+            finishSave = resolve;
+        })).mockResolvedValue(undefined);
+        const toast = vi.spyOn(useUiStore.getState(), 'showToast');
+        const view = renderContextsView();
+        const target = view.getByRole('button', { name: '@Office (1)' });
+        const transfer = taskDrag('task-2');
+        fireEvent.dragOver(target, { dataTransfer: transfer });
+        expect(target).toHaveClass('ring-2');
+        expect(view.getByText('Add @Office')).toBeInTheDocument();
+        const childLeave = new Event('dragleave', { bubbles: true });
+        Object.defineProperty(childLeave, 'relatedTarget', { value: target.querySelector('span') });
+        fireEvent(target, childLeave);
+        expect(target).toHaveClass('ring-2');
+        fireEvent.dragEnd(window);
+        expect(target).not.toHaveClass('ring-2');
+        fireEvent.dragOver(target, { dataTransfer: transfer });
+        await act(async () => { fireEvent.drop(target, { dataTransfer: transfer }); });
+        expect(updateTask).toHaveBeenCalledWith('task-2', { contexts: ['@Home', '@Office'] });
+        expect(toast).not.toHaveBeenCalled();
+        expect(takeUndoableAction()).toBeNull();
+        await act(async () => { finishSave(); });
+        expect(toast).toHaveBeenCalledWith('Added @Office', 'info', 5000, expect.objectContaining({ label: 'Undo' }));
+        const undo = toast.mock.calls[0]![3]!.onClick;
+        const latest = useTaskStore.getState()._allTasks.map((task) => task.id === 'task-2'
+            ? { ...task, title: 'Edited after drop', contexts: [...task.contexts, '@Later'], tags: ['#New'], projectId: 'later-project', status: 'waiting' as const, order: 17 }
+            : task);
+        act(() => useTaskStore.setState({ _allTasks: latest }));
+        await act(async () => { undo(); });
+        expect(useTaskStore.getState()._tasksById.get('task-2')).toMatchObject({
+            title: 'Edited after drop', contexts: ['@Home', '@Later'], tags: ['#New'], projectId: 'later-project', status: 'waiting', order: 17,
+        });
+        expect(save).toHaveBeenCalledTimes(2);
+        await act(async () => { undo(); });
+        expect(updateTask).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores existing normalized membership, tags, foreign, malformed, missing, and deleted drags', async () => {
+        const updateTask = mockContextWrite();
+        const save = vi.spyOn(core, 'flushPendingSave').mockResolvedValue(undefined);
+        const tasks = useTaskStore.getState()._allTasks.map((task) => task.id === 'task-2' ? { ...task, contexts: ['Office'] } : task);
+        const deleted = makeTask('deleted', { deletedAt: now, contexts: ['@Home'] });
+        useTaskStore.setState({ _allTasks: [...tasks, deleted] });
+        const view = renderContextsView();
+        const target = view.getByRole('button', { name: '@Office (1)' });
+        const textOnly = { types: ['text/plain'], getData: () => 'mindwtr-task:task-2' };
+        const malformed = { types: [CALENDAR_TASK_DRAG_MIME], getData: () => ' ' };
+        await act(async () => {
+            for (const transfer of [taskDrag('task-2'), textOnly, malformed, taskDrag('missing'), taskDrag('deleted')]) {
+                fireEvent.drop(target, { dataTransfer: transfer });
+            }
+            fireEvent.drop(view.getByRole('button', { name: '#ERP (1)' }), { dataTransfer: taskDrag('task-2') });
+            fireEvent.drop(view.getByRole('button', { name: /No context/ }), { dataTransfer: taskDrag('task-1') });
+        });
+        expect(updateTask).not.toHaveBeenCalled();
+        expect(save).not.toHaveBeenCalled();
+        fireEvent.dragOver(target, { dataTransfer: taskDrag('task-2') });
+        expect(target).not.toHaveClass('ring-2');
+        expect(takeUndoableAction()).toBeNull();
+    });
+
+    it('guards overlapping drops and keeps keyboard undo when undo notifications are disabled', async () => {
+        const updateTask = mockContextWrite();
+        let finishSave!: () => void;
+        vi.spyOn(core, 'flushPendingSave').mockImplementationOnce(() => new Promise<void>((resolve) => {
+            finishSave = resolve;
+        })).mockResolvedValue(undefined);
+        useTaskStore.setState({ settings: { undoNotificationsEnabled: false } });
+        const toast = vi.spyOn(useUiStore.getState(), 'showToast');
+        const view = renderContextsView();
+        const target = view.getByRole('button', { name: '@Office (1)' });
+        await act(async () => {
+            fireEvent.drop(target, { dataTransfer: taskDrag('task-2') });
+            fireEvent.drop(target, { dataTransfer: taskDrag('task-2') });
+        });
+        expect(updateTask).toHaveBeenCalledTimes(1);
+        await act(async () => { finishSave(); });
+        expect(toast).toHaveBeenCalledWith('Added @Office', 'success');
+        const undo = takeUndoableAction();
+        expect(undo).not.toBeNull();
+        await act(async () => { undo!(); });
+        expect(useTaskStore.getState()._tasksById.get('task-2')?.contexts).toEqual(['@Home']);
+    });
+
+    it('shows save and undo failures without reporting success for failed saves', async () => {
+        const updateTask = mockContextWrite();
+        const save = vi.spyOn(core, 'flushPendingSave').mockRejectedValueOnce(new Error('disk full'));
+        const toast = vi.spyOn(useUiStore.getState(), 'showToast');
+        const view = renderContextsView();
+        await act(async () => { fireEvent.drop(view.getByRole('button', { name: '@Office (1)' }), { dataTransfer: taskDrag('task-2') }); });
+        expect(toast).toHaveBeenCalledWith('Could not save the context assignment.', 'error');
+        expect(takeUndoableAction()).toBeNull();
+        const tasks = useTaskStore.getState()._allTasks.map((task) => task.id === 'task-2' ? { ...task, contexts: ['@Home'] } : task);
+        act(() => useTaskStore.setState({ _allTasks: tasks }));
+        save.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('undo disk full'));
+        await act(async () => { fireEvent.drop(view.getByRole('button', { name: '@Office (1)' }), { dataTransfer: taskDrag('task-2') }); });
+        await act(async () => { takeUndoableAction()!(); });
+        expect(toast).toHaveBeenLastCalledWith('Could not undo the context assignment.', 'error');
+        expect(updateTask).toHaveBeenCalledTimes(3);
+        expect(save).toHaveBeenCalledTimes(3);
+    });
+
+    it.each(['deleted', 'removed'])('does not undo a task/context %s after the drop or later re-addition', async (change) => {
+        const updateTask = mockContextWrite();
+        vi.spyOn(core, 'flushPendingSave').mockResolvedValue(undefined);
+        const view = renderContextsView();
+        await act(async () => { fireEvent.drop(view.getByRole('button', { name: '@Office (1)' }), { dataTransfer: taskDrag('task-2') }); });
+        const undo = takeUndoableAction()!;
+        let tasks = useTaskStore.getState()._allTasks.map((task) => task.id === 'task-2'
+            ? { ...task, ...(change === 'deleted' ? { deletedAt: now } : { contexts: ['@Home'] }) }
+            : task);
+        act(() => useTaskStore.setState({ _allTasks: tasks }));
+        await act(async () => { undo(); });
+        tasks = tasks.map((task) => task.id === 'task-2' ? { ...task, contexts: ['@Home', '@Office'], deletedAt: undefined } : task);
+        act(() => useTaskStore.setState({ _allTasks: tasks }));
+        await act(async () => { undo(); });
+        expect(updateTask).toHaveBeenCalledTimes(1);
+        expect(useTaskStore.getState()._tasksById.get('task-2')?.contexts).toEqual(['@Home', '@Office']);
+    });
+
+    it('shows a rejected store write without saving or registering undo', async () => {
+        const updateTask = vi.fn(async () => ({ success: false, error: 'Rejected' }));
+        useTaskStore.setState({ updateTask });
+        const save = vi.spyOn(core, 'flushPendingSave').mockResolvedValue(undefined);
+        const toast = vi.spyOn(useUiStore.getState(), 'showToast');
+        const view = renderContextsView();
+        await act(async () => { fireEvent.drop(view.getByRole('button', { name: '@Office (1)' }), { dataTransfer: taskDrag('task-2') }); });
+        expect(toast).toHaveBeenCalledWith('Could not save the context assignment.', 'error');
+        expect(save).not.toHaveBeenCalled();
+        expect(takeUndoableAction()).toBeNull();
     });
 
     it('ends both scrollers with the shared end gap, not with viewport padding (#977)', () => {

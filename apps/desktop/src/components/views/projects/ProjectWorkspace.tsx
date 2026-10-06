@@ -1101,6 +1101,7 @@ export function ProjectWorkspace({
                         sequenceCue={projectTaskSequenceCues.get(task.id)}
                         availableSequenceLabel={availableSequenceLabel}
                         laterSequenceLabel={laterSequenceLabel}
+                        dragLabel={`${t('board.dragTask')}: ${t('task.moveToProjectOrArea')}`}
                     />
                 )}
             />
@@ -1123,6 +1124,7 @@ export function ProjectWorkspace({
                     sequenceCue={projectTaskSequenceCues.get(task.id)}
                     availableSequenceLabel={availableSequenceLabel}
                     laterSequenceLabel={laterSequenceLabel}
+                    dragLabel={`${t('board.dragTask')}: ${t('task.moveToProjectOrArea')}`}
                 />
             )}
         />

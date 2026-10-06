@@ -1,16 +1,31 @@
 import { render, screen } from '@testing-library/react';
 import { DndContext } from '@dnd-kit/core';
 import { SortableContext } from '@dnd-kit/sortable';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Project, Task } from '@mindwtr/core';
 
 import { DraggableProjectTaskRow, SortableProjectRow, SortableProjectTaskRow } from './SortableRows';
+
+const dragState = vi.hoisted(() => ({ activeTask: false }));
+vi.mock('@dnd-kit/sortable', async () => {
+    const actual = await vi.importActual<typeof import('@dnd-kit/sortable')>('@dnd-kit/sortable');
+    return {
+        ...actual,
+        useSortable: (options: Parameters<typeof actual.useSortable>[0]) => {
+            const result = actual.useSortable(options);
+            return dragState.activeTask
+                ? { ...result, isOver: true, active: { data: { current: { type: 'task' } } } }
+                : result;
+        },
+    };
+});
+afterEach(() => { dragState.activeTask = false; });
 
 const taskItemProps = vi.hoisted(() => ({ calls: [] as Record<string, unknown>[] }));
 vi.mock('../../TaskItem', () => ({
     TaskItem: (props: Record<string, unknown>) => {
         taskItemProps.calls.push(props);
-        return <div data-task-id={(props.task as Task).id} />;
+        return <div data-task-id={(props.task as Task).id}>{props.dragHandle as React.ReactNode}</div>;
     },
 }));
 
@@ -52,6 +67,7 @@ const renderRow = (
                     interactionDisabled={interactionDisabled}
                     availableSequenceLabel="Available"
                     laterSequenceLabel="Later"
+                    dragLabel="Drag task: Move to project or area…"
                 />
             </SortableContext>
         </DndContext>
@@ -73,6 +89,20 @@ it('gives the project reorder handle an explicit accessible name', () => {
     expect(screen.getByRole('button', { name: 'Drag' })).toBeInTheDocument();
 });
 
+it.each(['active', 'deferred', 'archived'] as const)('highlights a hovered %s project only when it accepts a task move', (section) => {
+    dragState.activeTask = true;
+    render(
+        <DndContext>
+            <SortableContext items={[project.id]}>
+                <SortableProjectRow projectId={project.id} section={section}>
+                    {({ isTaskOver }) => <span data-testid="task-drop-highlight">{String(isTaskOver)}</span>}
+                </SortableProjectRow>
+            </SortableContext>
+        </DndContext>
+    );
+    expect(screen.getByTestId('task-drop-highlight')).toHaveTextContent(String(section !== 'archived'));
+});
+
 // The actions strip is `shrink-0`; inline, it starves the title in a container
 // as narrow as a section column. These pin the escape hatch, not the styling.
 describe.each([
@@ -91,6 +121,15 @@ describe.each([
 
         expect(props.actionsOverlay).toBeUndefined();
         expect(props.showStatusSelect).toBeUndefined();
+    });
+
+    it('labels the task grip with its supported sidebar move action', () => {
+        renderRow(false, Row);
+
+        const handle = screen.getByRole('button', { name: 'Drag task: Move to project or area…' });
+        expect(handle).toHaveAttribute('title', 'Drag task: Move to project or area…');
+        expect(handle).not.toHaveAttribute('draggable');
+        expect(handle).toHaveAttribute('aria-roledescription', Row === SortableProjectTaskRow ? 'sortable' : 'draggable');
     });
 
     it('removes drag and mutation capabilities for a read-only project row', () => {

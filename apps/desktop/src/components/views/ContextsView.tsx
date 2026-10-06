@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef, type DragEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
     useTaskStore,
@@ -12,6 +12,9 @@ import {
     buildContextsViewFilterSections,
     getContextsTokenCount,
     collectBulkTaskTokens,
+    normalizeBulkTaskTokenInput,
+    flushPendingSave,
+    formatI18nTemplate,
     tFallback,
     type Task,
     type ContextOrTagMatchMode,
@@ -51,6 +54,8 @@ import { LIST_END_GAP, ToolbarButton, VIEW_FILTER_INPUT } from './list/list-tool
 import { ViewControls } from './list/ViewControls';
 import { useUiStore } from '../../store/ui-store';
 import { resolveNonDoneTaskSortBy } from '@mindwtr/core';
+import { CALENDAR_TASK_DRAG_MIME, getCalendarTaskDragTaskId } from '../../lib/calendar-task-drag';
+import { showUndoToast } from '../../lib/undo-registry';
 
 type BulkTokenPickerState = {
     field: 'tags' | 'contexts';
@@ -114,6 +119,13 @@ export function ContextsView() {
     const [bulkTokenPicker, setBulkTokenPicker] = useState<BulkTokenPickerState>(null);
     const [contextsCollapsed, setContextsCollapsed] = useState(false);
     const [tagsCollapsed, setTagsCollapsed] = useState(false);
+    const [hoveredContext, setHoveredContext] = useState<string | null>(null);
+    const pendingContextDrops = useRef(new Set<string>());
+    useEffect(() => {
+        const clearHover = () => setHoveredContext(null);
+        window.addEventListener('dragend', clearHover);
+        return () => window.removeEventListener('dragend', clearHover);
+    }, []);
     const listScrollRef = useRef<HTMLDivElement>(null);
     const { requestConfirmation, confirmModal } = useConfirmDialog();
     const setSelectedContext = useCallback((value: string | null) => {
@@ -401,22 +413,97 @@ export function ContextsView() {
     const tagsLabel = tFallback(t, 'taskEdit.tagsLabel', 'Tags');
     const allTokensLabel = `${contextsLabel} & ${tagsLabel}`;
 
+    const contextDropLabel = (key: 'contexts.dropAdd' | 'contexts.dropAdded', context: string) =>
+        formatI18nTemplate(t(key), { context });
+    const acceptsContextDrop = (event: DragEvent<HTMLButtonElement>, context: string) => {
+        if (!Array.from(event.dataTransfer.types).includes(CALENDAR_TASK_DRAG_MIME)) return false;
+        const id = getCalendarTaskDragTaskId(event.dataTransfer);
+        // Native dragover protects the payload until drop; the MIME still identifies our task drag.
+        if (!id) return true;
+        const task = useTaskStore.getState()._tasksById.get(id);
+        return !!task && !task.deletedAt && !pendingContextDrops.current.has(id)
+            && !task.contexts.some((token) => normalizeBulkTaskTokenInput(token, 'contexts') === context);
+    };
+    const handleContextDrop = async (event: DragEvent<HTMLButtonElement>, context: string) => {
+        setHoveredContext(null);
+        if (!acceptsContextDrop(event, context)) return;
+        event.preventDefault();
+        const id = getCalendarTaskDragTaskId(event.dataTransfer);
+        if (!id) return;
+        const task = useTaskStore.getState()._tasksById.get(id);
+        if (!task || task.deletedAt) return;
+        pendingContextDrops.current.add(id);
+        try {
+            const result = await useTaskStore.getState().updateTask(id, { contexts: [...task.contexts, context] });
+            if (!result.success) throw new Error(result.error);
+            await flushPendingSave();
+            let undone = false;
+            const undo = async () => {
+                if (undone || pendingContextDrops.current.has(id)) return;
+                const latest = useTaskStore.getState()._tasksById.get(id);
+                if (!latest || latest.deletedAt) {
+                    undone = true;
+                    return;
+                }
+                const contexts = latest.contexts.filter((token) => normalizeBulkTaskTokenInput(token, 'contexts') !== context);
+                if (contexts.length === latest.contexts.length) {
+                    undone = true;
+                    return;
+                }
+                pendingContextDrops.current.add(id);
+                try {
+                    const result = await useTaskStore.getState().updateTask(id, { contexts });
+                    if (!result.success) throw new Error(result.error);
+                    await flushPendingSave();
+                    undone = true;
+                } catch {
+                    showToast(t('contexts.dropUndoFailed'), 'error');
+                } finally {
+                    pendingContextDrops.current.delete(id);
+                }
+            };
+            const message = contextDropLabel('contexts.dropAdded', context);
+            showUndoToast(message, () => { void undo(); }, t);
+            if (useTaskStore.getState().settings?.undoNotificationsEnabled === false) showToast(message, 'success');
+        } catch {
+            showToast(t('contexts.dropFailed'), 'error');
+        } finally {
+            pendingContextDrops.current.delete(id);
+        }
+    };
+
     const renderTokenRow = (token: string, marker: '@' | '#') => {
         const taskCount = getContextsTokenCount(tokenIndex, token);
+        const context = normalizeBulkTaskTokenInput(token, 'contexts');
+        const isHovered = marker === '@' && hoveredContext === token;
         return (
             <button
                 key={token}
                 type="button"
                 onClick={() => toggleSelectedContext(token)}
+                onDragOver={marker === '@' ? (event) => {
+                    if (!acceptsContextDrop(event, context)) {
+                        setHoveredContext(null);
+                        return;
+                    }
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                    setHoveredContext(token);
+                } : undefined}
+                onDragLeave={marker === '@' ? (event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHoveredContext(null);
+                } : undefined}
+                onDrop={marker === '@' ? (event) => { void handleContextDrop(event, context); } : undefined}
                 aria-label={`${token} (${taskCount})`}
                 aria-pressed={selectedContexts.includes(token)}
                 className={cn(
                     "flex w-full items-center gap-2 rounded-lg p-2 text-left text-sm transition-colors",
-                    selectedContexts.includes(token) ? "bg-primary/10 text-primary font-medium" : "hover:bg-muted/40 text-foreground"
+                    selectedContexts.includes(token) || isHovered ? "bg-primary/10 text-primary font-medium" : "hover:bg-muted/40 text-foreground",
+                    isHovered && "ring-2 ring-primary"
                 )}
             >
                 <span className="w-4 text-center text-muted-foreground">{marker}</span>
-                <span className="flex-1 truncate">{token.replace(marker === '@' ? /^@/ : /^#/, '')}</span>
+                <span className="flex-1 truncate">{isHovered ? contextDropLabel('contexts.dropAdd', context) : token.replace(marker === '@' ? /^@/ : /^#/, '')}</span>
                 <span className="text-xs text-muted-foreground">
                     {taskCount}
                 </span>

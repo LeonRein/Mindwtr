@@ -655,6 +655,10 @@ export const en: Record<string, string> = {
         // Contact / Contexts (Mobile updates)
         'contexts.title': 'Contexts',
         'contexts.filter': 'Filter tasks by context',
+        'contexts.dropAdd': 'Add {context}',
+        'contexts.dropAdded': 'Added {context}',
+        'contexts.dropFailed': 'Could not save the context assignment.',
+        'contexts.dropUndoFailed': 'Could not undo the context assignment.',
         'filters.label': 'Filters',
         'filters.active': 'Active filters',
         'filters.clear': 'Clear',
