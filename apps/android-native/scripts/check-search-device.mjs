@@ -112,7 +112,11 @@ const sheetShowing = async (description) => {
         return r > l && b > t && t >= box(sheet)[1] && b <= box(sheet)[3];
     };
     let nodes = await screen();
-    for (let step = 0; step < 6 && !shown(nodes); step += 1) {
+    // The sheet lists every context and tag first, so a long-used library needs many swipes: stop once a swipe moves nothing.
+    for (let step = 0, last = ''; step < 60 && !shown(nodes); step += 1) {
+        const seen = nodes.map((node) => `${node.text}|${node.bounds}`).join(';');
+        if (seen === last) break;
+        last = seen;
         // The sheet's column starts under its "Filters" heading; the results list behind it starts higher.
         const heading = nodes.find((node) => node.text === en['filters.label'] && node.class === 'android.widget.TextView') ?? fail('no filter sheet');
         const sheet = nodes.filter((node) => node.scrollable === 'true' && box(node)[1] >= box(heading)[3])
