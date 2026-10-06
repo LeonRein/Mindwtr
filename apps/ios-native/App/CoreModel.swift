@@ -63,7 +63,10 @@ final class CoreModel: ObservableObject {
 
     @Published private(set) var selectedSurface: Surface = .inbox {
         didSet {
-            if oldValue == .project && selectedSurface != .project { invalidateProjectAttachmentOpen() }
+            if oldValue == .project && selectedSurface != .project {
+                invalidateProjectAttachmentOpen()
+                cancelProjectFileImport()
+            }
             if oldValue == .settings && selectedSurface != .settings {
                 invalidateDiagnostics()
                 settingsDataPresented = false
@@ -504,7 +507,12 @@ final class CoreModel: ObservableObject {
     private var projectFilterPickerNeedsRead = false
     private var projectFilterReadTask: Task<Void, Never>?
     private var projectFilterSession = 0 {
-        didSet { if oldValue != projectFilterSession { invalidateProjectAttachmentOpen() } }
+        didSet {
+            if oldValue != projectFilterSession {
+                invalidateProjectAttachmentOpen()
+                cancelProjectFileImport()
+            }
+        }
     }
     private var projectShowCompleted = false
     private var projectCompletedCollapsed = true
@@ -547,6 +555,11 @@ final class CoreModel: ObservableObject {
     @Published private(set) var projectAttachmentWriteError: String?
     @Published private(set) var projectAttachmentEditReadError: String?
     @Published private(set) var projectAttachmentEditOpening = false
+    @Published private(set) var projectFileImporterID: UUID?
+    @Published private(set) var projectFileImporterPresented = false
+    @Published private(set) var projectFileAddOpening = false
+    @Published private(set) var projectFileAddSummary: CoreObject = [:]
+    @Published private(set) var projectFileAddError: String?
     @Published var collapsedProjectAreas: Set<String> = []
     @Published var expandedProjectSections: Set<String> = []
     @Published private(set) var contexts: CoreObject = [:]
@@ -842,6 +855,7 @@ final class CoreModel: ObservableObject {
         didSet {
             if oldValue.map({ ObjectIdentifier($0) }) != host.map({ ObjectIdentifier($0) }) {
                 cancelTaskFileImport()
+                cancelProjectFileImport()
                 invalidateTaskAttachmentOpen()
                 invalidateProjectAttachmentOpen()
                 taskStartupSaveReceipt = nil
@@ -1153,6 +1167,23 @@ final class CoreModel: ObservableObject {
     private weak var projectAttachmentWriteHost: CoreHost?
     private var projectAttachmentWriteExpectedID: String?
     private var projectAttachmentWriteSession = 0
+    private struct ProjectFileImportClaim {
+        let id: UUID
+        let host: CoreHost
+        let projectID: String
+        let session: Int
+    }
+    private struct ProjectFileAddOperation {
+        let host: CoreHost
+        let requestID: String
+        let projectID: String
+        let session: Int?
+        let requestJSON: String?
+    }
+    private var projectFileImportAdmission = UUID()
+    private var projectFileImportClaim: ProjectFileImportClaim?
+    private var projectFileImportTask: Task<Void, Never>?
+    private var projectFileAddOperation: ProjectFileAddOperation?
     private var projectCreateAreaFilterValue: String?
     private var pendingProjectTagFilter: String?
     private var projectCreateRequest: String?
@@ -1430,10 +1461,12 @@ final class CoreModel: ObservableObject {
         ready && selectedSurface == .search && searchCurrent && !busy && !retryNeeded && !taskPresented && !savedSearchWritePresented
     }
     var projectActionsEnabled: Bool {
-        projectActionsCurrent && !projectAttachmentOpening
+        projectActionsCurrent && !projectAttachmentOpening && !projectFileAddOpening
+            && projectFileImporterID == nil
     }
     private var projectActionsCurrent: Bool {
         ready && selectedSurface == .project && projectCurrent && !busy && !retryNeeded && !taskPresented
+            && !projectFileAddPending
             && !projectRenameEditing && !projectTaskOrderPresented
     }
     var projectDeleteOpenEnabled: Bool {
@@ -1455,6 +1488,18 @@ final class CoreModel: ObservableObject {
     }
     var projectAttachmentsVisible: Bool { projectAttachmentScopeCurrent && projectAttachmentsCurrent }
     var projectAttachmentWritePending: Bool { projectAttachmentWriteRequest != nil }
+    var projectFileAddPending: Bool { projectFileAddOperation != nil || !projectFileAddSummary.isEmpty }
+    var projectFileAddRecoveryVisible: Bool {
+        projectFileAddPending && !appLock.concealed && !projectFileImporterPresented
+    }
+    var projectFileAddRecoveryEnabled: Bool {
+        !busy && !projectFileAddOpening && !appLock.concealed
+            && projectFileAddOperation.map { host === $0.host } == true
+    }
+    var projectFileAddOpenEnabled: Bool {
+        projectAttachmentAddOpenEnabled && !projectFileAddPending
+            && !projectFileAddOpening && projectFileImporterID == nil && !projectFileImporterPresented
+    }
     var projectAttachmentAddOpenEnabled: Bool {
         projectViewOpenEnabled && !projectDetail.flag("readOnly") && !appLock.concealed
             && projectAttachmentsVisible && !projectAttachmentLoading && !projectAttachmentEditOpening
@@ -3733,9 +3778,12 @@ final class CoreModel: ObservableObject {
                 }
                 historyParamsByTab[name] = params
             }
-            let startup = try decode(await host!.start())
+            let currentHost = host!
+            let startup = try decode(await currentHost.start())
+            guard host === currentHost else { throw CancellationError() }
             // Preserve the acknowledged domain result before any later App read.
             stageTaskStartupSaveReceipt(startup)
+            try await readProjectFileAddInventory(currentHost)
             taskRecoveryStartupCorrupt = false
             do {
                 let persisted = try await host!.readEditorDraft()
@@ -3877,7 +3925,7 @@ final class CoreModel: ObservableObject {
             if projectLifecycleRecoveredResult != nil { selectedSurface = .projects }
             try await readSelectedSurface()
             ready = true
-            retryNeeded = false
+            retryNeeded = projectFileAddPending
             await reconcileTaskAttachmentPresentation()
             if let reply = backupDocumentRecoveredReply, let currentHost = host {
                 try await acceptBackupDocumentReply(reply, from: currentHost)
@@ -3915,6 +3963,20 @@ final class CoreModel: ObservableObject {
             }
             mindSweepRecoveredResult = nil
             appLockRecoveryPending = false
+        } catch is CoreHostProjectFileAddRecovery {
+            ready = false
+            if let currentHost = host {
+                do {
+                    try await readProjectFileAddInventory(currentHost)
+                    guard host === currentHost else { throw CancellationError() }
+                    try await readAppLock()
+                    guard host === currentHost else { throw CancellationError() }
+                } catch {
+                    // Keep a successfully read owner if the later lock read fails.
+                    if host === currentHost { projectFileAddError = "The pending attachment operation could not be loaded. Try again." }
+                }
+            }
+            self.error = "An attachment operation needs attention."
         } catch let pending as CoreHostAttachmentCleanupPending {
             // The host is unavailable after a failed cold cleanup. Keep the
             // proven Save result and retry start on this same host; do not read
@@ -3929,6 +3991,10 @@ final class CoreModel: ObservableObject {
             appLockRecoveryPending = error is CoreHostAppLockRecovery
             taskRecoveryStartupCorrupt = error is EditorDraftStoreError
             self.error = taskRecoveryStartupCorrupt ? "Saved editor draft is unreadable" : error.localizedDescription
+            if let currentHost = host {
+                do { try await readProjectFileAddInventory(currentHost) }
+                catch { /* Preserve the previous bounded summary on a failed read. */ }
+            }
         }
         #else
         error = "This build is not enabled for physical-device testing."
@@ -4466,6 +4532,7 @@ final class CoreModel: ObservableObject {
             if enabled == nil || locked {
                 self?.invalidateTaskAttachmentOpen()
                 self?.invalidateProjectAttachmentOpen()
+                self?.cancelProjectFileImport()
                 self?.invalidateDiagnostics(dropCache: true)
             }
         }
@@ -5136,9 +5203,11 @@ final class CoreModel: ObservableObject {
     }
 
     private func readAppLock(justEnabled: Bool = false) async throws {
+        let currentHost = host
         do {
             let options = try await query("appLockOptions", ["{}"])
-            guard Set(options.keys) == Set(["row", "value", "expected"]),
+            guard currentHost != nil, host === currentHost,
+                  Set(options.keys) == Set(["row", "value", "expected"]),
                   let value = options["value"] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID(),
                   !options.object("row").isEmpty, !options.object("expected").isEmpty else {
                 throw CocoaError(.coderReadCorrupt)
@@ -5149,8 +5218,10 @@ final class CoreModel: ObservableObject {
             appLockError = nil
             appLockAwaitingRefresh = false
         } catch {
-            appLock.readFailed()
-            appLockError = error.localizedDescription
+            if host === currentHost {
+                appLock.readFailed()
+                appLockError = error.localizedDescription
+            }
             throw error
         }
     }
@@ -16266,6 +16337,8 @@ final class CoreModel: ObservableObject {
     }
 
     private func resetProjectAttachments() {
+        cancelProjectFileImport()
+        if !projectFileAddPending { projectFileAddError = nil }
         projectAttachmentReadGeneration += 1
         invalidateProjectAttachmentOpen()
         projectAttachmentEditClaim = UUID()
@@ -17512,6 +17585,293 @@ final class CoreModel: ObservableObject {
 
     func dismissProjectAttachmentOpenError() { projectAttachmentOpenError = nil }
 
+    private func projectFileImportCurrent(_ claim: ProjectFileImportClaim) -> Bool {
+        host === claim.host && ready && !Task.isCancelled && !appLock.concealed
+            && projectFileImportClaim?.id == claim.id && projectFileImporterID == claim.id
+            && projectAttachmentEditContext(claim.projectID, session: claim.session)
+    }
+
+    func prepareProjectFileImport() async -> UUID? {
+        guard let currentHost = host else { return nil }
+        let projectID = projectHeader.text("id"), session = projectFilterSession
+        let admission = projectFileImportAdmission
+        // A blur may already have queued its ordinary Notes flush. Let that
+        // admitted task finish even if it owns busy; this awaits existing work
+        // and admits no new write before the full check below.
+        if let flush = projectNotesFlushTask {
+            guard await flush.value else { return nil }
+        }
+        guard projectFileImportAdmission == admission, host === currentHost,
+              !Task.isCancelled, projectFileAddOpenEnabled,
+              projectAttachmentEditContext(projectID, session: session) else { return nil }
+        let claim = ProjectFileImportClaim(id: UUID(), host: currentHost,
+            projectID: projectID, session: session)
+        projectFileImportClaim = claim
+        projectFileImporterID = claim.id
+        projectFileAddOpening = true
+        projectFileAddError = nil
+        defer { if projectFileImportClaim?.id == claim.id { projectFileAddOpening = false } }
+        guard await flushProjectNotesEdit(attachmentOpenClaim: nil, fileAddClaim: claim.id),
+              projectFileImportCurrent(claim), !busy, !retryNeeded,
+              !projectNotesDirty, !projectNotesWritePending else {
+            if projectFileImportClaim?.id == claim.id { cancelProjectFileImport() }
+            return nil
+        }
+        projectFileImporterPresented = true
+        return claim.id
+    }
+
+    func setProjectFileImporterPresented(_ value: Bool, pickerID: UUID?) {
+        guard pickerID == projectFileImporterID else { return }
+        if !value { projectFileImporterPresented = false }
+    }
+
+    func cancelProjectFileImport() {
+        // Invalidate a Prepare still awaiting an already admitted Notes flush.
+        projectFileImportAdmission = UUID()
+        projectFileImportClaim = nil
+        projectFileImporterID = nil
+        projectFileImporterPresented = false
+        projectFileAddOpening = false
+        projectFileImportTask?.cancel()
+        // Cancellation ends delivery, not a native intent already submitted.
+        // Its original operation/summary remains available for Retry or Stop.
+    }
+
+    func completeProjectFileImport(_ result: Result<[URL], Error>, pickerID: UUID) async {
+        guard let claim = projectFileImportClaim, claim.id == pickerID else { return }
+        guard !projectFileAddOpening else { return }
+        guard projectFileImportCurrent(claim) else { cancelProjectFileImport(); return }
+        projectFileImporterPresented = false
+        let selection: URL
+        switch result {
+        case .success(let urls):
+            guard urls.count == 1, let url = urls.first else { cancelProjectFileImport(); return }
+            selection = url
+        case .failure(let failure):
+            let error = failure as NSError
+            if error.domain != NSCocoaErrorDomain || error.code != NSUserCancelledError {
+                projectFileAddError = "This file could not be selected. Try again."
+            }
+            cancelProjectFileImport()
+            return
+        }
+        guard !busy, !retryNeeded, !projectFileAddPending else { cancelProjectFileImport(); return }
+        projectFileAddOpening = true
+        let task = Task { await performProjectFileImport(selection, claim: claim) }
+        projectFileImportTask = task
+        await task.value
+        if projectFileImportClaim == nil || projectFileImportClaim?.id == claim.id {
+            projectFileImportTask = nil
+        }
+    }
+
+    private func performProjectFileImport(_ selection: URL, claim: ProjectFileImportClaim) async {
+        var mutationStarted = false
+        var acknowledged = false
+        defer {
+            if projectFileImportClaim?.id == claim.id {
+                projectFileImportClaim = nil
+                projectFileImporterID = nil
+                projectFileImporterPresented = false
+                projectFileAddOpening = false
+            }
+            if mutationStarted { finishOperation() }
+        }
+        do {
+            guard await flushProjectNotesEdit(attachmentOpenClaim: nil, fileAddClaim: claim.id),
+                  projectFileImportCurrent(claim), !projectNotesDirty, !projectNotesWritePending else {
+                throw CancellationError()
+            }
+            // Selection may have remained open across another client's edit.
+            // Read the current Project and token now, never the pre-picker array.
+            try await readSelectedSurface()
+            guard projectFileImportCurrent(claim), !busy, !retryNeeded,
+                  !projectNotesDirty, !projectNotesWritePending else { throw CancellationError() }
+            projectAttachmentOpeningRaw = nil
+            projectAttachmentOpeningRevision = ""
+            try await readProjectAttachmentEditOptions(projectID: claim.projectID, session: claim.session)
+            guard projectFileImportCurrent(claim), !busy, !retryNeeded,
+                  projectAttachmentEditOptionsCurrent, projectAttachmentEditOptions.flag("canEdit"),
+                  !projectNotesDirty, !projectNotesWritePending else { throw CancellationError() }
+            let token = projectAttachmentEditOptions.object("project").filter { $0.key != "id" }
+            let requestID = UUID().uuidString.lowercased()
+            let request = try json(["requestId": requestID, "projectId": claim.projectID, "expected": token])
+            let operation = ProjectFileAddOperation(host: claim.host, requestID: requestID,
+                projectID: claim.projectID, session: claim.session, requestJSON: request)
+            projectFileAddOperation = operation
+            busy = true
+            mutationStarted = true
+            let reply = try decode(try await claim.host.addProviderProjectAttachment(selectedURL: selection, requestJSON: request))
+            try acknowledgeProjectFileAdd(reply, operation: operation)
+            acknowledged = true
+            projectAttachmentsCurrent = false
+            if projectFileImportCurrent(claim) {
+                try await refreshProjectFileAddPresentation(operation)
+            }
+        } catch {
+            guard host === claim.host else { return }
+            if let operation = projectFileAddOperation, operation.host === claim.host {
+                await retainProjectFileAddAfterFailure(operation)
+            } else if projectFileImportClaim?.id == claim.id && !Task.isCancelled && !appLock.concealed {
+                projectFileAddError = acknowledged
+                    ? "The attachment operation finished, but the Project could not be refreshed. Try again."
+                    : "This file could not be added. Try again."
+            }
+        }
+    }
+
+    private func parseProjectFileAddSummary(_ raw: String) throws -> CoreObject? {
+        guard raw.utf8.count <= 4_096 else { throw CocoaError(.coderReadCorrupt) }
+        let value = try NativeJSON.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed])
+        if value is NSNull { return nil }
+        guard let summary = value as? CoreObject,
+              Set(summary.keys) == Set(["requestId", "projectId", "phase"]),
+              let request = summary["requestId"] as? String,
+              UUID(uuidString: request)?.uuidString.lowercased() == request,
+              let project = summary["projectId"] as? String, !project.isEmpty, project.utf16.count <= 500,
+              project.rangeOfCharacter(from: .controlCharacters) == nil,
+              ["intent", "stagePrepared", "stageFilled", "published", "domainSaved", "settled"].contains(summary.text("phase")) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        return summary
+    }
+
+    private func readProjectFileAddInventory(_ currentHost: CoreHost) async throws {
+        let raw = try await currentHost.projectFileAddSummary()
+        guard host === currentHost else { throw CancellationError() }
+        let summary = try parseProjectFileAddSummary(raw)
+        if let operation = projectFileAddOperation {
+            guard operation.host === currentHost,
+                  summary == nil || (summary?.text("requestId") == operation.requestID
+                    && summary?.text("projectId") == operation.projectID) else { throw CancellationError() }
+        }
+        if let summary {
+            if projectFileAddOperation == nil {
+                projectFileAddOperation = ProjectFileAddOperation(host: currentHost,
+                    requestID: summary.text("requestId"), projectID: summary.text("projectId"),
+                    session: nil, requestJSON: nil)
+            }
+            projectFileAddSummary = summary
+            retryNeeded = true
+        } else if let operation = projectFileAddOperation {
+            try clearProjectFileAdd(operation)
+        } else {
+            projectFileAddSummary = [:]
+        }
+    }
+
+    private func projectFileAddOperationCurrent(_ operation: ProjectFileAddOperation) -> Bool {
+        host === operation.host && projectFileAddOperation?.host === operation.host
+            && projectFileAddOperation?.requestID == operation.requestID
+            && projectFileAddOperation?.projectID == operation.projectID
+            && projectFileAddOperation?.requestJSON == operation.requestJSON
+    }
+
+    private func clearProjectFileAdd(_ operation: ProjectFileAddOperation) throws {
+        guard projectFileAddOperationCurrent(operation) else { throw CancellationError() }
+        projectFileAddOperation = nil
+        projectFileAddSummary = [:]
+        projectFileAddError = nil
+        projectFileAddOpening = false
+        retryNeeded = false
+        error = nil
+    }
+
+    private func acknowledgeProjectFileAdd(_ result: CoreObject, operation: ProjectFileAddOperation) throws {
+        guard projectFileAddOperationCurrent(operation) else { throw CancellationError() }
+        let abandoned = Set(result.keys) == Set(["abandoned"])
+            && (result["abandoned"] as? NSNumber).map {
+                CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+            } == true
+        guard abandoned || (Set(result.keys) == Set(["id", "attachmentIds"])
+            && result.text("id") == operation.projectID
+            && result["attachmentIds"] as? [String] == [operation.requestID]) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        // The exact native ACK settles ownership even if presentation was lost.
+        // A subsequent inventory/read failure must not replay a completed Add.
+        try clearProjectFileAdd(operation)
+    }
+
+    private func retainProjectFileAddAfterFailure(_ operation: ProjectFileAddOperation) async {
+        guard projectFileAddOperationCurrent(operation) else { return }
+        projectFileAddOpening = false
+        projectFileAddError = "The attachment operation could not finish. Retry it or stop the pending operation."
+        retryNeeded = true
+        do {
+            try await readProjectFileAddInventory(operation.host)
+            if host === operation.host && !projectFileAddPending {
+                projectAttachmentsCurrent = false
+                projectFileAddError = "The attachment operation could not be confirmed. Refresh the Project to check its saved attachments."
+            }
+        }
+        catch {
+            // An unrelated failed read cannot erase a matching retained owner.
+            if projectFileAddOperationCurrent(operation) { retryNeeded = true }
+        }
+    }
+
+    private func refreshProjectFileAddPresentation(_ operation: ProjectFileAddOperation) async throws {
+        guard host === operation.host, !Task.isCancelled, !appLock.concealed,
+              let session = operation.session,
+              projectAttachmentEditContext(operation.projectID, session: session) else { return }
+        try await readSelectedSurface()
+        guard host === operation.host, !Task.isCancelled, !appLock.concealed,
+              projectAttachmentEditContext(operation.projectID, session: session) else { return }
+        try await readProjectAttachments(force: true)
+        guard host === operation.host, !Task.isCancelled, !appLock.concealed,
+              projectAttachmentEditContext(operation.projectID, session: session) else { return }
+    }
+
+    func retryProjectFileAdd() async { await resolveProjectFileAdd(stop: false) }
+    func stopProjectFileAdd() async { await resolveProjectFileAdd(stop: true) }
+
+    func retryProjectFileAddRead() async {
+        guard !projectFileAddPending, !busy, !retryNeeded, !appLock.concealed, let currentHost = host else { return }
+        let id = projectHeader.text("id"), session = projectFilterSession
+        await retryProjectAttachmentEditRead()
+        guard host === currentHost, !Task.isCancelled,
+              projectAttachmentEditContext(id, session: session), projectAttachmentsVisible,
+              projectAttachmentEditReadError == nil, projectAttachmentError == nil else { return }
+        projectFileAddError = nil
+    }
+
+    private func resolveProjectFileAdd(stop: Bool) async {
+        guard projectFileAddRecoveryEnabled, let operation = projectFileAddOperation else { return }
+        busy = true
+        var restart = false
+        defer {
+            finishOperation()
+            if restart {
+                Task { [currentHost = operation.host] in
+                    guard self.host === currentHost, !self.appLock.concealed else { return }
+                    await self.start()
+                }
+            }
+        }
+        do {
+            let raw: String
+            if stop { raw = try await operation.host.abandonProjectFileAdd(requestId: operation.requestID) }
+            else { raw = try await operation.host.recoverProjectFileAdd(requestId: operation.requestID) }
+            guard projectFileAddOperationCurrent(operation) else { throw CancellationError() }
+            try acknowledgeProjectFileAdd(decode(raw), operation: operation)
+            projectAttachmentsCurrent = false
+            if !ready {
+                selectedSurface = .projects
+                restart = true
+            } else {
+                try await refreshProjectFileAddPresentation(operation)
+            }
+        } catch {
+            if projectFileAddOperationCurrent(operation) {
+                await retainProjectFileAddAfterFailure(operation)
+            } else if host === operation.host && !appLock.concealed {
+                projectFileAddError = "The attachment operation finished, but the Project could not be refreshed. Try again."
+            }
+        }
+    }
+
     private func projectAttachmentEditContext(_ id: String, session: Int) -> Bool {
         selectedSurface == .project && projectCurrent && projectFilterSession == session
             && projectHeader.text("id") == id && projectDetail.text("projectId") == id
@@ -17821,11 +18181,12 @@ final class CoreModel: ObservableObject {
         await flushProjectNotesEdit(attachmentOpenClaim: nil)
     }
 
-    private func flushProjectNotesEdit(attachmentOpenClaim: UUID?) async -> Bool {
+    private func flushProjectNotesEdit(attachmentOpenClaim: UUID?, fileAddClaim: UUID? = nil) async -> Bool {
         if let task = projectNotesFlushTask { return await task.value }
         // A delayed blur cannot install a fresh flush under Open's freeze and
         // make the captured Open await a task which refuses its own admission.
-        guard attachmentOpenClaim != nil || !projectAttachmentOpening else { return false }
+        guard (attachmentOpenClaim != nil || !projectAttachmentOpening),
+              fileAddClaim != nil || (!projectFileAddOpening && projectFileImporterID == nil) else { return false }
         if !projectNotesExpanded || !projectNotesEditMode || !projectNotesEditLoaded {
             return projectNotesWriteRequest == nil && !retryNeeded
         }
@@ -17833,7 +18194,7 @@ final class CoreModel: ObservableObject {
               projectNotesEditError == nil, projectNotesWriteRequest == nil, !retryNeeded else { return false }
         guard projectNotesDirty else { return true }
         let id = UUID()
-        let task = Task { await self.performProjectNotesFlush(attachmentOpenClaim: attachmentOpenClaim) }
+        let task = Task { await self.performProjectNotesFlush(attachmentOpenClaim: attachmentOpenClaim, fileAddClaim: fileAddClaim) }
         projectNotesFlushID = id
         projectNotesFlushTask = task
         let accepted = await task.value
@@ -17844,13 +18205,17 @@ final class CoreModel: ObservableObject {
         return accepted
     }
 
-    private func performProjectNotesFlush(attachmentOpenClaim: UUID?) async -> Bool {
+    private func performProjectNotesFlush(attachmentOpenClaim: UUID?, fileAddClaim: UUID?) async -> Bool {
         // This captured Open may flush its already-present notes before reading
         // files, while the opening flag continues to refuse fresh Project work.
         let ownedOpen = attachmentOpenClaim.map {
             projectAttachmentOpenClaim == $0 && projectAttachmentOpening && projectFileOpenPresentation == nil
         } == true
-        guard projectActionsEnabled || (ownedOpen && projectActionsCurrent),
+        let ownedAdd = fileAddClaim.map {
+            projectFileImportClaim?.id == $0 && projectFileAddOpening
+                && projectFileImportClaim.map(projectFileImportCurrent) == true
+        } == true
+        guard projectActionsEnabled || ((ownedOpen || ownedAdd) && projectActionsCurrent),
               projectNotesExpanded, projectNotesEditMode,
               projectNotesEditLoaded, !busy else { return false }
         busy = true
@@ -21719,6 +22084,10 @@ final class CoreModel: ObservableObject {
     }
 
     func retry() async {
+        if projectFileAddPending {
+            await retryProjectFileAdd()
+            return
+        }
         if taskAttachmentSaveRequest != nil {
             await retryTaskAttachmentRecovery()
             return

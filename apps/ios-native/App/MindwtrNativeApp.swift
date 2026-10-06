@@ -140,7 +140,8 @@ final class AppLockController: ObservableObject {
             return false
         }
         let result: (Bool, Error?) = await withCheckedContinuation { continuation in
-            attempt.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in
+            let prompt = reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unlock Mindwtr" : reason
+            attempt.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: prompt) { success, error in
                 continuation.resume(returning: (success, error))
             }
         }
@@ -213,6 +214,15 @@ private struct AppLockRoot: View {
                                 Button("Cancel pending change") { Task { await model.cancelAppLockRecovery() } }
                                     .foregroundStyle(palette.onTint)
                                     .accessibilityIdentifier("app-lock-recovery-cancel")
+                            } else if !model.ready && !model.projectFileAddSummary.isEmpty && lock.enabled != nil {
+                                if lock.concealed {
+                                    Button(model.label("appLock.unlock").isEmpty ? "Unlock" : model.label("appLock.unlock")) {
+                                        Task { await lock.unlock(label: model.label) }
+                                    }
+                                    .foregroundStyle(palette.onTint).accessibilityIdentifier("app-lock-unlock")
+                                } else {
+                                    ProjectFileAddRecoveryPanel(model: model, palette: palette)
+                                }
                             } else if !model.ready || lock.enabled == nil {
                                 if !model.ready && model.error != nil {
                                     Text(model.label("settings.feedback.actionFailed").isEmpty
@@ -244,6 +254,7 @@ private struct AppLockRoot: View {
         .onAppear { lock.sceneChanged(phase) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             model.cancelTaskFileImport()
+            model.cancelProjectFileImport()
             model.flushTaskDraftCheckpointInBackground()
             if model.appLockActive && !lock.authenticating { lock.readFailed() }
             lock.concealSnapshot()
@@ -251,6 +262,7 @@ private struct AppLockRoot: View {
         .onChange(of: phase) { next in
             if next != .active {
                 model.cancelTaskFileImport()
+                model.cancelProjectFileImport()
                 model.flushTaskDraftCheckpointInBackground()
             }
             if next != .active && model.appLockActive && !lock.authenticating { lock.readFailed() }
@@ -258,7 +270,11 @@ private struct AppLockRoot: View {
             if next == .active && !lock.concealed { Task { await model.refresh() } }
         }
         .onChange(of: lock.concealed) { concealed in
-            if concealed { model.cancelTaskFileImport(); model.dismissTaskShare() }
+            if concealed {
+                model.cancelTaskFileImport()
+                model.cancelProjectFileImport()
+                model.dismissTaskShare()
+            }
             if !concealed && phase == .active { Task { await model.refresh() } }
         }
         .task(id: "\(model.ready)-\(lock.nonce)-\(phase == .active)-\(lock.authenticating)") {

@@ -49,6 +49,7 @@ enum NativeAttachmentFileJobsError: LocalizedError {
 /// held without JSC pumping until the typed operation has completed.
 enum NativeAttachmentDraftFileRequest: Sendable {
     case ensureManagedDirectory
+    case ensureManagedDirectoryProof
     case snapshotSource(sourceURI: String)
     case snapshotBaseline(attachmentID: String, targetURI: String)
     case prepareStage(targetURI: String, operationID: String)
@@ -63,7 +64,7 @@ enum NativeAttachmentDraftFileRequest: Sendable {
     fileprivate var isInstaller: Bool {
         switch self {
         case .prepareStage, .publishStage, .retirePrivateStage: return true
-        case .ensureManagedDirectory, .snapshotSource, .snapshotBaseline, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished, .retireBaseline: return false
+        case .ensureManagedDirectory, .ensureManagedDirectoryProof, .snapshotSource, .snapshotBaseline, .fillStage, .observeFilledStage, .verifyPublication, .retirePublished, .retireBaseline: return false
         }
     }
 
@@ -97,6 +98,8 @@ enum NativeAttachmentDraftFileRequest: Sendable {
         switch self {
         case .ensureManagedDirectory:
             input = ["op": "ensureManagedDirectory"]
+        case .ensureManagedDirectoryProof:
+            input = ["op": "ensureManagedDirectoryProof"]
         case .snapshotSource(let sourceURI):
             try uri(sourceURI)
             input = ["op": "snapshotSource", "sourceURI": sourceURI]
@@ -207,6 +210,10 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
     /// Set before submitting work. Hooks run on the file queue, never on JSC.
     var beforeWork: ((String, Bool) throws -> Void)?
     var afterWork: ((String, Bool) -> Void)?
+    var beforeProviderOutputNamedStat: ((Bool) throws -> Void)? {
+        get { files.beforeProviderOutputNamedStat }
+        set { files.beforeProviderOutputNamedStat = newValue }
+    }
     var beforeFilePublish: (() throws -> Void)? {
         get { files.beforePublish }
         set { files.beforePublish = newValue }
@@ -324,6 +331,8 @@ final class NativeAttachmentFileJobs: @unchecked Sendable {
             let request = try JSONSerialization.data(withJSONObject: ["op": "makeDirectory", "uri": files.managedRoot.absoluteString])
             _ = try files.call(String(decoding: request, as: UTF8.self), checkCancellation: token.check)
             return [:]
+        case .ensureManagedDirectoryProof:
+            return ["directoryIdentity": try files.ensureManagedDirectoryProof(checkCancellation: token.check)]
         case .snapshotSource(let sourceURI):
             let proof = try files.snapshotCacheSource(sourceURI, checkCancellation: token.check)
             return ["sourceURI": proof.sourceURI, "sha256": proof.sha256, "size": proof.size,

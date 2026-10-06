@@ -16,19 +16,19 @@ import {
 } from '../project-status';
 import { normalizeCancellationTimestamp, normalizeTaskForLoad } from '../task-status';
 import { mapSqliteTaskRow, rawReadTaskSnapshot } from '../sqlite-adapter';
-import { rawReadProjectSnapshot } from '../sqlite-raw-snapshot';
+import { rawReadProjectSnapshot, rawReadRow } from '../sqlite-raw-snapshot';
 import { TASK_SQLITE_COLUMNS, taskToSqliteRow } from '../task-sync-schema';
 import { logInfo, logWarn } from '../logger';
 import { clearDerivedCache } from '../store-settings';
 import { generateUUID as uuidv4 } from '../uuid';
 import { DEFAULT_PROJECT_COLOR } from '../color-constants';
 import { findSelectableProjectByTitleAndArea, normalizeProjectTaskSortBy } from '../project-utils';
-import { PROJECT_SQLITE_COLUMNS, projectToSqliteRow } from '../project-sync-schema';
+import { PROJECT_SQLITE_COLUMNS, projectFromSqliteRow, projectToSqliteRow } from '../project-sync-schema';
 import { taskEditValuesEqual } from '../json-value-equality';
 import { planAttachmentLinkBatch, softDeleteAttachment } from '../attachment-editor-model';
-import type { Area, TaskSortBy } from '../types';
+import type { Area, Attachment, TaskSortBy } from '../types';
 import type { Project, ProjectCoreActions, ProjectActionContext, Section, Task, TaskStatus } from './shared';
-import type { PreparedProjectArea, PreparedProjectAttachmentWrite, PreparedProjectFileRemoveWrite, PreparedProjectCreate, PreparedProjectDate, PreparedProjectDelete, PreparedProjectDeleteUndo, PreparedProjectDuplicate, PreparedProjectLifecycle, PreparedProjectFlow, PreparedProjectTaskSort, PreparedProjectFocus, PreparedProjectNotesWrite, PreparedProjectTagsWrite, PreparedProjectRename, PreparedProjectStatus, PreparedTaskEditResult, PreparedTrashProjectRestore, ProjectAttachmentIntent, ProjectFileRemoveIntent, ProjectFlowAction, TaskStore } from '../store-types';
+import type { PreparedProjectArea, PreparedProjectAttachmentWrite, PreparedProjectFileAddWrite, PreparedProjectFileRemoveWrite, PreparedProjectCreate, PreparedProjectDate, PreparedProjectDelete, PreparedProjectDeleteUndo, PreparedProjectDuplicate, PreparedProjectLifecycle, PreparedProjectFlow, PreparedProjectTaskSort, PreparedProjectFocus, PreparedProjectNotesWrite, PreparedProjectTagsWrite, PreparedProjectRename, PreparedProjectStatus, PreparedTaskEditResult, PreparedTrashProjectRestore, ProjectAttachmentIntent, ProjectFileRemoveIntent, ProjectFlowAction, TaskStore } from '../store-types';
 import { projectTagsForIntent, type ProjectTagsIntent } from '../project-tags';
 import { settingsWithPurgedParentAttachmentDeletes } from '../attachment-cleanup';
 import {
@@ -161,6 +161,30 @@ export const sameProjectSqliteRow = (left: Project, right: Project): boolean => 
             && typeof other === 'string' ? taskEditValuesEqual(JSON.parse(value), JSON.parse(other))
                 : Object.is(value, other);
     });
+};
+
+/** Add must not silently normalize a raw scalar cell that its frozen DTO cannot retain. */
+export const projectFileAddScalarCellsMatchWriter = (project: Project): boolean => {
+    const projection = projectToSqliteRow(project), raw = rawReadRow(project, projection).row;
+    return projection.every((value, index) => projectJsonColumns.has(PROJECT_SQLITE_COLUMNS[index])
+        || PROJECT_SQLITE_COLUMNS[index] === 'viewSectionIds'
+        || Object.is(raw[index], value));
+};
+
+/** Project-owned file Add retains raw JSON presence through the display codec. */
+export const sameProjectFileAddSqliteRow = (left: Project, right: Project): boolean => {
+    if (!projectFileAddScalarCellsMatchWriter(left) || !projectFileAddScalarCellsMatchWriter(right)) return false;
+    const before = rawReadProjectSnapshot(left), after = rawReadProjectSnapshot(right);
+    return !!before && !!after && sameProjectSqliteRow(before, after);
+};
+
+/** Match the actual saved Project to either host's live display without changing its raw witness. */
+export const projectFileAddLiveRowMatches = (live: Project, saved: Project): boolean => {
+    if (sameProjectFileAddSqliteRow(live, saved)) return true;
+    const values = projectToSqliteRow(rawReadProjectSnapshot(saved) ?? saved);
+    const display = normalizeProjectLifecycleFields(projectFromSqliteRow(Object.fromEntries(
+        PROJECT_SQLITE_COLUMNS.map((column, index) => [column, values[index]]))));
+    return sameProjectSqliteRow(live, display);
 };
 
 /** The existing RN Restore policy, also used to derive native prepared effects. */
@@ -372,6 +396,19 @@ export const projectFileRemoveWriteEffect = (project: Project, intent: ProjectFi
     if (intent.kind !== 'remove' || ids.length !== 1 || ids[0] !== intent.attachmentId
         || target?.kind !== 'file' || target.deletedAt) return null;
     const attachments = softDeleteAttachment(project.attachments ?? [], intent.attachmentId, now);
+    const transition = applyProjectLifecycleTransition(project, { attachments }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN Project file Add appends completed metadata through the existing Project lifecycle. */
+export const projectFileAddWriteEffect = (project: Project, attachment: Attachment, deviceId: string,
+    now: string): PreparedProjectFileAddWrite['effect'] | null => {
+    if (attachment.kind !== 'file' || (project.attachments?.length ?? 0) >= 1_000
+        || project.attachments?.some((row) => row.id === attachment.id)) return null;
+    const attachments = [...(project.attachments ?? []), attachment];
     const transition = applyProjectLifecycleTransition(project, { attachments }, [], [], now, deviceId);
     return { project: { before: project, after: normalizeProjectLifecycleFields({
         ...project, ...transition.projectUpdates,
@@ -867,6 +904,53 @@ export const createProjectCoreActions = ({
             result = { success: true, id: current.id, outcome: 'applied' };
             return { _allProjects: projects, settings,
                 lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectFileAddWrite: async (input, authority): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project file Add conflicts with current data' };
+        if (input.version !== 3 || input.kind !== 'project-file-add'
+            || input.attachment.id !== input.request.requestId || input.result.id !== input.request.projectId
+            || !taskEditValuesEqual(input.result.attachmentIds, [input.request.requestId])) return result;
+        const planned = projectFileAddWriteEffect(input.scope.project, input.attachment,
+            input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+        if (!planned || !taskEditValuesEqual(planned, input.effect)) return result;
+        set((state) => {
+            const bound = authority.state, durable = authority.snapshot;
+            if (state._allTasks !== bound._allTasks || state._allProjects !== bound._allProjects
+                || state._allSections !== bound._allSections || state._allAreas !== bound._allAreas
+                || state._allPeople !== bound._allPeople || state.settings !== bound.settings
+                || state.lastDataChangeAt !== bound.lastDataChangeAt) return state;
+            const matches = durable.projects.filter((row) => row.id === input.request.projectId);
+            const current = matches.length === 1 ? matches[0] : undefined;
+            const live = state._projectsById.get(input.request.projectId);
+            if (!current || !live || !(projectFileAddLiveRowMatches(live, current)
+                || state.persistenceFailure && projectFileAddLiveRowMatches(live, input.effect.project.after))) return state;
+            if ((!input.deviceIdToInitialize || durable.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectFileAddSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (durable.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectFileAddSqliteRow(current, input.scope.project)) return state;
+            const projects = replaceEntitiesInArray(durable.projects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...durable.settings, deviceId: input.deviceIdToInitialize } : durable.settings;
+            const liveSettings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, { ...state, _allTasks: durable.tasks, _allProjects: durable.projects,
+                _allSections: durable.sections ?? [], _allAreas: durable.areas ?? [], _allPeople: durable.people ?? [], settings: durable.settings },
+            { ...durable, projects, settings });
+            const lastDataChangeAt = getNextDataChangeAt(state.lastDataChangeAt);
+            authority.saveBoundary = { taskReference: state._allTasks, lastDataChangeAt,
+                generation: getSaveGeneration(), failure: state.persistenceFailure };
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: replaceEntitiesInArray(state._allProjects, [planned.project.after]),
+                settings: liveSettings, lastDataChangeAt };
         });
         return result;
     },

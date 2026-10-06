@@ -1478,6 +1478,79 @@ final class FoundationUITests: XCTestCase {
         app.terminate()
     }
 
+    func testProjectFilePickerFlushesNotesBeforePresentationAndCancellationCreatesNoAttachment() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-ui-test-library", "5752ba30-4d8b-4a59-ba28-a748aaf067da"]
+        let notes = "Task282 Notes saved before picker"
+        func projects() {
+            boardEnabled(app.buttons["tab-menu"], timeout: 30)
+            boardTap(app, "tab-menu"); boardTap(app, "menu-projects")
+            boardEnabled(app.textFields["projects-create-title"])
+        }
+        func open(_ id: String) {
+            if id == "task121-archived" {
+                let section = app.buttons["projects-section-archived"]
+                revealPagedElement(app, section, in: app.scrollViews["projects-scroll"])
+                if section.value as? String == "Expand" { section.tap() }
+            }
+            let row = app.buttons["project-open-" + id]
+            revealPagedElement(app, row, in: app.scrollViews["projects-scroll"])
+            boardEnabled(row); row.tap(); boardTap(app, "project-details-toggle")
+        }
+        func tap(_ id: String) {
+            let button = app.buttons[id]
+            revealPagedElement(app, button, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+            boardEnabled(button); XCTAssertGreaterThanOrEqual(button.frame.height + 0.000001, 44)
+            button.tap()
+        }
+        func unchangedAttachments() {
+            let file = app.buttons["project-attachment-open-task121-file"]
+            revealPagedElement(app, file, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+            boardEnabled(file)
+            XCTAssertEqual(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+                "project-attachment-open-task121-")).count, 4)
+            XCTAssertFalse(app.otherElements["project-file-add-recovery"].exists)
+            XCTAssertFalse(app.buttons["project-file-add-retry"].exists)
+            XCTAssertFalse(app.buttons["project-file-add-stop"].exists)
+        }
+        app.launch(); projects(); open("task121-active")
+        tap("project-notes-toggle")
+        if app.buttons["project-notes-mode-edit"].isEnabled { tap("project-notes-mode-edit") }
+        let input = app.textViews["project-notes-input"]
+        boardEnabled(input); input.tap(); input.typeText(notes)
+        tap("project-attachment-add-file")
+        let cancel = app.navigationBars.buttons["Cancel"].firstMatch
+        boardEnabled(cancel, timeout: 20)
+        // Kill while the real picker is still presented: Notes must already be
+        // durable, and no Project/Task attachment owner exists before selection.
+        app.terminate(); app.launch(); projects(); open("task121-active")
+        unchangedAttachments()
+        tap("project-notes-toggle")
+        if app.buttons["project-notes-mode-preview"].exists && app.buttons["project-notes-mode-preview"].isEnabled {
+            tap("project-notes-mode-preview")
+        }
+        let savedNotes = app.staticTexts[notes]
+        revealPagedElement(app, savedNotes, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        XCTAssertTrue(savedNotes.exists)
+        tap("project-attachment-add-file")
+        boardEnabled(cancel, timeout: 20); cancel.tap()
+        XCTAssertTrue(cancel.waitForNonExistence(timeout: 15))
+        let addFileButton = app.buttons["project-attachment-add-file"]
+        revealPagedElement(app, addFileButton, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        boardEnabled(addFileButton)
+        unchangedAttachments()
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Project picker Cancel retains Notes and original attachments"
+        shot.lifetime = .keepAlways; add(shot)
+        boardTap(app, "project-back"); open("task121-archived")
+        let archivedOpen = app.buttons["project-attachment-open-task121-file"]
+        revealPagedElement(app, archivedOpen, in: app.scrollViews["project-detail-scroll"], outerEdge: true)
+        let archivedAdd = app.buttons["project-attachment-add-file"]
+        XCTAssertTrue(archivedAdd.exists); XCTAssertFalse(archivedAdd.isEnabled)
+        XCTAssertGreaterThanOrEqual(archivedAdd.frame.height + 0.000001, 44)
+        app.terminate()
+    }
+
     private func openTask120(_ library: String) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--native-ui-test-library", library]

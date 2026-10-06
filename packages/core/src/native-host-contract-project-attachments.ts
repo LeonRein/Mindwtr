@@ -246,3 +246,7 @@ export function createProjectFileRemoveWriteMethods(deps: AttachmentWriteDepende
         commitPreparedProjectFileRemoveWrite: methods.commitPreparedProjectAttachmentWrite,
     };
 }
+
+// Concrete Project metadata readers shared by the separate owned-file Add foundation.
+export { token as projectAttachmentWriteToken, validToken as isProjectAttachmentWriteToken,
+    validAttachmentProject as isProjectAttachmentWriteProject };

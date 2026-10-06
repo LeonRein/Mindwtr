@@ -1631,6 +1631,32 @@ describe('canonical local reads contract', () => {
                 expect(nativeValue(await host.commitPreparedProjectAttachmentWrite({ request, prepared: planned.prepared })))
                     .toEqual(planned.prepared.result);
             },
+            commitPreparedProjectFileAddWrite: async (control) => {
+                const host = await nativeHost(control);
+                const before = nativeValue(await readAreaDurableData(false, true)).authority.snapshot;
+                const options = nativeValue(host.getProjectAttachmentEditOptions({ projectId: settled.projects[1].id }));
+                const { id, ...expected } = options.project;
+                const request = { requestId: '87191485-2aba-4d0f-85d1-f2f9d791c174', projectId: id, expected,
+                    picked: { uri: 'file:///provider/contract.pdf', name: 'contract.pdf', mimeType: 'application/pdf', size: null },
+                    measuredSize: 27, managedDirectoryURI: 'file:///documents/attachments/' };
+                const planned = nativeValue(await host.prepareProjectFileAddWrite(request));
+                if (planned.kind !== 'prepared') throw new Error('Project file Add must prepare a real write');
+                expect(planned.prepared.effect.project.after.attachments).toEqual([
+                    ...(planned.prepared.scope.project.attachments ?? []), planned.prepared.attachment,
+                ]);
+                expect(planned.prepared.attachment).toMatchObject({ id: request.requestId, kind: 'file', size: 27,
+                    uri: `file:///documents/attachments/${request.requestId}.pdf` });
+                control.expectPersisted((written) => {
+                    expect(written.projects).toEqual(before.projects.map((row) => row.id === id
+                        ? planned.prepared.effect.project.after : row));
+                    expect(written.tasks).toEqual(before.tasks);
+                    expect(written.sections).toEqual(before.sections);
+                    expect(written.settings).toEqual(before.settings);
+                });
+                control.resetBaseline();
+                expect(nativeValue(await host.commitPreparedProjectFileAddWrite({ request, prepared: planned.prepared })))
+                    .toEqual({ id, attachmentIds: [request.requestId] });
+            },
             commitPreparedProjectFileRemoveWrite: async (control) => {
                 const projectId = settled.projects[1].id;
                 const attachment = fileAttachment('contract-project-file');

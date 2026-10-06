@@ -113,6 +113,7 @@ final class NativeAttachmentFiles {
         return String(decoding: try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
     }
     #if DEBUG
+    var beforeProviderOutputNamedStat: ((Bool) throws -> Void)?
     var afterSourceOpened: (() throws -> Void)?
     var beforePublish: (() throws -> Void)?
     var beforeStageSync: (() throws -> Void)?
@@ -317,6 +318,20 @@ final class NativeAttachmentFiles {
     }
 
     /// Native-only evidence for a future durable copy intent, not editor ownership.
+    /// Native Project Add captures the descriptor used by the actual directory
+    /// creation; later pathname observations cannot substitute a replacement.
+    func ensureManagedDirectoryProof(checkCancellation: () throws -> Void) throws -> String {
+        try checkCancellation()
+        let path = try reference(managedRoot.absoluteString)
+        let directory = try openDirectory(path, create: true)
+        defer { Darwin.close(directory) }
+        try checkCancellation()
+        let named = try openDirectory(path); defer { Darwin.close(named) }
+        let identity = try Self.identity(directory)
+        guard identity == (try Self.identity(named)) else { throw NativeAttachmentFilesError.unavailable }
+        return Self.token(identity)
+    }
+
     func copyProviderSource(_ selectedURL: URL, checkCancellation: () throws -> Void) throws -> ProviderCacheCopyReceipt {
         guard selectedURL.isFileURL else { throw NativeAttachmentFilesError.invalidRequest }
         _ = try Self.filePath(selectedURL.absoluteString)
@@ -384,7 +399,7 @@ final class NativeAttachmentFiles {
         guard output >= 0 else { throw NativeAttachmentFilesError.unavailable }
         defer { Darwin.close(output) }
         let created = try Self.identity(output)
-        var promoted = false, complete = false
+        var promoted = false, complete = false, outputFrozen = false
         defer {
             if !complete {
                 // A pathname is insufficient even in a failure defer: ancestors
@@ -404,8 +419,19 @@ final class NativeAttachmentFiles {
         func validateOutput() throws {
             let named = Parent(fd: parent.fd, leaf: promoted ? leaf : partial)
             try verify(named, path: promoted ? path : partialPath)
-            let retained = try Self.regular(output), current = try Self.named(named)
-            guard Identity(retained) == created, Self.unchanged(retained, current),
+            let retained = try Self.regular(output)
+            #if DEBUG
+            try beforeProviderOutputNamedStat?(outputFrozen)
+            #endif
+            let current = try Self.named(named)
+            // Creation authority owns this output while it is being filled.
+            // After sync/capture, every generation check includes ctime again.
+            let sameGeneration = outputFrozen ? Self.unchanged(retained, current)
+                : Identity(retained) == Identity(current) && retained.st_size == current.st_size
+                    && retained.st_mode == current.st_mode
+                    && retained.st_mtimespec.tv_sec == current.st_mtimespec.tv_sec
+                    && retained.st_mtimespec.tv_nsec == current.st_mtimespec.tv_nsec
+            guard Identity(retained) == created, sameGeneration,
                   retained.st_nlink == 1, current.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
         }
         func check() throws {
@@ -441,6 +467,7 @@ final class NativeAttachmentFiles {
         try check()
         guard Darwin.fsync(output) == 0, Darwin.fcntl(output, F_FULLFSYNC) == 0 else { throw NativeAttachmentFilesError.unavailable }
         let filled = try Self.regular(output)
+        outputFrozen = true
         #if DEBUG
         try beforePublish?()
         #endif

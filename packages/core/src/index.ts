@@ -50,6 +50,7 @@ export * from './native-host-contract-project-flow';
 export * from './native-host-contract-project-notes';
 export * from './native-host-contract-project-tags';
 export * from './native-host-contract-project-attachments';
+export * from './native-host-contract-project-file-add';
 export * from './project-tags';
 export * from './native-host-contract-project-status';
 export * from './native-host-contract-project-date';

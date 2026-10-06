@@ -120,12 +120,12 @@ struct TaskViewSheet: View {
         .sheet(item: Binding(
             get: {
                 guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented else { return nil }
-                return TaskDocumentPickerClaim(id: pickerID)
+                return NativeDocumentPickerClaim(id: pickerID)
             },
-            set: { (claim: TaskDocumentPickerClaim?) in
+            set: { (claim: NativeDocumentPickerClaim?) in
                 if claim == nil { model.setTaskFileImporterPresented(false, pickerID: pickerID) }
             })) { claim in
-                TaskDocumentPicker(pickerID: claim.id) { result, capturedID in
+                NativeDocumentPicker(pickerID: claim.id) { result, capturedID in
                     Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
                 }
                 .id(claim.id)
@@ -1401,11 +1401,11 @@ struct TaskViewSheet: View {
 
 }
 
-private struct TaskDocumentPickerClaim: Identifiable {
+struct NativeDocumentPickerClaim: Identifiable {
     let id: UUID
 }
 
-private struct TaskDocumentPicker: UIViewControllerRepresentable {
+struct NativeDocumentPicker: UIViewControllerRepresentable {
     let pickerID: UUID
     let completion: (Result<[URL], Error>, UUID) -> Void
 
