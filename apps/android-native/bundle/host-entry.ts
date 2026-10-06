@@ -69,6 +69,8 @@ import {
     formatListItemCount,
     getBulkMoveStatusOptions,
     type TaskStatus,
+    type Task,
+    type Project,
     webdavDeleteFile,
     webdavGetFile,
     webdavGetJson,
@@ -1044,13 +1046,20 @@ const settledAttachmentDiscardState = () => {
         return { state, status };
     } catch { throw attachmentDiscardNotReady(); }
 };
+// Reference-only: the fixed iOS spellings can keep bytes, never grant file IO.
+const nativeAttachmentFileInUse = (uri: string, owners: readonly (Task | Project)[]): boolean => {
+    if (isAttachmentFileInUse(uri, owners)) return true;
+    const counterpart = uri.startsWith('file:///private/var/') ? 'file:///var/' + uri.slice('file:///private/var/'.length)
+        : uri.startsWith('file:///var/') ? 'file:///private/var/' + uri.slice('file:///var/'.length) : null;
+    return counterpart !== null && isAttachmentFileInUse(counterpart, owners);
+};
 /** Native-held callbacks complete their action before JSC's return-time microtask drain. */
 const retireAttachmentDiscard = (json: string, keepCallback: () => string, retireCallback: () => string): string => {
     if (typeof keepCallback !== 'function' || typeof retireCallback !== 'function') throw attachmentDiscardInvalid();
     const input = attachmentDiscardInput(json), before = settledAttachmentDiscardState();
     const tasks = before.state._allTasks, projects = before.state._allProjects, generation = before.status.generation;
     let inUse: boolean;
-    try { inUse = isAttachmentFileInUse(input.targetURI, [...tasks, ...projects]); }
+    try { inUse = nativeAttachmentFileInUse(input.targetURI, [...tasks, ...projects]); }
     catch { throw attachmentDiscardNotReady(); }
     const after = settledAttachmentDiscardState();
     if (after.state._allTasks !== tasks || after.state._allProjects !== projects
@@ -1092,6 +1101,7 @@ type AttachmentSavePlan = Readonly<{
     envelopeJSON: string;
     taskID: string;
     afterRevision: ReturnType<typeof taskRevisionOf>;
+    completeRemoveOnly: boolean;
     settlementPlan: ReadonlyArray<Readonly<(ReturnType<typeof contract.validatePreparedOwnedEditorFileEditTaskDraftSave>
         & { ok: true })['value']['settlementPlan'][number]>>;
 }>;
@@ -1105,12 +1115,23 @@ const retireAttachmentFileEditSave = (json: string, referencedCallback: () => st
     }
     let plan: AttachmentSavePlan;
     let index: number;
+    let currentURI: string | null = null;
     try {
         const input = attachmentDraftJson(json) as Record<string, unknown> | null;
-        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 3
-            || input.version !== 1 || typeof input.envelopeJSON !== 'string' || input.envelopeJSON.length > 8 * 1024 * 1024
+        if (!input || typeof input !== 'object' || Array.isArray(input)
+            || (input.version !== 1 && input.version !== 2)
+            || Object.keys(input).length !== (input.version === 2 ? 4 : 3)
+            || typeof input.envelopeJSON !== 'string' || input.envelopeJSON.length > 8 * 1024 * 1024
             || new TextEncoder().encode(input.envelopeJSON).byteLength > 8 * 1024 * 1024
             || !Number.isSafeInteger(input.candidateIndex) || (input.candidateIndex as number) < 0) throw attachmentSaveInvalid();
+        if (input.version === 2) {
+            if (typeof input.currentURI !== 'string' || !input.currentURI.startsWith('file:///')
+                || input.currentURI.length > 16 * 1024 || new TextEncoder().encode(input.currentURI).byteLength > 16 * 1024
+                || /[?#\\\u0000-\u0020]/.test(input.currentURI) || /%(?:2f|5c)/i.test(input.currentURI)) throw attachmentSaveInvalid();
+            const path = decodeURIComponent(input.currentURI.slice('file:///'.length));
+            if (/[\\\u0000-\u001f\u007f]/.test(path) || path.split('/').some((part) => !part || part === '.' || part === '..')) throw attachmentSaveInvalid();
+            currentURI = input.currentURI;
+        }
         index = input.candidateIndex as number;
         if (attachmentSavePlan?.envelopeJSON === input.envelopeJSON) plan = attachmentSavePlan;
         else {
@@ -1127,11 +1148,14 @@ const retireAttachmentFileEditSave = (json: string, referencedCallback: () => st
             if (!afterTask) throw attachmentSaveInvalid();
             plan = Object.freeze({ envelopeJSON: input.envelopeJSON, taskID: envelope.request.saveRequest.id,
                 afterRevision: taskRevisionOf(afterTask),
+                completeRemoveOnly: complete !== null && complete.request.ownedDraft.priorOperations.length > 0
+                    && complete.request.ownedDraft.priorOperations.every((entry) => entry.kind === 'remove'),
                 settlementPlan: Object.freeze(checked.value.settlementPlan.map((value) => Object.freeze({ ...value,
                     attachment: Object.freeze({ ...value.attachment }) }))) });
             attachmentSavePlan = plan;
         }
-        if (index >= plan.settlementPlan.length) throw attachmentSaveInvalid();
+        if (index >= plan.settlementPlan.length || currentURI !== null && (!plan.completeRemoveOnly
+            || plan.settlementPlan[index].reason === 'uncommitted-draft')) throw attachmentSaveInvalid();
     } catch { throw attachmentSaveInvalid(); }
     const selected = plan.settlementPlan[index];
     // Out-of-order and failed last calls safely revalidate on a later retry.
@@ -1141,7 +1165,9 @@ const retireAttachmentFileEditSave = (json: string, referencedCallback: () => st
     const generation = before.status.generation;
     let referenced: boolean, moved: boolean;
     try {
-        referenced = isAttachmentFileInUse(selected.attachment.uri, [...tasks, ...projects]);
+        const owners = [...tasks, ...projects];
+        referenced = nativeAttachmentFileInUse(selected.attachment.uri, owners)
+            || currentURI !== null && nativeAttachmentFileInUse(currentURI, owners);
         const currentTask = taskMap.get(plan.taskID);
         moved = selected.reason !== 'uncommitted-draft'
             && (!currentTask || taskRevisionOf(currentTask) !== plan.afterRevision);
@@ -3388,15 +3414,17 @@ globalThis.MindwtrHost = {
             const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
             const ownedResume = operation === 'owned-resume' && outcome === 'validated';
             const preexistingReplay = operation === 'preexisting-journal-replay' && outcome === 'confirmed';
+            const containerRecovery = operation === 'container-relocation' && outcome === 'confirmed';
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
                     context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }
+                        : containerRecovery ? { releaseCheck: 'v1.3.5/ios-attachment-container-recovery' }
                         : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
                         : completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }

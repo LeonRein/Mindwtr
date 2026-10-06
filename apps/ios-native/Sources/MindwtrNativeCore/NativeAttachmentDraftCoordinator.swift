@@ -1257,20 +1257,25 @@ final class NativeAttachmentDraftCoordinator {
     }
     /// Typed synchronous jobs only, under the caller's journal-bound closure.
     func retireMixedSaveTarget(_ candidate: MixedSaveCandidate, record: Store.MixedRecord,
+                               currentURI: String? = nil,
                                cancellation: NativeAttachmentCancellation) throws -> String {
         try requireOwner(); try cancellation.check()
         let outcome: String
         switch candidate.authority {
         case .ownedAdd(let id):
-            guard let op = Self.mixedSaveAdds(record).first(where: { Self.equal($0.requestId, id) }) else { throw Self.failure }
+            guard currentURI == nil, let op = Self.mixedSaveAdds(record).first(where: { Self.equal($0.requestId, id) }) else { throw Self.failure }
             outcome = try retireOwnedDiscardTarget(op, cancellation: cancellation)
         case .baseline(let observation):
             if let proof = observation.proof {
-                let value = try file(.retireBaseline(attachmentID: candidate.attachmentID, proof: proof), cancellation: cancellation)
+                // The synchronous native owner has rechecked this mapping. No
+                // content or file/directory generation proof can be replaced.
+                let resolved = currentURI.map { NativeAttachmentFiles.BaselineAttachmentProof(targetURI: $0,
+                    sha256: proof.sha256, size: proof.size, identity: proof.identity, directoryIdentity: proof.directoryIdentity) } ?? proof
+                let value = try file(.retireBaseline(attachmentID: candidate.attachmentID, proof: resolved), cancellation: cancellation)
                 guard Set(value.keys) == Set(["status"]), let status = value["status"] as? String,
                       ["removed", "absent", "generationChanged", "unsafeEntry"].contains(status) else { throw Self.failure }
                 outcome = status
-            } else { outcome = observation.kind }
+            } else { guard currentURI == nil else { throw Self.failure }; outcome = observation.kind }
         }
         jobs.drain(); try requireOwner(); try cancellation.check()
         guard candidate.outcomes.contains(outcome) else { throw Self.failure }

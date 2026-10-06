@@ -116,3 +116,6 @@ Data → Backup also supports Export CSV through RN's shared serializer. It expo
 
 
 Data → Backup → Export as TaskNotes shares RN's ZIP of Markdown files. Reference/deleted/purged tasks are excluded by the shared format, and binary bytes remain intact. Task200 passed core/Swift checks, normal/maximum-text simulator flows, JSON regression and an isolated iPhone ZIP-content/share-cancellation check. Independent Sol review found no blockers. JSON merge/restore and other imports remain pending; details and limits are in the [parity ledger](../../docs/development/native-mobile-parity.md#task200-tasknotes-zip-export).
+
+
+Terminal Remove-only attachment Saves can now finish cleanup after an iOS data-container UUID change when the original file and parent ownership proofs still match. The original journal arguments and database URIs stay unchanged. Final targeted checks and the retained physical iPhone case passed with ordinary development data preserved; see [Task276 parity evidence](../../docs/development/native-mobile-parity.md#terminal-attachment-removal-after-container-relocation-2026-10-06-task276). Add recovery across container moves and attachment URI migration/opening remain separate work.

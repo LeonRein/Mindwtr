@@ -44,6 +44,10 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
     }
     // Only outer SQL object ordering is canonicalized; opaque cell strings stay exact.
     private func rows() throws -> String { try json(NativeJSON.jsonObject(with: Data(sql("SELECT * FROM tasks ORDER BY id").utf8))) }
+    private func inode(_ url: URL) throws -> String {
+        var value = stat(); guard lstat(url.path, &value) == 0 else { throw HostFailure("Fixture identity unavailable") }
+        return "\(UInt64(value.st_dev)):\(UInt64(value.st_ino))"
+    }
     private func task(_ id: String? = nil) throws -> [String: Any] { try XCTUnwrap((NativeJSON.jsonObject(with: Data(sql("SELECT * FROM tasks WHERE id=?", [id ?? taskID]).utf8)) as? [[String: Any]])?.first) }
     private func latest() throws -> EditorDraftSnapshot { try XCTUnwrap(editor.read()?.snapshot) }
     private func record() throws -> Store.MixedRecord { try XCTUnwrap(store.readMixed()) }
@@ -153,6 +157,202 @@ final class AttachmentCompleteSaveHostTests: XCTestCase {
     private func probe(_ suffix: String) throws {
         bundle = root.appendingPathComponent("probe-core-host.js")
         try (String(contentsOf: originalBundle, encoding: .utf8) + "\n;(()=>{" + suffix + "})();\n").write(to: bundle, atomically: true, encoding: .utf8)
+    }
+    private func relocatedTerminal(withAdd: Bool = false, stop: AttachmentDraftBoundary = .beforeSaveTarget(0)) async throws
+        -> (original: URL, arguments: String, result: String) {
+        let fixture = try XCTUnwrap(root), application = fixture.appendingPathComponent("Application", isDirectory: true)
+        let oldContainer = application.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let newContainer = application.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let suffix = "Library/NativeUITests/" + UUID().uuidString
+        root = oldContainer.appendingPathComponent(suffix, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let original = try XCTUnwrap(root), host = try await seed()
+        if withAdd { _ = try await add(host) }; try await remove(host)
+        await boundary(stop, host: host)
+        let known = await refused({ _ = try await self.save(host) }, saved: true)
+        let result = try XCTUnwrap(known?.resultJSON), arguments = try XCTUnwrap(journalObject()["argumentsJSON"] as? String)
+        let savedRows = try rows(), bytes = try Data(contentsOf: journal), identity = try inode(journal), parent = try inode(managed)
+        let owner = try store.readMixed().map { _ in try Data(contentsOf: store.url) }
+        await host.close(); try FileManager.default.moveItem(at: oldContainer, to: newContainer)
+        root = newContainer.appendingPathComponent(suffix, isDirectory: true)
+        XCTAssertEqual(try inode(journal), identity); XCTAssertEqual(try Data(contentsOf: journal), bytes)
+        XCTAssertEqual(try inode(managed), parent); XCTAssertEqual(try rows(), savedRows)
+        if let owner { XCTAssertEqual(try Data(contentsOf: store.url), owner) } else { XCTAssertNil(try store.readMixed()) }
+        return (original, arguments, result)
+    }
+
+    func testTerminalRemoveRelocatesSameInodeContainerWithoutRewritingFrozenAuthority() async throws {
+        let fixture = try XCTUnwrap(root), application = fixture.appendingPathComponent("Application", isDirectory: true)
+        let oldContainer = application.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let newContainer = application.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let suffix = "Library/NativeUITests/" + UUID().uuidString
+        root = oldContainer.appendingPathComponent(suffix, isDirectory: true); defer { root = fixture }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let host = try await seed(); try await remove(host)
+        await boundary(.beforeSaveTarget(0), host: host)
+        let known = await refused({ _ = try await self.save(host) }, saved: true)
+        let savedResult = try XCTUnwrap(known?.resultJSON), command = try journalObject()
+        let arguments = try XCTUnwrap(command["argumentsJSON"] as? String), fingerprint = try Store.mixedFingerprint(record())
+        let encoded = try XCTUnwrap(NativeJSON.jsonObject(with: Data(arguments.utf8)) as? [String])
+        let wrapper = try object(XCTUnwrap(encoded.first)); XCTAssertEqual(wrapper["recordSHA256"] as? String, fingerprint)
+        XCTAssertEqual(try settlement()["phase"] as? String, "domainSaved")
+        XCTAssertEqual((try settlement()["stages"] as? [Any])?.count, 0); XCTAssertNil(try editor.read())
+        let savedRows = try rows(), originalURI = target().absoluteString
+        let oldRootIdentity = try inode(root), parentIdentity = try inode(managed), fileIdentity = try inode(target())
+        let sidecarIdentity = try inode(store.url), journalIdentity = try inode(journal)
+        let ownerBytes = try Data(contentsOf: store.url), journalBytes = try Data(contentsOf: journal)
+        await host.close()
+        try FileManager.default.moveItem(at: oldContainer, to: newContainer)
+        root = newContainer.appendingPathComponent(suffix, isDirectory: true)
+        XCTAssertNotEqual(target().absoluteString, originalURI)
+        XCTAssertEqual(try inode(root), oldRootIdentity); XCTAssertEqual(try inode(managed), parentIdentity)
+        XCTAssertEqual(try inode(target()), fileIdentity); XCTAssertEqual(try inode(store.url), sidecarIdentity)
+        XCTAssertEqual(try inode(journal), journalIdentity); XCTAssertEqual(try Data(contentsOf: store.url), ownerBytes)
+        XCTAssertEqual(try Data(contentsOf: journal), journalBytes); XCTAssertEqual(try rows(), savedRows)
+        let cold = core(noWrites()); var progress = 0
+        await boundary(.afterSaveProgress, host: cold, action: {
+            progress += 1
+            XCTAssertEqual(try self.journalObject()["argumentsJSON"] as? String, arguments)
+            XCTAssertEqual(try Store.mixedFingerprint(self.record()), fingerprint)
+            XCTAssertEqual(try Data(contentsOf: self.store.url), ownerBytes)
+        })
+        let recovered = try recovery(await cold.start())
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(object(savedResult)))
+        XCTAssertGreaterThan(progress, 0); XCTAssertEqual(try rows(), savedRows)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target().path)); XCTAssertEqual(try inode(managed), parentIdentity)
+        let attachmentsJSON = try XCTUnwrap(task()["attachments"] as? String)
+        let attachments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(attachmentsJSON.utf8)) as? [[String: Any]])
+        XCTAssertEqual(attachments.first?["uri"] as? String, originalURI); XCTAssertNotNil(attachments.first?["deletedAt"] as? String)
+        try released(); await cold.close()
+        let again = core(noWrites()), hooks = NativeAttachmentHostHooks(); var jobs = 0
+        hooks.configureJobs = { queue in queue.beforeWork = { _, _ in jobs += 1 } }
+        await again.configureAttachmentHost(hooks)
+        let reopened = try object(await again.start()); XCTAssertNil(reopened["recovery"])
+        XCTAssertEqual(jobs, 0); XCTAssertEqual(try rows(), savedRows); try released()
+    }
+
+    func testAlreadySettledAddWithAbsentSidecarClearsAfterContainerRenameWithoutFileJobsOrRelocationMarker() async throws {
+        let fixture = try XCTUnwrap(root); defer { root = fixture }
+        let frozen = try await relocatedTerminal(withAdd: true, stop: .afterSaveRelease)
+        XCTAssertEqual(try settlement()["phase"] as? String, "settled"); XCTAssertNil(try store.readMixed()); XCTAssertNil(try editor.read())
+        let savedRows = try rows(), raw = try XCTUnwrap(task()["attachments"] as? String)
+        let attachments = try XCTUnwrap(NativeJSON.jsonObject(with: Data(raw.utf8)) as? [[String: Any]])
+        let added = try XCTUnwrap(attachments.first { $0["kind"] as? String == "file" && $0["deletedAt"] == nil })
+        let originalURI = try XCTUnwrap(added["uri"] as? String), originalTarget = try XCTUnwrap(URL(string: originalURI))
+        XCTAssertTrue(originalURI.hasPrefix(frozen.original.absoluteString))
+        let published = managed.appendingPathComponent(originalTarget.lastPathComponent), bytes = try Data(contentsOf: published), identity = try inode(published)
+        let cold = core(noWrites()), hooks = NativeAttachmentHostHooks(); var jobs = 0
+        hooks.configureJobs = { queue in queue.beforeWork = { _, _ in jobs += 1 } }; await cold.configureAttachmentHost(hooks)
+        let recovered = try recovery(await cold.start())
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(object(frozen.result)))
+        XCTAssertEqual(jobs, 0); XCTAssertEqual(try rows(), savedRows); XCTAssertEqual(try Data(contentsOf: published), bytes)
+        XCTAssertEqual(try inode(published), identity); try released()
+        let logs = (try? String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"), encoding: .utf8)) ?? ""
+        XCTAssertFalse(logs.contains("v1.3.5/ios-attachment-container-recovery"), "already-settled Add clearing is not relocated cleanup")
+    }
+
+    func testRelocatedRemoveOriginalTaskAndCurrentProjectReferencesKeepExactGeneration() async throws {
+        for currentProject in [false, true] {
+            let fixture = try isolate(); defer { root = fixture }
+            let frozen = try await relocatedTerminal(), bytes = try Data(contentsOf: target()), identity = try inode(target())
+            var attachment = baseline(0)
+            if !currentProject { attachment["uri"] = frozen.original.appendingPathComponent("attachment-files/documents/attachments/baseline-0.txt").absoluteString }
+            if currentProject {
+                _ = try sql("INSERT INTO projects(id,title,status,color,supportNotes,attachments,createdAt,updatedAt,rev,revBy) VALUES ('relocated-reference','Live reference','active','#94a3b8','',?,?,?,1,'fixture')",
+                    [json([attachment]), at, at])
+            } else { _ = try sql("UPDATE tasks SET attachments=? WHERE id='unrelated'", [json([attachment])]) }
+            let savedRows = try rows(), cold = core(noWrites()), hooks = NativeAttachmentHostHooks(); var jobs = 0
+            hooks.configureJobs = { queue in queue.beforeWork = { _, _ in jobs += 1 } }; await cold.configureAttachmentHost(hooks)
+            let recovered = try recovery(await cold.start())
+            XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(object(frozen.result)))
+            XCTAssertEqual(jobs, 0, "a fresh old/current reference selects keep before native file IO")
+            XCTAssertEqual(try rows(), savedRows); XCTAssertEqual(try Data(contentsOf: target()), bytes); XCTAssertEqual(try inode(target()), identity)
+            try released(); await cold.close()
+        }
+    }
+
+    func testRelocatedRemoveKeepsSameBytesNewFileGenerationAndUnsafeLeaf() async throws {
+        for symlink in [false, true] {
+            let fixture = try isolate(); defer { root = fixture }
+            _ = try await relocatedTerminal()
+            let bytes = try Data(contentsOf: target()), original = try inode(target()), parent = try inode(managed), savedRows = try rows()
+            let kept = root.appendingPathComponent("prior-generation.txt")
+            try FileManager.default.moveItem(at: target(), to: kept)
+            if symlink { try FileManager.default.createSymbolicLink(at: target(), withDestinationURL: kept) }
+            else { try bytes.write(to: target()) }
+            XCTAssertNotEqual(try inode(target()), original)
+            let replacement = try inode(target()), cold = core(noWrites()); _ = try await cold.start()
+            XCTAssertEqual(try Data(contentsOf: target()), bytes); XCTAssertEqual(try inode(target()), replacement)
+            XCTAssertEqual(try Data(contentsOf: kept), bytes); XCTAssertEqual(try inode(kept), original)
+            XCTAssertEqual(try inode(managed), parent); XCTAssertEqual(try rows(), savedRows); try released(); await cold.close()
+        }
+    }
+
+    func testRelocatedRemoveRefusesChangedParentWithOriginalFileInodeAndRetainsTerminal() async throws {
+        let fixture = try XCTUnwrap(root); defer { root = fixture }
+        let frozen = try await relocatedTerminal(), bytes = try Data(contentsOf: target()), fileIdentity = try inode(target())
+        let parentIdentity = try inode(managed), ownerBytes = try Data(contentsOf: store.url), savedRows = try rows()
+        let previousParent = managed.deletingLastPathComponent().appendingPathComponent("previous-attachments", isDirectory: true)
+        try FileManager.default.moveItem(at: managed, to: previousParent)
+        try FileManager.default.createDirectory(at: managed, withIntermediateDirectories: false)
+        try FileManager.default.moveItem(at: previousParent.appendingPathComponent(target().lastPathComponent), to: target())
+        XCTAssertNotEqual(try inode(managed), parentIdentity); XCTAssertEqual(try inode(target()), fileIdentity)
+        let cold = core(noWrites()); await refused { _ = try await cold.start() }
+        XCTAssertEqual(try Data(contentsOf: target()), bytes); XCTAssertEqual(try inode(target()), fileIdentity)
+        XCTAssertEqual(try Data(contentsOf: store.url), ownerBytes); XCTAssertEqual(try rows(), savedRows)
+        XCTAssertEqual(try journalObject()["argumentsJSON"] as? String, frozen.arguments)
+        XCTAssertEqual(try settlement()["phase"] as? String, "domainSaved"); XCTAssertNil(try editor.read())
+    }
+
+    func testRelocatedRemoveRefusesForeignContainerPrefixLibrarySuffixAndInvalidUUIDBeforeSQL() async throws {
+        for change in ["prefix", "library", "uuid"] {
+            let fixture = try isolate(); defer { root = fixture }
+            _ = try await relocatedTerminal()
+            let bytes = try Data(contentsOf: journal), ownerBytes = try Data(contentsOf: store.url), savedRows = try rows()
+            let fileIdentity = try inode(target()), parentIdentity = try inode(managed), library = try XCTUnwrap(root)
+            if change == "library" {
+                let changed = library.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.moveItem(at: library, to: changed); root = changed
+            } else {
+                let container = library.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                let changed = change == "prefix"
+                    ? container.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Foreign/Application/" + UUID().uuidString, isDirectory: true)
+                    : container.deletingLastPathComponent().appendingPathComponent("not-a-container-uuid", isDirectory: true)
+                try FileManager.default.createDirectory(at: changed.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: container, to: changed)
+                root = changed.appendingPathComponent("Library/NativeUITests/" + library.lastPathComponent, isDirectory: true)
+            }
+            XCTAssertEqual(try inode(managed), parentIdentity); XCTAssertEqual(try inode(target()), fileIdentity)
+            let faults = HostIOFaults(), cold = core(faults); var queries = 0
+            faults.beforeSQL = { _ in queries += 1 }
+            await refused { _ = try await cold.start() }
+            XCTAssertEqual(queries, 0, change); XCTAssertEqual(try Data(contentsOf: journal), bytes, change)
+            XCTAssertEqual(try Data(contentsOf: store.url), ownerBytes, change); XCTAssertEqual(try rows(), savedRows, change)
+            XCTAssertEqual(try inode(managed), parentIdentity); XCTAssertEqual(try inode(target()), fileIdentity)
+            await cold.close()
+        }
+    }
+
+    func testRelocatedRemoveInterruptedAfterUnlinkRetriesExactTerminalWithoutDomainWrite() async throws {
+        let fixture = try XCTUnwrap(root); defer { root = fixture }
+        let frozen = try await relocatedTerminal(), savedRows = try rows(), fingerprint = try Store.mixedFingerprint(record())
+        let parentIdentity = try inode(managed), cold = core(noWrites()); var entered = 0
+        await boundary(.afterSaveTarget(0), host: cold, action: { entered += 1; throw HostFailure("Stop after relocated unlink") })
+        await refused({ _ = try await cold.start() }, saved: true)
+        XCTAssertEqual(entered, 1); XCTAssertFalse(FileManager.default.fileExists(atPath: target().path))
+        XCTAssertEqual(try settlement()["phase"] as? String, "domainSaved")
+        let targets = try XCTUnwrap(settlement()["targets"] as? [[String: Any]])
+        XCTAssertTrue(targets.first?["outcome"] is NSNull); XCTAssertEqual(try journalObject()["argumentsJSON"] as? String, frozen.arguments)
+        XCTAssertEqual(try Store.mixedFingerprint(record()), fingerprint); XCTAssertEqual(try rows(), savedRows); await cold.close()
+        let retry = core(noWrites()); var progress = 0
+        await boundary(.afterSaveProgress, host: retry, action: {
+            progress += 1; XCTAssertEqual(try self.journalObject()["argumentsJSON"] as? String, frozen.arguments)
+            XCTAssertEqual(try Store.mixedFingerprint(self.record()), fingerprint)
+        })
+        let recovered = try recovery(await retry.start())
+        XCTAssertEqual(try json(XCTUnwrap(recovered["result"])), try json(object(frozen.result)))
+        XCTAssertGreaterThan(progress, 0); XCTAssertFalse(FileManager.default.fileExists(atPath: target().path))
+        XCTAssertEqual(try inode(managed), parentIdentity); XCTAssertEqual(try rows(), savedRows); try released()
     }
 
     func testChecklistOrdinaryAndMixedFilesCommitTogetherWithCloudMergeAndUnrelatedCells() async throws {

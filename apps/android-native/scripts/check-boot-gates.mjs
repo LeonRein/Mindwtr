@@ -4155,11 +4155,11 @@ const poll = async (state, id) => {
     const fixtureState = makeState(0, [], 'ios', configureLocal);
     assert.equal((await poll(fixtureState, fixtureState.MindwtrHost.boot())).ok, true);
     const fixtures = new Map();
-    const fixture = async (count = 1, kind = 'noop') => {
-        const key = `${count}:${kind}`;
+    const fixture = async (count = 1, kind = 'noop', managedDirectoryURI = ROOT) => {
+        const key = `${count}:${kind}:${managedDirectoryURI}`;
         if (fixtures.has(key)) return fixtures.get(key);
         const baseline = Array.from({ length: count }, (_, n) => ({ id: `baseline${n}`, kind: 'file', title: 'File',
-            uri: ROOT + `baseline${n}.pdf`, createdAt: AT, updatedAt: AT, ...(n ? { deletedAt: AT } : {}) }));
+            uri: managedDirectoryURI + `baseline${n}.pdf`, createdAt: AT, updatedAt: AT, ...(n ? { deletedAt: AT } : {}) }));
         const initialPayloadJSON = JSON.stringify({ version: 2, taskID: 'task259', tab: 'task', touchedBase: {}, edited: {},
             raw: { title: '', note: '', location: '', estimate: '', estimateResolved: '', timeSpent: '', timeSpentResolved: '',
                 tokens: {}, tokenCanonical: {}, tokenResolved: {}, tokenEdited: [], checklistInputs: {}, checklistAppend: '',
@@ -4167,7 +4167,7 @@ const poll = async (state, id) => {
                 recurrenceInputs: {}, recurrenceOwned: [], recurrenceCommitRequested: [] }, scheduleEdits: [], scheduleFailedID: null,
             attachmentsOwned: true, attachmentsBase: baseline, attachments: baseline, linkSheet: {} });
         const owned = { version: 3, taskID: 'task259', initialPayloadJSON, beforePayloadJSON: initialPayloadJSON,
-            priorOperations: [], managedDirectoryURI: ROOT };
+            priorOperations: [], managedDirectoryURI };
         const removed = await poll(fixtureState, fixtureState.MindwtrHost.attachmentDraftRemovePrepareV3(JSON.stringify({ ...owned,
             requestId: REQUEST, attachmentId: baseline[0].id })));
         assert.equal(removed.ok, true);
@@ -4312,6 +4312,51 @@ const poll = async (state, id) => {
         (where === 'project' ? state.ownerProjects : state.lastLoaded.tasks).push(owner);
         const kept = ['task', 'project', 'archived'].includes(where);
         assert.deepEqual(invoke(state), { value: { outcome: kept ? 'referenced' : 'removed' }, seen: [kept ? 'referenced' : 'retire'] });
+    });
+    // Task276: extra lexical system-alias comparisons can only keep a file.
+    // Full pure envelopes and the same mutable generation fence remain in use.
+    let aliasCases276 = 0;
+    const checkAlias276 = async (work) => { await check(work); aliasCases276++; };
+    const aliasSuffix276 = 'mobile/Containers/Data/Application/27600000-0000-4000-8000-000000000001/Library/attachment-files/documents/attachments/';
+    for (const [prefix, otherPrefix] of [['file:///var/', 'file:///private/var/'], ['file:///private/var/', 'file:///var/']]) {
+        const f = await fixture(1, 'noop', prefix + aliasSuffix276);
+        const aliasURI = f.plan[0].attachment.uri.replace(prefix, otherPrefix);
+        for (const where of ['task', 'project', 'deletedOwner', 'deletedAttachment']) await checkAlias276(async () => {
+            const state = await make(f), attachment = { kind: 'file', uri: aliasURI,
+                ...(where === 'deletedAttachment' ? { deletedAt: AT } : {}) };
+            const owner = { id: 'alias-owner', attachments: [attachment], ...(where === 'deletedOwner' ? { deletedAt: AT } : {}) };
+            (where === 'project' ? state.ownerProjects : state.lastLoaded.tasks).push(owner);
+            const kept = where === 'task' || where === 'project';
+            assert.deepEqual(invoke(state, input(f)), { value: { outcome: kept ? 'referenced' : 'removed' }, seen: [kept ? 'referenced' : 'retire'] });
+        });
+        await checkAlias276(async () => {
+            const state = await make(f); let reads = 0, entered = 0;
+            const owner = { id: 'alias-generation-change' };
+            Object.defineProperty(owner, 'attachments', { get() {
+                if (++reads === 2) state.persistenceStatus.generation++;
+                return [{ kind: 'file', uri: aliasURI }];
+            } });
+            state.ownerProjects.push(owner);
+            const callback = () => { entered++; return '{"outcome":"referenced"}'; };
+            assert.throws(() => state.MindwtrHost.attachmentFileEditSaveRetire(input(f), callback, callback, callback),
+                /NOT_READY: Attachment Save requires settled native storage/);
+            assert(reads >= 2, 'mutation occurs during the sibling-alias reference comparison');
+            assert.equal(entered, 0, 'alias comparison never releases the captured generation fence');
+        });
+    }
+    for (const [prefix, otherPrefix] of [['file:///variant/', 'file:///private/variant/'], ['file:///private/variant/', 'file:///variant/']]) await checkAlias276(async () => {
+        const f = await fixture(1, 'noop', prefix + aliasSuffix276), state = await make(f);
+        state.ownerProjects.push({ attachments: [{ kind: 'file', uri: f.plan[0].attachment.uri.replace(prefix, otherPrefix) }] });
+        assert.deepEqual(invoke(state, input(f)), { value: { outcome: 'removed' }, seen: ['retire'] }, 'only the complete fixed /var/ prefix has a sibling');
+    });
+    console.log(`Task276: ${aliasCases276} v1 Save alias-reference checks (real254 pure envelopes; no physical normalization)`);
+    await check(async () => {
+        const state = await make(), seen = [];
+        const callback = () => { seen.push('callback'); return '{"outcome":"removed"}'; };
+        assert.throws(() => state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: 2,
+            envelopeJSON: JSON.stringify(plain.envelope), candidateIndex: 0, currentURI: 'file:///var/current.pdf' }),
+        callback, callback, callback), /INVALID_INPUT: Invalid attachment Save handoff/);
+        assert.deepEqual(seen, [], 'v2 cannot borrow a validated legacy file-only envelope');
     });
     for (const change of ['missing', 'rev', 'revBy', 'updatedAt']) await check(async () => {
         const state = await make();
@@ -4472,10 +4517,11 @@ const poll = async (state, id) => {
     const databases = []; let cases = 0;
     const check = async (work) => { await work(); cases++; };
     const call = (state, method, input) => poll(state, state.MindwtrHost[method](JSON.stringify(input)));
-    const fixture = async ({ empty = false, noop = false, recurring = false, cancel = false, large = false } = {}) => {
-        const baseline = Array.from({ length: 2 }, (_, n) => ({ id: `file${n}`, kind: 'file', title: 'File', uri: ROOT + `${n}.pdf`,
+    const fixture = async ({ empty = false, noop = false, recurring = false, cancel = false, large = false, withAdd = false,
+        managedDirectoryURI = ROOT } = {}) => {
+        const baseline = Array.from({ length: 2 }, (_, n) => ({ id: `file${n}`, kind: 'file', title: 'File', uri: managedDirectoryURI + `${n}.pdf`,
             size: 3, localStatus: 'available', createdAt: AT, updatedAt: AT }));
-        baseline.push({ ...baseline[0], id: 'old-tombstone', uri: ROOT + 'old.pdf', deletedAt: AT });
+        baseline.push({ ...baseline[0], id: 'old-tombstone', uri: managedDirectoryURI + 'old.pdf', deletedAt: AT });
         const source = { id: 'task268', title: 'Task', status: 'next', taskMode: 'list', tags: [], contexts: [], checklist: [],
             description: large ? 'x'.repeat(270_000) : 'Notes', attachments: baseline, createdAt: AT, updatedAt: AT, rev: 8, revBy: 'before',
             ...(recurring ? { dueDate: '2026-10-05', recurrence: { rule: 'daily', strategy: 'strict' } } : {}) };
@@ -4498,12 +4544,20 @@ const poll = async (state, id) => {
                 recurrenceInputs: {}, recurrenceOwned: [], recurrenceCommitRequested: [] }, scheduleEdits: [], scheduleFailedID: null,
             attachmentsOwned: true, attachmentsBase: baseline, attachments: baseline, linkSheet: {} });
         const ownedDraft = { version: 3, taskID: source.id, initialPayloadJSON, beforePayloadJSON: initialPayloadJSON,
-            priorOperations: [], managedDirectoryURI: ROOT };
+            priorOperations: [], managedDirectoryURI };
         if (!empty) for (let index = 0; index < (recurring || cancel ? 1 : 2); index++) {
             const removed = await call(state, 'attachmentDraftRemovePrepareV3', { ...ownedDraft,
                 requestId: `26800000-0000-4000-8000-${String(index + 3).padStart(12, '0')}`, attachmentId: `file${index}` });
             assert.equal(removed.ok, true); ownedDraft.beforePayloadJSON = removed.value.afterPayloadJSON;
             ownedDraft.priorOperations.push({ kind: 'remove', operation: removed.value });
+        }
+        if (withAdd) {
+            const added = await call(state, 'attachmentDraftPrepareV3', { ...ownedDraft,
+                requestId: '27600000-0000-4000-8000-000000000003', measuredSize: 3,
+                picked: { uri: 'file:///library/cache/picked.pdf', name: 'Picked.pdf', mimeType: null, size: null } });
+            assert.equal(added.ok, true); assert.equal(added.value.kind, 'prepared');
+            ownedDraft.beforePayloadJSON = added.value.afterPayloadJSON;
+            ownedDraft.priorOperations.push({ kind: 'add', operation: added.value });
         }
         const draft = JSON.parse(ownedDraft.beforePayloadJSON).attachments;
         if (noop && !empty) source.attachments = draft;
@@ -4526,9 +4580,10 @@ const poll = async (state, id) => {
             .map((row) => ({ ...row, attachments: JSON.parse(row.attachments ?? '[]') }));
         f.state.ownerTaskMap = new Map(f.state.lastLoaded.tasks.map((row) => [row.id, row]));
     };
-    const invoke = (f, index = 0, envelopeJSON = JSON.stringify(f.envelope)) => {
+    const invoke = (f, index = 0, envelopeJSON = JSON.stringify(f.envelope), currentURI) => {
         const seen = [], callback = (outcome) => function () { assert.equal(arguments.length, 0); seen.push(outcome); return JSON.stringify({ outcome }); };
-        const result = f.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: 1, envelopeJSON, candidateIndex: index }),
+        const result = f.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: currentURI === undefined ? 1 : 2,
+            envelopeJSON, candidateIndex: index, ...(currentURI === undefined ? {} : { currentURI }) }),
             callback('referenced'), callback('taskChanged'), callback('removed'));
         return { result: JSON.parse(result), seen };
     };
@@ -4621,6 +4676,86 @@ const poll = async (state, id) => {
             assert.deepEqual(reusable.state.order268, ['retire', 'returned']); await new Promise((done) => setImmediate(done));
             assert.deepEqual(reusable.state.order268, ['retire', 'returned', 'microtask']);
         });
+        // Task276: current URI is fresh per call, never part of the immutable
+        // complete plan memo. These callbacks test policy, not physical IO.
+        let relocationCases276 = 0;
+        const checkRelocation276 = async (work) => { await check(work); relocationCases276++; };
+        const oldRoot276 = 'file:///private/var/mobile/Containers/Data/Application/27600000-0000-4000-8000-000000000001/Library/attachment-files/documents/attachments/';
+        const relocated = await fixture({ managedDirectoryURI: oldRoot276 });
+        assert.equal((await call(relocated.state, 'attachmentFileEditSaveCommit', relocated.envelope)).ok, true); syncLive(relocated);
+        const index276 = relocated.plan.findIndex((entry) => entry.attachment.id === 'file0'); assert(index276 >= 0);
+        const raw276 = JSON.stringify(relocated.envelope), original276 = relocated.plan[index276].attachment.uri;
+        const current276 = original276.replace('file:///private/var/', 'file:///var/')
+            .replace('Application/27600000-0000-4000-8000-000000000001/', 'Application/27600000-0000-4000-8000-000000000002/');
+        const refs276 = [original276, original276.replace('file:///private/var/', 'file:///var/'), current276,
+            current276.replace('file:///var/', 'file:///private/var/')];
+        const reset276 = () => { syncLive(relocated); relocated.state.ownerProjects = []; relocated.state.persistenceStatus = { generation: 0 }; };
+        for (const where of ['task', 'project']) for (const uri of refs276) await checkRelocation276(async () => {
+            reset276(); const owner = { id: 'live-alias-ref', attachments: [{ kind: 'file', uri }] };
+            (where === 'task' ? relocated.state.lastLoaded.tasks : relocated.state.ownerProjects).push(owner);
+            assert.deepEqual(invoke(relocated, index276, raw276, current276), { result: { outcome: 'referenced' }, seen: ['referenced'] });
+        });
+        await checkRelocation276(async () => {
+            reset276(); relocated.state.ownerProjects = [{ deletedAt: AT, attachments: [{ kind: 'file', uri: current276 }] },
+                { attachments: [{ kind: 'file', uri: refs276[3], deletedAt: AT }] }];
+            assert.deepEqual(invoke(relocated, index276, raw276, current276), { result: { outcome: 'removed' }, seen: ['removed'] });
+            relocated.state.ownerTaskMap = new Map();
+            assert.deepEqual(invoke(relocated, index276, raw276, current276), { result: { outcome: 'taskChanged' }, seen: ['taskChanged'] });
+            relocated.state.ownerProjects.push({ attachments: [{ kind: 'file', uri: refs276[3] }] });
+            assert.deepEqual(invoke(relocated, index276, raw276, current276), { result: { outcome: 'referenced' }, seen: ['referenced'] },
+                'current alias reference wins over a moved source');
+        });
+        await checkRelocation276(async () => {
+            reset276(); const before = relocated.state.fileEditSaveInputs.filter(([name]) => name === 'completeValidate').length;
+            assert.deepEqual(invoke(relocated, index276, raw276, current276), { result: { outcome: 'removed' }, seen: ['removed'] });
+            const laterURI = current276.replace('/0.pdf', '/later.pdf');
+            relocated.state.ownerProjects.push({ attachments: [{ kind: 'file', uri: laterURI }] });
+            assert.deepEqual(invoke(relocated, index276, raw276, laterURI), { result: { outcome: 'referenced' }, seen: ['referenced'] });
+            assert.equal(relocated.state.fileEditSaveInputs.filter(([name]) => name === 'completeValidate').length, before,
+                'memo hits retain neither current URI nor reference outcome');
+            relocated.state.persistenceStatus.queued = true;
+            assert.throws(() => invoke(relocated, index276, raw276, laterURI), /NOT_READY/);
+        });
+        await checkRelocation276(async () => {
+            reset276(); let reads = 0, entered = 0; const owner = {};
+            Object.defineProperty(owner, 'attachments', { get() {
+                if (++reads === 4) relocated.state.persistenceStatus.generation++;
+                return [{ kind: 'file', uri: refs276[3] }];
+            } });
+            relocated.state.ownerProjects.push(owner);
+            const callback = () => { entered++; return '{"outcome":"referenced"}'; };
+            assert.throws(() => relocated.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: 2,
+                envelopeJSON: raw276, candidateIndex: index276, currentURI: current276 }), callback, callback, callback), /NOT_READY/);
+            assert(reads >= 4, 'old/current and both alias spellings share the same generation fence'); assert.equal(entered, 0);
+        });
+        await checkRelocation276(async () => {
+            reset276(); const valid = { version: 2, envelopeJSON: raw276, candidateIndex: index276, currentURI: current276 };
+            const invalid = 'INVALID_INPUT: Invalid attachment Save handoff';
+            const frames = [
+                ...[null, '', 'https://example.test/file', 'file://authority/file', 'file:///x?query', 'file:///x#fragment',
+                    'file:///x//leaf', 'file:///x/../leaf', 'file:///x/%2e%2e/leaf', 'file:///x%2Fleaf', 'file:///x%5cleaf',
+                    'file:///x/%00', 'file:///x/\u0000', 'file:///x/%', 'file:///' + '界'.repeat(5462)]
+                    .map((currentURI) => ({ ...valid, currentURI })),
+                ...[0, 3, null].map((version) => ({ ...valid, version })), { ...valid, version: 1 },
+                { version: 2, envelopeJSON: raw276, candidateIndex: index276 }, { ...valid, proof: true },
+                ...[-1, 0.5, true, relocated.plan.length].map((candidateIndex) => ({ ...valid, candidateIndex })),
+                { ...valid, envelopeJSON: ' '.repeat(8 * 1024 * 1024) + raw276 },
+            ];
+            for (const frame of frames) {
+                let entered = 0; const callback = () => { entered++; return '{"outcome":"removed"}'; };
+                assert.throws(() => relocated.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify(frame), callback, callback, callback),
+                    (error) => error.message === invalid); assert.equal(entered, 0, 'bad v2 fields refuse even on a memo hit');
+            }
+        });
+        await checkRelocation276(async () => {
+            const mixed = await fixture({ withAdd: true });
+            assert.equal((await call(mixed.state, 'attachmentFileEditSaveCommit', mixed.envelope)).ok, true); syncLive(mixed);
+            let entered = 0; const callback = () => { entered++; return '{"outcome":"removed"}'; };
+            assert.throws(() => mixed.state.MindwtrHost.attachmentFileEditSaveRetire(JSON.stringify({ version: 2,
+                envelopeJSON: JSON.stringify(mixed.envelope), candidateIndex: 0, currentURI: current276 }), callback, callback, callback),
+            /INVALID_INPUT: Invalid attachment Save handoff/); assert.equal(entered, 0, 'a real complete Add/Remove envelope cannot borrow v2 cleanup');
+        });
+        console.log(`Task276: ${relocationCases276} v2 complete Remove-only reference/grammar checks (real266 SQLite envelope; same-turn callbacks only)`);
     } finally { for (const db of databases) db.close(); }
     console.log(`Task268: ${cases} complete Save/Undo/retire checks (real bound266 factory + SQLite, fresh refs and same-turn callbacks; Node VM)`);
 }
@@ -4866,6 +5001,46 @@ const poll = async (state, id) => {
         assert.equal(call(state), '{"outcome":"referenced"}');
         state.ownerProjects = [];
     });
+    let aliasCases276 = 0;
+    const checkAlias276 = async (name, work) => { await check(name, work); aliasCases276++; };
+    const aliasSuffix276 = 'mobile/Containers/Data/Application/27600000-0000-4000-8000-000000000001/Library/attachment-files/documents/attachments/owned.pdf';
+    for (const [prefix, otherPrefix] of [['file:///var/', 'file:///private/var/'], ['file:///private/var/', 'file:///var/']]) {
+        const targetURI = prefix + aliasSuffix276, aliasURI = otherPrefix + aliasSuffix276;
+        const json = JSON.stringify({ version: 1, requestId: ID, targetURI });
+        for (const where of ['task', 'project', 'deletedOwner', 'deletedAttachment']) await checkAlias276(`Discard alias ${where}`, async () => {
+            const local = await bootLocal(), attachment = { kind: 'file', uri: aliasURI,
+                ...(where === 'deletedAttachment' ? { deletedAt: 'at' } : {}) };
+            const owner = { attachments: [attachment], ...(where === 'deletedOwner' ? { deletedAt: 'at' } : {}) };
+            (where === 'project' ? local.ownerProjects : local.lastLoaded.tasks).push(owner);
+            let keep = 0, retire = 0;
+            const result = call(local, json, () => { keep++; return '{"outcome":"referenced"}'; },
+                () => { retire++; return '{"outcome":"removed"}'; });
+            const kept = where === 'task' || where === 'project';
+            assert.equal(result, JSON.stringify({ outcome: kept ? 'referenced' : 'removed' }));
+            assert.equal(keep, kept ? 1 : 0); assert.equal(retire, kept ? 0 : 1);
+        });
+        await checkAlias276('Discard alias generation mutation', async () => {
+            const local = await bootLocal(); local.persistenceStatus = { generation: 0 };
+            let reads = 0, entered = 0;
+            const owner = {};
+            Object.defineProperty(owner, 'attachments', { get() {
+                if (++reads === 2) local.persistenceStatus.generation++;
+                return [{ kind: 'file', uri: aliasURI }];
+            } });
+            local.ownerProjects.push(owner);
+            const callback = () => { entered++; return '{"outcome":"referenced"}'; };
+            assert.throws(() => call(local, json, callback, callback), (error) => error.message === unready);
+            assert(reads >= 2, 'mutation occurs during the sibling-alias reference comparison');
+            assert.equal(entered, 0, 'all alias checks retain the same captured generation');
+        });
+    }
+    for (const [prefix, otherPrefix] of [['file:///variant/', 'file:///private/variant/'], ['file:///private/variant/', 'file:///variant/']]) await checkAlias276('Discard unrelated URI prefix', async () => {
+        const local = await bootLocal();
+        local.ownerProjects.push({ attachments: [{ kind: 'file', uri: otherPrefix + aliasSuffix276 }] });
+        assert.equal(call(local, JSON.stringify({ version: 1, requestId: ID, targetURI: prefix + aliasSuffix276 })), '{"outcome":"removed"}',
+            'an unrelated prefix cannot gain a system-alias keep decision');
+    });
+    console.log(`Task276: ${aliasCases276} v1 Discard alias-reference checks (same captured generation; no physical normalization)`);
     await check('optimistic queued deletion cannot hide a durable live owner', () => {
         const oldLoaded = state.lastLoaded, oldDurable = state.fakeData;
         state.fakeData = { ...oldDurable, tasks: [{ attachments: [{ kind: 'file', uri: TARGET }] }] };
@@ -5181,15 +5356,17 @@ const poll = async (state, id) => {
             assert.equal(absent.logText, null);
         }
     });
-    await check('preexisting journal replay acknowledgment is fixed, exportable and best effort', async () => {
+    for (const [operation, releaseCheck] of [
+        ['preexisting-journal-replay', 'v1.3.5/ios-preexisting-attachment-journal-replay'],
+        ['container-relocation', 'v1.3.5/ios-attachment-container-recovery'],
+    ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };
         const acknowledge = (state, outcome = 'confirmed') => poll(state,
-            state.MindwtrHost.attachmentDraftAcknowledged('preexisting-journal-replay', outcome));
+            state.MindwtrHost.attachmentDraftAcknowledged(operation, outcome));
         assert.equal((await acknowledge(local)).ok, true);
         assert.deepEqual(JSON.parse(local.logText.trim()).context, {
-            releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay',
-            operation: 'preexisting-journal-replay', outcome: 'confirmed',
+            releaseCheck, operation, outcome: 'confirmed',
         });
         const before = local.logText;
         for (const outcome of ['replayed', 'settled', '', null]) assert.equal((await acknowledge(local, outcome)).ok, true);

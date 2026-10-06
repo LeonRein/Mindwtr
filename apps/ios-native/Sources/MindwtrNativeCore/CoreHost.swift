@@ -457,6 +457,11 @@ private final class Engine: @unchecked Sendable {
         var targets: [String?]
         var stages: [String?]
     }
+    private struct MixedSaveRelocation {
+        let originalManagedURI: String
+        let currentManagedURI: String
+        let containerComponentIndex: Int?
+    }
     private struct MixedSaveJournal {
         let selection: NativeAttachmentDraftCoordinator.MixedSaveSelection
         let fingerprint: String
@@ -467,6 +472,7 @@ private final class Engine: @unchecked Sendable {
         let stages: [String]
         let binding: NativeAttachmentDraftStore.VersionedSnapshot?
         let settlement: MixedSaveSettlement?
+        let relocation: MixedSaveRelocation?
     }
     private struct MixedSaveFileBinding: Equatable {
         let bytes: Data
@@ -2342,6 +2348,68 @@ private final class Engine: @unchecked Sendable {
               let document = directories["document"] as? String, let root = URL(string: document) else { throw Self.ownedSaveFailure }
         return root.appendingPathComponent("attachments", isDirectory: true).absoluteString
     }
+    /// Only the canonical native spelling and Apple's actual fixed system alias
+    /// can participate in a bounded terminal mapping. No arbitrary URL rebasing.
+    private static func mixedSaveCanonicalPath(_ uri: String, directory: Bool) throws -> String {
+        guard !uri.isEmpty, uri.utf8.count <= 16 * 1024 else { throw ownedSaveFailure }
+        let path = try NativeAttachmentFiles.filePath(uri)
+        guard !path.utf8.contains(92) else { throw ownedSaveFailure }
+        let trimmed = directory && path.hasSuffix("/") ? String(path.dropLast()) : path
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count > 1, components.first == "", components.dropFirst().allSatisfy({ !$0.isEmpty }) else {
+            throw ownedSaveFailure
+        }
+        let canonical = URL(fileURLWithPath: trimmed, isDirectory: directory).absoluteString
+        if !ownedEqual(uri, canonical) {
+            let prefix = "file:///private/var/"
+            guard canonical.hasPrefix(prefix) else { throw ownedSaveFailure }
+            let alias = "file:///var/" + String(canonical.dropFirst(prefix.count))
+            guard ownedEqual(uri, alias), ownedEqual(try NativeAttachmentFiles.filePath(alias), path) else { throw ownedSaveFailure }
+        }
+        return trimmed
+    }
+    private static func mixedSaveRelocation(original: String, current: String) throws -> MixedSaveRelocation {
+        let oldPath = try mixedSaveCanonicalPath(original, directory: true)
+        let newPath = try mixedSaveCanonicalPath(current, directory: true)
+        if ownedEqual(oldPath, newPath) {
+            return .init(originalManagedURI: original, currentManagedURI: current, containerComponentIndex: nil)
+        }
+        let old = oldPath.split(separator: "/").map(String.init), fresh = newPath.split(separator: "/").map(String.init)
+        func containerUUID(_ text: String) -> Bool {
+            text.utf8.count == 36 && UUID(uuidString: text)?.uuidString.lowercased() == text.lowercased()
+        }
+        let positions = fresh.indices.filter { index in
+            index >= 2 && ownedEqual(fresh[index], "Library") && ownedEqual(fresh[index - 2], "Application")
+                && containerUUID(fresh[index - 1])
+        }
+        guard positions.count == 1, let library = positions.first, old.count == fresh.count,
+              containerUUID(old[library - 1]), zip(old.indices, old).allSatisfy({ pair in
+                  pair.0 == library - 1 || ownedEqual(pair.1, fresh[pair.0])
+              }) else { throw ownedSaveFailure }
+        return .init(originalManagedURI: original, currentManagedURI: current, containerComponentIndex: library - 1)
+    }
+    private func requireMixedSaveRelocation(_ relocation: MixedSaveRelocation) throws {
+        let actual = try Self.mixedSaveRelocation(original: relocation.originalManagedURI, current: mixedSaveManagedURI())
+        guard Self.ownedEqual(actual.originalManagedURI, relocation.originalManagedURI),
+              Self.ownedEqual(actual.currentManagedURI, relocation.currentManagedURI),
+              actual.containerComponentIndex == relocation.containerComponentIndex else { throw Self.ownedSaveFailure }
+    }
+    private func mixedSaveCurrentURI(_ captured: MixedSaveJournal,
+                                     candidate: NativeAttachmentDraftCoordinator.MixedSaveCandidate) throws -> String? {
+        guard let relocation = captured.relocation else { return nil }
+        try requireMixedSaveRelocation(relocation)
+        guard case .baseline(let observation) = candidate.authority else { throw Self.ownedSaveFailure }
+        // A non-present opening observation never gains a new generation.
+        guard observation.proof != nil else { return nil }
+        let original = try Self.mixedSaveCanonicalPath(relocation.originalManagedURI, directory: true)
+        let current = try Self.mixedSaveCanonicalPath(relocation.currentManagedURI, directory: true)
+        let target = Data(try Self.mixedSaveCanonicalPath(candidate.targetURI, directory: false).utf8)
+        let prefix = Data((original + "/").utf8), leaf = target.dropFirst(prefix.count)
+        guard target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) else { throw Self.ownedSaveFailure }
+        let resolved = URL(fileURLWithPath: current + "/" + String(decoding: leaf, as: UTF8.self), isDirectory: false).absoluteString
+        _ = try Self.mixedSaveCanonicalPath(resolved, directory: false)
+        return resolved
+    }
     private func mixedSaveJournal(_ command: PendingCommand, checkingNative: Bool = true) throws -> MixedSaveJournal {
         guard command.version == 2, command.method == Self.mixedSaveMethod,
               try JSONEncoder().encode(command).count <= Self.ownedSaveMaximumBytes, let attempt = command.editorDraft,
@@ -2361,7 +2429,7 @@ private final class Engine: @unchecked Sendable {
               Set(owned.keys) == Set(["version", "taskID", "initialPayloadJSON", "beforePayloadJSON", "priorOperations", "managedDirectoryURI"]),
               Self.isInteger(owned["version"], equalTo: 3), let task = owned["taskID"] as? String, Self.ownedEqual(task, snapshot.taskID),
               let payload = owned["beforePayloadJSON"] as? String, Self.ownedEqual(payload, snapshot.payloadJSON),
-              owned["initialPayloadJSON"] is String, owned["managedDirectoryURI"] is String,
+               owned["initialPayloadJSON"] is String, let frozenManagedURI = owned["managedDirectoryURI"] as? String,
               let history = owned["priorOperations"] as? [[String: Any]], (selection.allowsEmptyHistory ? 0...128 : 1...128).contains(history.count),
               let save = request["saveRequest"] as? [String: Any],
               Self.equalJSON(try (selection == .complete ? Self.completeOriginalRequest(attempt) : Self.ownedOriginalRequest(attempt)), save),
@@ -2406,14 +2474,23 @@ private final class Engine: @unchecked Sendable {
         case nil: settlement = nil
         }
         var binding: NativeAttachmentDraftStore.VersionedSnapshot?
+        var relocation: MixedSaveRelocation?
         if checkingNative {
             binding = try NativeAttachmentDraftStore(databaseURL: databaseURL).readVersioned()
             if let binding {
+                let managedURI = try mixedSaveManagedURI()
+                if !Self.ownedEqual(frozenManagedURI, managedURI) {
+                    guard selection == .complete, settlement != nil, !history.isEmpty, stages.isEmpty,
+                          history.allSatisfy({ $0["kind"] as? String == "remove" }), authorities.allSatisfy({ authority in
+                              if case .baseline = authority { return true }; return false
+                          }) else { throw Self.ownedSaveFailure }
+                    relocation = try Self.mixedSaveRelocation(original: frozenManagedURI, current: managedURI)
+                }
                 guard case .mixed(let record) = binding.record,
                       Self.ownedEqual(try NativeAttachmentDraftStore.mixedFingerprint(record), fingerprint),
                       Self.ownedEqual(record.session.checkpoint, snapshot),
                       Self.equalJSON(try NativeJSON.jsonObject(with: Data(NativeAttachmentDraftCoordinator.mixedSaveLineageJSON(record,
-                        managedDirectoryURI: mixedSaveManagedURI(), selection: selection).utf8)), owned) else { throw Self.ownedSaveFailure }
+                        managedDirectoryURI: relocation?.originalManagedURI ?? managedURI, selection: selection).utf8)), owned) else { throw Self.ownedSaveFailure }
             } else { guard settlement?.phase == "settled" else { throw Self.ownedSaveFailure } }
             let retainedEditor = try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000)
             if let current = try editorDrafts.read() {
@@ -2425,7 +2502,7 @@ private final class Engine: @unchecked Sendable {
             guard try mixedSaveFileBinding(editorDrafts.url, maximumBytes: 3_000_000) == retainedEditor else { throw Self.ownedSaveFailure }
         }
         return .init(selection: selection, fingerprint: fingerprint, envelopeJSON: try Self.ownedJSON(envelope), snapshot: snapshot, attempt: attempt,
-            authorities: authorities, stages: stages, binding: binding, settlement: settlement)
+            authorities: authorities, stages: stages, binding: binding, settlement: settlement, relocation: relocation)
     }
     private func decodeMixedSaveJournal(_ data: Data, checkingNative: Bool) throws -> PendingCommand {
         guard data.count <= Self.ownedSaveMaximumBytes, let raw = try NativeJSON.jsonObject(with: data) as? [String: Any],
@@ -2586,7 +2663,7 @@ private final class Engine: @unchecked Sendable {
         try requireMixedSaveOwner(turn, cancellation: cancellation)
         return .init(selection: captured.selection, fingerprint: captured.fingerprint, envelopeJSON: captured.envelopeJSON, snapshot: captured.snapshot,
             attempt: captured.attempt, authorities: captured.authorities, stages: captured.stages,
-            binding: present ? turn.record : nil, settlement: state)
+            binding: present ? turn.record : nil, settlement: state, relocation: captured.relocation)
     }
     private func mixedSaveCoordinator(_ command: PendingCommand, turn: MixedSaveTurn,
                                       cancellation: NativeAttachmentCancellation) throws -> NativeAttachmentDraftCoordinator {
@@ -2726,15 +2803,21 @@ private final class Engine: @unchecked Sendable {
         guard let binding = captured.binding, case .mixed(let record) = binding.record,
               let host = turn.runtime.objectForKeyedSubscript("MindwtrHost"), !invoking else { throw Self.ownedSaveFailure }
         let coordinator = try mixedSaveCoordinator(command, turn: turn, cancellation: cancellation)
+        let currentURI = try mixedSaveCurrentURI(captured, candidate: candidate)
         let lease = MixedSaveCallbackLease()
         lease.work = { [weak self] branch in
             guard let self else { throw Self.ownedSaveFailure }
-            _ = try self.requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            let checked = try self.requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            let recomputed = try self.mixedSaveCurrentURI(checked, candidate: candidate)
+            guard (currentURI == nil && recomputed == nil) || currentURI.flatMap({ value in
+                recomputed.map { Self.ownedEqual(value, $0) }
+            }) == true else { throw Self.ownedSaveFailure }
             let outcome: String
             switch branch {
             case "referenced": outcome = "referenced"
             case "taskChanged": guard candidate.reason != "uncommitted-draft" else { throw Self.ownedSaveFailure }; outcome = "taskChanged"
-            case "retire": outcome = try coordinator.retireMixedSaveTarget(candidate, record: record, cancellation: cancellation)
+            case "retire": outcome = try coordinator.retireMixedSaveTarget(candidate, record: record,
+                currentURI: currentURI, cancellation: cancellation)
             default: throw Self.ownedSaveFailure
             }
             guard candidate.outcomes.contains(outcome) else { throw Self.ownedSaveFailure }
@@ -2744,7 +2827,10 @@ private final class Engine: @unchecked Sendable {
         let referenced: @convention(block) () -> String = { [weak lease] in lease?.enter("referenced") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
         let changed: @convention(block) () -> String = { [weak lease] in lease?.enter("taskChanged") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
         let retire: @convention(block) () -> String = { [weak lease] in lease?.enter("retire") ?? "!MindwtrNativeError:Attachment Save callback is unavailable" }
-        let input = try Self.ownedJSON(["version": 1, "envelopeJSON": captured.envelopeJSON, "candidateIndex": candidate.index])
+        var frame: [String: Any] = ["version": currentURI == nil ? 1 : 2,
+                                  "envelopeJSON": captured.envelopeJSON, "candidateIndex": candidate.index]
+        if let currentURI { frame["currentURI"] = currentURI }
+        let input = try Self.ownedJSON(frame)
         guard input.utf8.count <= Self.ownedSaveMaximumBytes else { throw Self.ownedSaveFailure }
         invoking = true
         defer { lease.invalidate(); invoking = false; scheduleAttachmentIdle(immediate: true) }
@@ -2899,6 +2985,12 @@ private final class Engine: @unchecked Sendable {
             }
             // A settled replay performs no file jobs, including private stages.
             _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+            if let relocation = captured.relocation, relocation.containerComponentIndex != nil {
+                try requireMixedSaveRelocation(relocation)
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["container-relocation", "confirmed"])
+                _ = try requireMixedSaveAuthority(command, turn: turn, cancellation: cancellation, editorAbsent: true)
+                try requireMixedSaveRelocation(relocation)
+            }
             #if DEBUG
             try attachmentDraftHooks?.boundary?(.beforeSaveRelease)
             #endif
