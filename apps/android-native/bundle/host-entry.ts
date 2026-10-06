@@ -3387,14 +3387,16 @@ globalThis.MindwtrHost = {
             const completeSave = operation === 'complete-save' && ['domainSaved', 'settled'].includes(outcome);
             const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
             const ownedResume = operation === 'owned-resume' && outcome === 'validated';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume
+            const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged)) return {};
             try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
-                    context: { ...(ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
+                    context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }
+                        : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
                         : completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
                         : providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
                         : mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }
@@ -3405,7 +3407,7 @@ globalThis.MindwtrHost = {
                         : finishedDiscard ? { releaseCheck: 'v1.3.5/ios-owned-discard-finish' }
                             : unstartedDiscard ? { releaseCheck: 'v1.3.5/ios-unstarted-add-discard' }
                                 : operation === 'discard-capacity' ? { releaseCheck: 'v1.3.5/ios-owned-discard-capacity' }
-                                    : { releaseCheck: 'v1.3.4/ios-attachment-draft-owned' }), operation, outcome } }, { force: true });
+                                    : { releaseCheck: 'v1.3.4/ios-attachment-draft-owned' }), operation: editorAcknowledged ? operation.slice('editor-'.length) : operation, outcome } }, { force: true });
             } catch { /* Diagnostics cannot invalidate a durable acknowledgment. */ }
             return {};
         });

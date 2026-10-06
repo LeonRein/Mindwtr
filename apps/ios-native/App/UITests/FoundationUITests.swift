@@ -1453,6 +1453,162 @@ final class FoundationUITests: XCTestCase {
         app.terminate()
     }
 
+    func testTaskFilePickerCancellationPreservesEditedTitleThroughSaveAndRestart() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        let library = UUID().uuidString.lowercased()
+        app.launchArguments = ["--native-ui-test-library", library]
+        print("Attachment picker cancellation isolated library: " + library)
+        app.launch()
+        boardTap(app, "capture-open")
+        let capture = app.textViews["capture-input"]
+        boardEnabled(capture); capture.tap(); capture.typeText("Attachment picker draft")
+        boardTap(app, "capture-save")
+        let row = app.buttons["Attachment picker draft"]
+        boardEnabled(row, timeout: 30); row.tap(); boardTap(app, "task-mode-edit")
+        replaceProjectNotesText(app.textFields["task-editor-title"], with: "Attachment picker preserved")
+        let scroll = app.scrollViews["task-editor-scroll"]
+        let details = app.buttons["task-editor-section-details"]
+        revealPagedElement(app, details, in: scroll, outerEdge: true)
+        if details.value as? String == "Expand" { boardTap(app, "task-editor-section-details") }
+        let add = app.buttons["task-attachment-add-file"]
+        revealPagedElement(app, add, in: scroll, outerEdge: true)
+        boardEnabled(add); XCTAssertEqual(add.label, "Add file"); add.tap()
+        // The system document picker owns this Cancel, not editor Discard.
+        let cancel = app.navigationBars.buttons["Cancel"].firstMatch
+        boardEnabled(cancel, timeout: 30); cancel.tap()
+        revealAttachmentTestTitle(app)
+        boardEnabled(app.textFields["task-editor-title"], timeout: 30)
+        XCTAssertEqual(app.textFields["task-editor-title"].value as? String, "Attachment picker preserved")
+        XCTAssertFalse(app.staticTexts["task-attachment-error"].exists)
+        boardTap(app, "task-editor-save")
+        boardEnabled(app.buttons["Attachment picker preserved"], timeout: 30)
+        app.terminate(); app.launch()
+        boardEnabled(app.buttons["Attachment picker preserved"], timeout: 30)
+        XCTAssertFalse(app.buttons["task-recovery-open"].exists)
+        app.terminate()
+    }
+
+    func testOwnedEmptyDiscardCleanupRetryReleasesRecoveryGateThroughRestart() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        let library = UUID().uuidString.lowercased()
+        app.launchArguments = ["--native-ui-test-library", library]
+        print("Owned empty discard retry isolated library: " + library)
+        app.launch()
+        boardTap(app, "capture-open")
+        let capture = app.textViews["capture-input"]
+        boardEnabled(capture); capture.tap(); capture.typeText("Attachment discard original")
+        boardTap(app, "capture-save")
+        let row = app.buttons["Attachment discard original"]
+        boardEnabled(row, timeout: 30); row.tap(); boardTap(app, "task-mode-edit")
+        replaceProjectNotesText(app.textFields["task-editor-title"], with: "Attachment discard unsaved")
+        let scroll = app.scrollViews["task-editor-scroll"]
+        let details = app.buttons["task-editor-section-details"]
+        revealPagedElement(app, details, in: scroll, outerEdge: true)
+        if details.value as? String == "Expand" { boardTap(app, "task-editor-section-details") }
+        let add = app.buttons["task-attachment-add-file"]
+        revealPagedElement(app, add, in: scroll, outerEdge: true)
+        boardEnabled(add); add.tap()
+        // Begin owns an empty V3 draft before the picker; Cancel submits no Add.
+        let cancel = app.navigationBars.buttons["Cancel"].firstMatch
+        boardEnabled(cancel, timeout: 30); cancel.tap()
+        revealAttachmentTestTitle(app)
+        boardEnabled(app.textFields["task-editor-title"], timeout: 30)
+        XCTAssertEqual(app.textFields["task-editor-title"].value as? String, "Attachment discard unsaved")
+        XCTAssertFalse(app.staticTexts["task-attachment-error"].exists)
+        boardTap(app, "task-view-close"); boardTap(app, "task-editor-discard")
+        let gate = app.descendants(matching: .any).matching(identifier: "task-recovery-gate").firstMatch
+        XCTAssertTrue(gate.waitForExistence(timeout: 30))
+        let retry = app.buttons["task-attachment-retry"]
+        boardEnabled(retry, timeout: 30)
+        XCTAssertTrue(app.buttons["task-attachment-continue"].exists)
+        XCTAssertTrue(app.staticTexts["task-attachment-status"].label.contains("discarded"))
+        XCTAssertFalse(app.staticTexts["task-attachment-error"].exists)
+        retry.tap()
+        boardEnabled(app.buttons["tab-inbox"], timeout: 30)
+        boardEnabled(row, timeout: 30)
+        XCTAssertFalse(gate.exists)
+        XCTAssertFalse(app.buttons["task-recovery-resume"].exists)
+        XCTAssertFalse(app.buttons["task-recovery-open"].exists)
+        XCTAssertFalse(app.buttons["Attachment discard unsaved"].exists)
+        app.terminate(); app.launch()
+        boardEnabled(app.buttons["tab-inbox"], timeout: 30)
+        boardEnabled(row, timeout: 30)
+        XCTAssertFalse(gate.exists)
+        XCTAssertFalse(app.buttons["task-recovery-open"].exists)
+        XCTAssertFalse(app.buttons["Attachment discard unsaved"].exists)
+        row.tap(); boardTap(app, "task-mode-edit")
+        XCTAssertEqual(app.textFields["task-editor-title"].value as? String, "Attachment discard original")
+        boardTap(app, "task-view-close")
+        XCTAssertFalse(app.buttons["task-editor-discard"].exists)
+        app.terminate()
+    }
+
+    func testOwnedCheckpointRetryPreservesNewerTitleThroughColdRecovery() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        let library = UUID().uuidString.lowercased()
+        app.launchArguments = ["--native-ui-test-library", library, "--native-owned-checkpoint-failure"]
+        print("Owned checkpoint retry isolated library: " + library)
+        app.launch()
+        boardTap(app, "capture-open")
+        let capture = app.textViews["capture-input"]
+        boardEnabled(capture); capture.tap(); capture.typeText("Owned checkpoint")
+        boardTap(app, "capture-save")
+        boardEnabled(app.buttons["Owned checkpoint"], timeout: 30)
+        app.buttons["Owned checkpoint"].tap(); boardTap(app, "task-mode-edit")
+        let scroll = app.scrollViews["task-editor-scroll"]
+        let details = app.buttons["task-editor-section-details"]
+        revealPagedElement(app, details, in: scroll, outerEdge: true)
+        if details.value as? String == "Expand" { boardTap(app, "task-editor-section-details") }
+        let add = app.buttons["task-attachment-add-file"]
+        revealPagedElement(app, add, in: scroll, outerEdge: true)
+        boardEnabled(add); XCTAssertEqual(add.label, "Add file"); add.tap()
+        let cancel = app.navigationBars.buttons["Cancel"].firstMatch
+        boardEnabled(cancel, timeout: 30); cancel.tap()
+        let title = app.textFields["task-editor-title"]
+        revealAttachmentTestTitle(app)
+        boardEnabled(title)
+        title.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5)).tap()
+        title.typeText("X")
+        XCTAssertEqual(title.value as? String, "Owned checkpointX")
+        let retry = app.buttons["task-attachment-retry"]
+        revealPagedElement(app, retry, in: scroll, outerEdge: true)
+        boardEnabled(retry, timeout: 30); retry.tap()
+        boardEnabled(app.staticTexts["task-recovery-protected"], timeout: 30)
+        XCTAssertEqual(title.value as? String, "Owned checkpointX")
+        boardTap(app, "task-view-close")
+        boardTap(app, "task-editor-keep-for-later")
+        app.terminate()
+        app.launchArguments = ["--native-ui-test-library", library]
+        app.launch()
+        boardEnabled(title, timeout: 30)
+        XCTAssertEqual(title.value as? String, "Owned checkpointX")
+        boardTap(app, "task-editor-save")
+        boardEnabled(app.buttons["Owned checkpointX"], timeout: 30)
+        app.terminate(); app.launch()
+        boardEnabled(app.buttons["Owned checkpointX"], timeout: 30)
+        XCTAssertFalse(app.buttons["task-recovery-open"].exists)
+        app.terminate()
+    }
+
+    private func revealAttachmentTestTitle(_ app: XCUIApplication) {
+        let title = app.textFields["task-editor-title"]
+        let scroll = app.scrollViews["task-editor-scroll"]
+        // The lazy stack omits the title after scrolling to Attachments;
+        // return toward the known top instead of searching further down.
+        for _ in 0..<8 {
+            if title.exists && title.isHittable && scroll.frame.contains(title.frame) { return }
+            let frame = scroll.frame.intersection(app.frame)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: frame.minX + 4, dy: frame.minY + frame.height * 0.25))
+                .press(forDuration: 0.05, thenDragTo: origin.withOffset(
+                    CGVector(dx: frame.minX + 4, dy: frame.minY + frame.height * 0.8)))
+        }
+        XCTAssertTrue(title.exists && title.isHittable)
+    }
+
     private func openTask119(_ library: String) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--native-ui-test-library", library]
@@ -1495,7 +1651,7 @@ final class FoundationUITests: XCTestCase {
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: input)
         waitForExpectations(timeout: 15)
         XCTAssertFalse(app.buttons["task-attachment-edit-task119-file"].exists)
-        XCTAssertFalse(app.buttons["task-attachment-remove-task119-file"].exists)
+        XCTAssertTrue(app.buttons["task-attachment-remove-task119-file"].exists)
         boardEnabled(app.staticTexts["task-recovery-protected"], timeout: 15)
         boardTap(app, "task-editor-save")
         boardEnabled(app.buttons["Task119 Saved"], timeout: 30)

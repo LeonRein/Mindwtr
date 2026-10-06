@@ -346,19 +346,32 @@ final class NativeAttachmentFiles {
         let sourcePath = try Self.filePath(url.absoluteString)
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let sourceParentPath = sourceURL.deletingLastPathComponent().path
-        let sourceParent = Parent(fd: try Self.openAbsoluteDirectory(sourceParentPath), leaf: sourceURL.lastPathComponent)
-        defer { Darwin.close(sourceParent.fd) }
-        let input = try openFile(sourceParent); defer { Darwin.close(input) }
+        // Provider scope can grant this file without parent-directory reads.
+        // Parent metadata stays mandatory; every file open refuses all symlinks.
+        func sourceParentIdentity() throws -> Identity {
+            var value = stat()
+            guard Darwin.lstat(sourceParentPath, &value) == 0 else { throw Self.failure() }
+            guard value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { throw NativeAttachmentFilesError.unavailable }
+            return Identity(value)
+        }
+        let parentIdentity = try sourceParentIdentity()
+        func openSource() throws -> Int32 {
+            let fd = Darwin.open(sourcePath, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
+            guard fd >= 0 else { throw Self.failure() }
+            do { _ = try Self.regular(fd); return fd }
+            catch { Darwin.close(fd); throw error }
+        }
+        let input = try openSource(); defer { Darwin.close(input) }
         let before = try Self.regular(input)
         guard before.st_nlink == 1 else { throw NativeAttachmentFilesError.unavailable }
         guard before.st_size <= Self.maximumProviderBytes else { throw NativeAttachmentFilesError.providerTooLarge }
         func validateSource() throws {
-            let namedParent = try Self.openAbsoluteDirectory(sourceParentPath); defer { Darwin.close(namedParent) }
-            guard try Self.identity(namedParent) == Self.identity(sourceParent.fd),
-                  try Self.unchanged(before, Self.regular(input)), try Self.unchanged(before, Self.named(sourceParent)),
-                  try Self.regular(input).st_nlink == 1, try Self.named(sourceParent).st_nlink == 1 else {
-                throw NativeAttachmentFilesError.unavailable
-            }
+            guard try sourceParentIdentity() == parentIdentity else { throw NativeAttachmentFilesError.unavailable }
+            let named = try openSource(); defer { Darwin.close(named) }
+            let retained = try Self.regular(input), current = try Self.regular(named)
+            guard Self.unchanged(before, retained), Self.unchanged(before, current),
+                  retained.st_nlink == 1, current.st_nlink == 1,
+                  try sourceParentIdentity() == parentIdentity else { throw NativeAttachmentFilesError.unavailable }
         }
         let metadata = try? url.resourceValues(forKeys: [.nameKey, .contentTypeKey])
         let fileName = metadata?.name.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
@@ -873,7 +886,7 @@ final class NativeAttachmentFiles {
         throw NativeAttachmentFilesError.invalidRequest
     }
 
-    private static func filePath(_ text: String) throws -> String {
+    static func filePath(_ text: String) throws -> String {
         guard !text.isEmpty, !text.utf8.contains(0), let url = URLComponents(string: text),
               url.scheme?.lowercased() == "file", url.host == nil || url.host == "",
               url.user == nil, url.password == nil, url.port == nil, url.query == nil, url.fragment == nil,
@@ -915,15 +928,11 @@ final class NativeAttachmentFiles {
     }
     private static func failure() -> NativeAttachmentFilesError { errno == ENOENT ? .missing : .unavailable }
     private static func openAbsoluteDirectory(_ path: String) throws -> Int32 {
-        var directory = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        // iOS permits the owned directory but can deny reading its ancestors.
+        // The kernel still refuses every symlink in the complete path.
+        let directory = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
         guard directory >= 0 else { throw failure() }
-        do {
-            for component in parts(path) {
-                let next = try childDirectory(directory, component, create: false)
-                Darwin.close(directory); directory = next
-            }
-            return directory
-        } catch { Darwin.close(directory); throw error }
+        return directory
     }
     private static func childDirectory(_ parent: Int32, _ name: String, create: Bool) throws -> Int32 {
         if create {

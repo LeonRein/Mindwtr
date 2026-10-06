@@ -5181,6 +5181,52 @@ const poll = async (state, id) => {
             assert.equal(absent.logText, null);
         }
     });
+    await check('editor acceptance acknowledgment forces five fixed file markers with or without local capability', async () => {
+        for (const local of [makeState(0, [], 'ios'), makeState(0, [], 'ios', configureLocal)]) {
+            local.settings = { diagnostics: { loggingEnabled: false } };
+            for (const operation of ['add', 'remove', 'save', 'discard', 'recover']) {
+                assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(`editor-${operation}`, 'confirmed'))).ok, true);
+                const marker = JSON.parse(local.logText.trim().split('\n').at(-1));
+                assert.deepEqual({ ...marker, ts: '' }, { ts: '', level: 'info', scope: 'native-ios',
+                    message: 'Native iOS attachment draft acknowledged',
+                    context: { releaseCheck: 'v1.3.5/ios-editor-owned-attachments', operation, outcome: 'confirmed' } });
+                assert.match(marker.ts, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+            }
+            assert.equal(local.logOps.filter((operation) => operation === 'append').length, 5);
+            assert.deepEqual(local.events, []); assert.deepEqual(local.fileCalls, []);
+            const exported = await poll(local, local.MindwtrHost.logShare());
+            assert.equal(exported.ok, true);
+            assert.deepEqual(exported.value, { path: 'files/logs/mindwtr.log' });
+            assert.equal(local.logText.split('\n').filter((line) => line.includes('v1.3.5/ios-editor-owned-attachments')).length, 5,
+                'the same file exported by Diagnostics contains each model acknowledgment');
+        }
+    });
+    await check('editor acceptance acknowledgment rejects every nonselected pair and stays silent on Android', async () => {
+        const local = makeState(0, [], 'ios', configureLocal);
+        for (const operation of ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover']) {
+            for (const outcome of ['replayed', 'retained', 'domainSaved', 'settled', '', null])
+                assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(operation, outcome))).ok, true);
+        }
+        for (const operation of ['editor-checkpoint', 'editor-delete', 'editor-save ', 'editor-', '', null])
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(operation, 'confirmed'))).ok, true);
+        assert.equal(local.logText, null); assert.deepEqual(local.logOps, []);
+        for (const platform of ['android', undefined]) {
+            const android = makeState(0, [], platform);
+            for (const operation of ['add', 'remove', 'save', 'discard', 'recover'])
+                assert.equal((await poll(android, android.MindwtrHost.attachmentDraftAcknowledged(`editor-${operation}`, 'confirmed'))).ok, true);
+            assert.equal(android.logText, null); assert.deepEqual(android.logOps, []);
+        }
+    });
+    await check('editor acceptance acknowledgment never fails its caller when the file sink refuses', async () => {
+        const local = makeState(0, [], 'ios');
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('editor-add', 'confirmed'))).ok, true);
+        const before = local.logText;
+        local.logFailure = 'private diagnostics failure';
+        for (const operation of ['add', 'remove', 'save', 'discard', 'recover'])
+            assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(`editor-${operation}`, 'confirmed'))).ok, true);
+        assert.equal(local.logText, before, 'no failed append fabricates a marker or changes the acknowledgment');
+        assert(!local.logText.includes('private diagnostics failure'));
+    });
     console.log(`Task244: ${cases} binding cases; direct callback branch/readiness/transport and real RN live-reference policy (Node VM, not Mac/native retirement proof)`);
 }
 const state = makeState(1);

@@ -243,6 +243,11 @@ public final class CoreHost: @unchecked Sendable {
         try await perform { try $0.diagnosticsFileAction(method) }
     }
 
+    /// Best-effort proof that the app accepted a matching editor attachment result.
+    public func recordEditorAttachmentAcknowledgment(operation: String) async {
+        _ = try? await perform { try $0.recordEditorAttachmentAcknowledgment(operation: operation) }
+    }
+
     public func validatedDiagnosticsShareURL(_ path: String) async throws -> URL {
         try await perform { try $0.validatedDiagnosticsShareURL(path) }
     }
@@ -2701,7 +2706,11 @@ private final class Engine: @unchecked Sendable {
         invoking = true
         defer { lease.invalidate(); invoking = false; scheduleAttachmentIdle(immediate: true) }
         turn.runtime.exception = nil
-        let returned = host.invokeMethod("attachmentFileEditSaveRetire", withArguments: [input, referenced, changed, retire])
+        guard let referencedValue = JSValue(object: referenced, in: turn.runtime),
+              let changedValue = JSValue(object: changed, in: turn.runtime),
+              let retireValue = JSValue(object: retire, in: turn.runtime),
+              turn.runtime.exception == nil else { throw Self.ownedSaveFailure }
+        let returned = host.invokeMethod("attachmentFileEditSaveRetire", withArguments: [input, referencedValue, changedValue, retireValue])
         let threw = turn.runtime.exception != nil; turn.runtime.exception = nil
         guard !threw, lease.consumed, !lease.failed, let outcome = lease.outcome,
               let returned, returned.isString, let text = returned.toString(), text.utf8.count <= 1024,
@@ -3556,7 +3565,10 @@ private final class Engine: @unchecked Sendable {
         defer { lease.invalidate(); invoking = false; scheduleAttachmentIdle(immediate: true) }
         turn.runtime.exception = nil
         let input = try Self.ownedJSON(["version": 1, "requestId": op.requestId, "targetURI": op.targetURI])
-        let returned = host.invokeMethod("attachmentDraftDiscardRetire", withArguments: [input, keep, retire])
+        guard let keepValue = JSValue(object: keep, in: turn.runtime),
+              let retireValue = JSValue(object: retire, in: turn.runtime),
+              turn.runtime.exception == nil else { throw Self.ownedDiscardFailure }
+        let returned = host.invokeMethod("attachmentDraftDiscardRetire", withArguments: [input, keepValue, retireValue])
         // Never expose arbitrary JS exception content. A callback/outer failure
         // keeps the journal even if an unlink already completed.
         let threw = turn.runtime.exception != nil
@@ -4171,6 +4183,13 @@ private final class Engine: @unchecked Sendable {
         // No pending check or mutation here: the file queue is independent from
         // an already initialized host's exact owed domain command.
         return try invoke(method, arguments: [])
+    }
+
+    func recordEditorAttachmentAcknowledgment(operation: String) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, !recoveryActivationPending,
+              ["add", "remove", "save", "discard", "recover"].contains(operation) else { return }
+        _ = try invoke("attachmentDraftAcknowledged", arguments: ["editor-" + operation, "confirmed"])
     }
 
     func validatedDiagnosticsShareURL(_ path: String) throws -> URL {

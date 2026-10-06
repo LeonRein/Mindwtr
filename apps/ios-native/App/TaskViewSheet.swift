@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import LinkPresentation
+import UniformTypeIdentifiers
 
 private struct TaskDraftDirection: ViewModifier {
     let direction: LayoutDirection
@@ -22,6 +23,8 @@ struct TaskViewSheet: View {
     let palette: AppPalette
     @State private var editing = false
     @State private var discardConfirm = false
+    @State private var fileImporterID: UUID?
+    @State private var ownedMenuPromptVisible = false
     @State private var sectionExpanded: [String: Bool] = [:]
     @State private var sectionTaskID = ""
     @State private var datePickerID = ""
@@ -37,15 +40,30 @@ struct TaskViewSheet: View {
     private var busy: Bool { model.busy }
     private var error: String? { model.taskError }
     private var readOnly: Bool { model.taskEditor.flag("readOnly") }
-    private var frozen: Bool { busy || model.retryNeeded || model.taskChecklistReadPending || model.taskPersonCreateOwed || model.taskAttachmentOpening || model.taskReferenceOpening || model.taskSharePayload != nil }
+    private var operationFrozen: Bool { busy || model.retryNeeded || model.taskChecklistReadPending || model.taskPersonCreateOwed || model.taskAttachmentOpening || model.taskReferenceOpening || model.taskSharePayload != nil || model.taskAttachmentWorking || model.taskFileImporterPresented }
+    private var attachmentRecoveryFrozen: Bool {
+        model.taskAttachmentState == .interrupted || model.taskAttachmentState == .savedCleanup
+            || model.taskAttachmentState == .blocked
+    }
+    private var ownedCloseDecision: Bool {
+        model.taskAttachmentState == .active || model.taskAttachmentState == .interrupted
+            || model.taskAttachmentState == .blocked
+    }
+    private var ownedMenuSettled: Bool {
+        model.taskOwnedMenuAction != nil
+            && (model.taskAttachmentState == .none || model.taskAttachmentState == .discardedCleanup)
+    }
+    private var frozen: Bool { operationFrozen || attachmentRecoveryFrozen || model.taskOwnedMenuAction != nil }
 
     private var rows: [CoreObject] { value.objects("rows") }
     private var modalPresented: Bool {
         !model.taskDestinationKind.isEmpty || monthlyCustom != nil || waitingAssignment != nil
-            || backdatedCompletion != nil || model.taskLinkSheetActive
+            || backdatedCompletion != nil || model.taskLinkSheetActive || model.taskFileImporterPresented
+            || ownedMenuPromptVisible
     }
 
     var body: some View {
+        let pickerID = fileImporterID
         ZStack {
             taskContent
                 .accessibilityElement(children: modalPresented ? .ignore : .contain)
@@ -71,6 +89,44 @@ struct TaskViewSheet: View {
         .sheet(item: Binding(get: { model.taskSharePayload }, set: { if $0 == nil { model.dismissTaskShare() } })) { payload in
             TaskActivitySheet(payload: payload)
         }
+        .sheet(item: Binding(
+            get: {
+                guard let pickerID, pickerID == model.taskFileImporterID, model.taskFileImporterPresented else { return nil }
+                return TaskDocumentPickerClaim(id: pickerID)
+            },
+            set: { (claim: TaskDocumentPickerClaim?) in
+                if claim == nil { model.setTaskFileImporterPresented(false, pickerID: pickerID) }
+            })) { claim in
+                TaskDocumentPicker(pickerID: claim.id) { result, capturedID in
+                    Task { await model.completeTaskFileImport(result, pickerID: capturedID) }
+                }
+                .id(claim.id)
+                .interactiveDismissDisabled()
+            }
+        .alert(ownedMenuTitle, isPresented: $ownedMenuPromptVisible, presenting: model.taskOwnedMenuAction) { _ in
+            Button(strings.text(ownedMenuSettled ? "settings.attachmentsCleanupPendingDeletesConfirmAction" : "common.save")) {
+                endEditingBeforeAction()
+                Task { await model.resolveTaskOwnedMenuAction(.save) }
+            }
+            .disabled(operationFrozen || attachmentRecoveryFrozen || model.taskPersonCreateNeedsReview)
+            .accessibilityIdentifier("task-owned-action-save")
+            if !ownedMenuSettled {
+                Button(strings.text("common.discard"), role: .destructive) {
+                    endEditingBeforeAction()
+                    Task { await model.resolveTaskOwnedMenuAction(.discard) }
+                }
+                .disabled(busy || model.taskAttachmentWorking || model.taskAttachmentState == .savedCleanup)
+                .accessibilityIdentifier("task-owned-action-discard")
+            }
+            Button(strings.text("common.cancel"), role: .cancel) {
+                Task { await model.resolveTaskOwnedMenuAction(.cancel) }
+            }
+            .accessibilityIdentifier("task-owned-action-cancel")
+        } message: { _ in
+            Text(ownedMenuSettled
+                ? "Continue with this task action, or cancel it."
+                : "Choose whether to save or discard this draft before continuing. If recovery is needed, the action will wait.")
+        }
         .alert(strings.text("common.share"), isPresented: Binding(
             get: { model.taskShareError != nil },
             set: { if !$0 { model.dismissTaskShareError() } })) {
@@ -94,7 +150,7 @@ struct TaskViewSheet: View {
         VStack(spacing: 0) {
             HStack {
                 Button {
-                    if model.taskDirty {
+                    if model.taskDirty || ownedCloseDecision {
                         model.preserveTaskTokenInputForTransientModal()
                         _ = UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
                             to: nil, from: nil, for: nil)
@@ -106,7 +162,9 @@ struct TaskViewSheet: View {
                 } label: {
                     AppIcon(name: "x", size: 22).frame(width: 44, height: 44).contentShape(Rectangle())
                 }
-                .buttonStyle(.plain).disabled(frozen || model.taskScheduleUpdating)
+                .buttonStyle(.plain).disabled((ownedCloseDecision
+                    ? busy || model.taskAttachmentWorking || model.taskFileImporterPresented || modalPresented
+                    : frozen) || model.taskScheduleUpdating)
                 .accessibilityLabel(strings.text("common.close")).accessibilityIdentifier("task-view-close")
                 Spacer()
                 if !readOnly && !model.taskEditor.isEmpty {
@@ -192,6 +250,17 @@ struct TaskViewSheet: View {
             ScrollViewReader { reader in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
+                        TaskAttachmentRecoveryStatus(model: model, palette: palette)
+                            .id("task-attachment-recovery-status")
+                        if model.taskOwnedMenuAction != nil {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(ownedMenuTitle + " is waiting for your decision or recovery.")
+                                    .rnFont(14).foregroundStyle(palette.secondary)
+                                Button("Review action") { ownedMenuPromptVisible = true }
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .disabled(busy || model.taskAttachmentWorking)
+                            }
+                        }
                         if !value.text("readOnlyHint").isEmpty {
                             Text(value.text("readOnlyHint")).rnFont(13).foregroundStyle(palette.secondary)
                                 .accessibilityIdentifier("task-view-readonly-hint")
@@ -241,6 +310,10 @@ struct TaskViewSheet: View {
                     guard message != nil else { return }
                     DispatchQueue.main.async { reader.scrollTo("task-view-error", anchor: .top) }
                 }
+                .onChange(of: model.taskAttachmentError) { message in
+                    guard message != nil else { return }
+                    DispatchQueue.main.async { reader.scrollTo("task-attachment-recovery-status", anchor: .top) }
+                }
                 .onChange(of: model.taskRecoveryCheckpointError) { message in
                     guard message != nil else { return }
                     DispatchQueue.main.async { reader.scrollTo("task-recovery-checkpoint-error", anchor: .top) }
@@ -253,11 +326,20 @@ struct TaskViewSheet: View {
         }
         .foregroundStyle(palette.text).background(palette.card)
         .tint(palette.tint)
-        .interactiveDismissDisabled(frozen || model.taskDirty || modalPresented)
-        .alert(strings.text("taskEdit.discardChanges"), isPresented: $discardConfirm) {
+        .interactiveDismissDisabled(frozen || model.taskDirty || ownedCloseDecision || modalPresented)
+        .alert(ownedCloseDecision ? "Finish this draft?" : strings.text("taskEdit.discardChanges"), isPresented: $discardConfirm) {
+            if model.taskAttachmentState == .active {
+                Button(strings.text("common.save")) {
+                    endEditingBeforeAction()
+                    Task { await model.saveTask() }
+                }
+                .disabled(operationFrozen || readOnly || model.taskPersonCreateNeedsReview)
+                .accessibilityIdentifier("task-editor-save-close")
+            }
             Button(strings.text("common.discard"), role: .destructive) {
                 endEditingBeforeAction()
-                model.discardTask()
+                if ownedCloseDecision { Task { await model.discardTaskRecoveryDraft(close: true) } }
+                else { model.discardTask() }
             }
                 .accessibilityIdentifier("task-editor-discard")
             if model.taskRecoveryAvailable {
@@ -268,16 +350,44 @@ struct TaskViewSheet: View {
             }
             Button(strings.text("common.cancel"), role: .cancel) {}
                 .accessibilityIdentifier("task-editor-keep-editing")
-        } message: { Text(strings.text("taskEdit.discardChangesDesc")) }
+        } message: {
+            Text(model.taskAttachmentState == .active
+                ? "Save this draft, discard it, or keep it on this device for later."
+                : ownedCloseDecision
+                    ? "Discard this draft or keep it on this device for later. Recovery must finish before editing can continue."
+                    : strings.text("taskEdit.discardChangesDesc"))
+        }
         .onAppear {
             editing = model.taskInitialTab == "task"
+            ownedMenuPromptVisible = model.taskOwnedMenuAction != nil
             initializeSections()
         }
         .onChange(of: model.taskInitialTab) { tab in editing = tab == "task" }
-        .onChange(of: model.taskEditor.text("id")) { _ in waitingAssignment = nil; backdatedCompletion = nil; initializeSections() }
-        .onChange(of: model.taskEditorSession) { _ in waitingAssignment = nil; backdatedCompletion = nil }
-        .onDisappear { backdatedCompletion = nil }
+        .onChange(of: model.taskEditor.text("id")) { _ in
+            cancelFileImporter()
+            waitingAssignment = nil; backdatedCompletion = nil; initializeSections()
+        }
+        .onChange(of: model.taskEditorSession) { _ in
+            cancelFileImporter()
+            waitingAssignment = nil; backdatedCompletion = nil
+        }
+        .onChange(of: model.taskOwnedMenuAction) { action in ownedMenuPromptVisible = action != nil }
+        .onDisappear { cancelFileImporter(); backdatedCompletion = nil }
         .onChange(of: model.taskChecklistFocusIndex) { index in focusedChecklistIndex = index }
+    }
+
+    private var ownedMenuTitle: String {
+        switch model.taskOwnedMenuAction {
+        case .delete: return strings.text("common.delete")
+        case .duplicate: return strings.text("taskEdit.duplicateTask")
+        case .promote: return strings.text("task.createProjectFromTask")
+        case nil: return strings.text("common.more")
+        }
+    }
+
+    private func cancelFileImporter() {
+        model.cancelTaskFileImport()
+        fileImporterID = nil
     }
 
     private func scrollChecklistFocus(_ reader: ScrollViewProxy) {
@@ -1080,6 +1190,17 @@ struct TaskViewSheet: View {
                         .buttonStyle(.plain).foregroundStyle(palette.danger)
                         .accessibilityLabel(strings.text("attachments.remove") + " " + entry.text("title"))
                         .accessibilityIdentifier("task-attachment-remove-" + entry.text("id"))
+                    } else if entry.text("kind") == "file" {
+                        Button {
+                            endEditingBeforeAction()
+                            Task { await model.removeTaskFile(entry.text("id")) }
+                        } label: {
+                            Image(systemName: "trash").frame(width: 44, height: 44).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain).foregroundStyle(palette.danger)
+                        .disabled(frozen || !model.canRemoveTaskFile || entry.flag("disabled"))
+                        .accessibilityLabel(strings.text("attachments.remove") + " " + entry.text("title"))
+                        .accessibilityIdentifier("task-attachment-remove-" + entry.text("id"))
                     }
                 }
                 .frame(minHeight: 44).padding(.leading, 12)
@@ -1096,6 +1217,19 @@ struct TaskViewSheet: View {
             }
             .buttonStyle(.plain).foregroundStyle(palette.tint)
             .accessibilityIdentifier("task-attachment-add-link")
+            Button {
+                endEditingBeforeAction()
+                Task {
+                    guard let id = await model.prepareTaskFileImport() else { return }
+                    fileImporterID = id
+                }
+            } label: {
+                Label(strings.text("attachments.addFile"), systemImage: "paperclip")
+                    .rnFont(14, .semibold).frame(minWidth: 44, minHeight: 44)
+            }
+            .buttonStyle(.plain).foregroundStyle(palette.tint)
+            .disabled(frozen || !model.canAddTaskFile)
+            .accessibilityIdentifier("task-attachment-add-file")
         }
     }
 
@@ -1237,6 +1371,44 @@ struct TaskViewSheet: View {
         }
     }
 
+}
+
+private struct TaskDocumentPickerClaim: Identifiable {
+    let id: UUID
+}
+
+private struct TaskDocumentPicker: UIViewControllerRepresentable {
+    let pickerID: UUID
+    let completion: (Result<[URL], Error>, UUID) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(pickerID: pickerID, completion: completion) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: false)
+        picker.allowsMultipleSelection = false
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let pickerID: UUID
+        let completion: (Result<[URL], Error>, UUID) -> Void
+
+        init(pickerID: UUID, completion: @escaping (Result<[URL], Error>, UUID) -> Void) {
+            self.pickerID = pickerID
+            self.completion = completion
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            completion(.success(urls), pickerID)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            completion(.failure(CocoaError(.userCancelled)), pickerID)
+        }
+    }
 }
 
 struct NativeMarkdownChecklistMarker: View {

@@ -124,6 +124,63 @@ final class NativeAttachmentProviderHostTests: XCTestCase {
                        try object(before.payloadJSON)["raw"].flatMap { ($0 as? [String: Any])?["note"] as? String })
     }
 
+    func testSearchableProviderParentWithoutReadPermissionStillAddsExactFile() async throws {
+        let host = try await seed(), before = try latest(), rows = try domain(), source = try selection()
+        let bytes = try Data(contentsOf: source), sourceIdentity = try inode(source)
+        let parent = source.deletingLastPathComponent()
+        XCTAssertEqual(Darwin.chmod(parent.path, mode_t(0o111)), 0)
+        defer { XCTAssertEqual(Darwin.chmod(parent.path, mode_t(0o755)), 0) }
+
+        // This must run as the ordinary Mac test account: the parent cannot be
+        // opened for directory reads, while the selected regular file can.
+        let parentFD = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        let parentError = errno
+        if parentFD >= 0 { Darwin.close(parentFD) }
+        XCTAssertEqual(parentFD, -1); XCTAssertEqual(parentError, EACCES)
+        let sourceFD = Darwin.open(source.path, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK)
+        XCTAssertGreaterThanOrEqual(sourceFD, 0)
+        if sourceFD >= 0 { Darwin.close(sourceFD) }
+
+        let reply = try await added(host, source: source), op = try lastAdd()
+        XCTAssertEqual(reply["status"] as? String, "added"); XCTAssertEqual(reply["generation"] as? Int, 2)
+        XCTAssertEqual(op.phase, .checkpointed); XCTAssertEqual(op.source.size, Int64(bytes.count))
+        let picked = try XCTUnwrap(object(op.requestJSON)["picked"] as? [String: Any])
+        XCTAssertEqual(picked["name"] as? String, source.lastPathComponent)
+        XCTAssertEqual(picked["mimeType"] as? String, "application/pdf"); XCTAssertEqual(picked["size"] as? Int, bytes.count)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(URL(string: op.targetURI))), bytes)
+        XCTAssertEqual(try Data(contentsOf: source), bytes); XCTAssertEqual(try inode(source), sourceIdentity)
+        XCTAssertTrue(try cacheEntries().isEmpty); XCTAssertEqual(try latest(), op.after); XCTAssertEqual(try domain(), rows)
+        XCTAssertEqual(before.generation, 1)
+    }
+
+    func testEditorAcknowledgmentFacadeForcesFiveBoundedLogMarkersWithDebugLoggingOff() async throws {
+        let host = try await seed()
+        let settings = try object(await host.call("menuRead", argumentsJSON: json(["dataSettings", "{}"])))
+        let diagnostics = try XCTUnwrap(settings["diagnostics"] as? [String: Any])
+        let debugLogging = try XCTUnwrap(diagnostics["debugLogging"] as? [String: Any])
+        XCTAssertEqual(debugLogging["value"] as? Bool, false)
+
+        let operations = ["add", "remove", "save", "discard", "recover"]
+        for operation in operations { await host.recordEditorAttachmentAcknowledgment(operation: operation) }
+        let log = root.appendingPathComponent("logs/mindwtr.log"), beforeInvalid = try Data(contentsOf: log)
+        await host.recordEditorAttachmentAcknowledgment(operation: "invalid-operation")
+        XCTAssertEqual(try Data(contentsOf: log), beforeInvalid)
+
+        let rows = try String(decoding: beforeInvalid, as: UTF8.self).split(separator: "\n").map { try object(String($0)) }
+        let slug = "v1.3.5/ios-editor-owned-attachments"
+        let markers = rows.filter { ($0["context"] as? [String: Any])?["releaseCheck"] as? String == slug }
+        XCTAssertEqual(markers.count, operations.count)
+        for (marker, operation) in zip(markers, operations) {
+            XCTAssertEqual(marker["level"] as? String, "info"); XCTAssertEqual(marker["scope"] as? String, "native-ios")
+            XCTAssertEqual(marker["message"] as? String, "Native iOS attachment draft acknowledged")
+            let context = try XCTUnwrap(marker["context"] as? [String: Any])
+            XCTAssertEqual(Set(context.keys), Set(["releaseCheck", "operation", "outcome"]))
+            XCTAssertEqual(context["releaseCheck"] as? String, slug)
+            XCTAssertEqual(context["operation"] as? String, operation); XCTAssertEqual(context["outcome"] as? String, "confirmed")
+        }
+        XCTAssertFalse(String(decoding: beforeInvalid, as: UTF8.self).contains("invalid-operation"))
+    }
+
     func testZeroAndExact50MiBUseStreamingWhileOversizeKeepsEmptyOwner() async throws {
         for size in [0, Int(NativeAttachmentFiles.maximumProviderBytes), Int(NativeAttachmentFiles.maximumProviderBytes) + 1] {
             let previous = try isolate(); defer { root = previous }
@@ -160,12 +217,16 @@ final class NativeAttachmentProviderHostTests: XCTestCase {
     }
 
     func testProviderSourceSymlinkHardlinkGrowthAndRootReplacementRefuseWithoutForeignUnlink() throws {
-        for kind in ["symlink", "hardlink", "growth", "root"] {
+        for kind in ["symlink", "ancestor-symlink", "hardlink", "growth", "root"] {
             let previous = try isolate(); defer { root = previous }
             let files = try NativeAttachmentFiles(libraryRoot: root), source = try selection(), bytes = try Data(contentsOf: source)
             var selected = source
             if kind == "symlink" {
                 selected = source.appendingPathExtension("alias"); try FileManager.default.createSymbolicLink(at: selected, withDestinationURL: source)
+            } else if kind == "ancestor-symlink" {
+                let alias = root.appendingPathComponent("provider-alias", isDirectory: true)
+                try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: source.deletingLastPathComponent())
+                selected = alias.appendingPathComponent(source.lastPathComponent)
             } else if kind == "hardlink" {
                 selected = source.appendingPathExtension("link"); try FileManager.default.linkItem(at: source, to: selected)
             } else if kind == "growth" {
@@ -185,14 +246,31 @@ final class NativeAttachmentProviderHostTests: XCTestCase {
     }
 
     func testSourceAndCreatedScratchReplacementDuringCopyDoNotAdoptOrDeleteForeignGeneration() throws {
-        for kind in ["source", "scratch"] {
+        for kind in ["source", "parent", "scratch"] {
             let previous = try isolate(); defer { root = previous }
             let files = try NativeAttachmentFiles(libraryRoot: root), source = try selection(), bytes = try Data(contentsOf: source)
-            var changed: URL?
+            let sourceIdentity = try inode(source)
+            var changed: URL?, retainedSource: URL?, parentSentinel: URL?
             if kind == "source" { files.afterSourceOpened = { try self.replaceExact(source) } }
+            else if kind == "parent" { files.afterSourceOpened = {
+                let parent = source.deletingLastPathComponent(), oldParentIdentity = try self.inode(parent)
+                let retainedParent = parent.appendingPathExtension("retained")
+                try FileManager.default.moveItem(at: parent, to: retainedParent)
+                retainedSource = retainedParent.appendingPathComponent(source.lastPathComponent)
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+                try bytes.write(to: source)
+                let sentinel = parent.appendingPathComponent("foreign-sentinel")
+                try Data("foreign provider parent".utf8).write(to: sentinel); parentSentinel = sentinel
+                XCTAssertNotEqual(try self.inode(parent), oldParentIdentity)
+                XCTAssertNotEqual(try self.inode(source), sourceIdentity)
+            } }
             else { files.beforePublish = { let partial = try XCTUnwrap(self.cacheEntries().first); changed = partial; try self.replaceExact(partial) } }
             XCTAssertThrowsError(try files.copyProviderSource(source, checkCancellation: {}))
             XCTAssertEqual(try Data(contentsOf: source), bytes)
+            if let retainedSource {
+                XCTAssertEqual(try Data(contentsOf: retainedSource), bytes); XCTAssertEqual(try inode(retainedSource), sourceIdentity)
+                XCTAssertEqual(try Data(contentsOf: XCTUnwrap(parentSentinel)), Data("foreign provider parent".utf8))
+            }
             if let changed { XCTAssertEqual(try Data(contentsOf: changed), bytes) }
             else { XCTAssertTrue(try cacheEntries().isEmpty) }
         }
@@ -241,9 +319,30 @@ final class NativeAttachmentProviderHostTests: XCTestCase {
     func testInterruptedIntentAndStageFilledKeepBorrowedSourceAcrossColdRecovery() async throws {
         for point in [AttachmentDraftBoundary.afterIntent, .afterFilled] {
             let previous = try isolate(); defer { root = previous }
-            let host = try await seed(), before = try latest(), source = try selection(), rows = try domain()
-            await boundary(point, host: host)
-            await refused { _ = try await self.added(host, source: source) }
+            let label = point == .afterIntent ? "afterIntent" : "afterFilled"
+            var sourcePublicationReached = false
+            let fileHooks = NativeAttachmentHostHooks()
+            fileHooks.configureJobs = { jobs in jobs.beforeFilePublish = { sourcePublicationReached = true } }
+            let host = try await seed(hooks: fileHooks), before = try latest(), source = try selection(), rows = try domain()
+            var reached: [AttachmentDraftBoundary] = [], hits = 0
+            let draftHooks = AttachmentDraftHostHooks()
+            draftHooks.boundary = { actual in
+                reached.append(actual)
+                if actual == point { hits += 1; throw HostFailure("Private provider failure") }
+            }
+            await host.configureAttachmentDraftHost(draftHooks)
+            var refusal: Error?
+            await refused {
+                do { _ = try await self.added(host, source: source) }
+                catch { refusal = error; throw error }
+            }
+            let operationCount = (try? store.readMixed())?.operations.count
+            let cacheCount = try? cacheEntries().count
+            let trace = reached.map { String(describing: $0) }.joined(separator: ",")
+            let failureType = refusal.map { String(describing: type(of: $0)) } ?? "none"
+            let failureMessage = refusal?.localizedDescription ?? "none"
+            XCTAssertEqual(hits, 1, "Provider fault \(label) not reached exactly once; boundaries=[\(trace)]; sourcePublication=\(sourcePublicationReached); errorType=\(failureType); error=\(failureMessage); operations=\(operationCount.map { String($0) } ?? "unavailable"); cache=\(cacheCount.map { String($0) } ?? "unavailable")")
+            guard hits == 1 else { return }
             let op = try lastAdd(), scratch = try XCTUnwrap(URL(string: op.source.sourceURI))
             XCTAssertEqual(op.phase, point == .afterIntent ? .intent : .stageFilled)
             XCTAssertEqual(try Data(contentsOf: scratch), try Data(contentsOf: source)); XCTAssertEqual(try latest(), before)

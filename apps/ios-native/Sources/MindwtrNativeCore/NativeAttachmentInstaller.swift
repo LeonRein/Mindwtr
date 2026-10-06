@@ -17,11 +17,22 @@ enum NativeAttachmentInstallerError: LocalizedError, Equatable {
 /// identity, locking, streaming hashes, and interrupted-install recovery.
 /// Calls must be serialized by the file-port owner, outside the JS engine queue.
 final class NativeAttachmentInstaller {
-    private let installer: AttachmentFileInstaller
+    private let managedRoot: URL
+    private let sourceRoots: [URL]
+    private var installer: AttachmentFileInstaller {
+        get throws {
+            // A missing root can canonicalize differently once the existing
+            // owned ensure creates it. RN binds its stateless facade per call.
+            do { return try AttachmentFileInstaller(targetRoot: managedRoot, sourceRoots: sourceRoots) }
+            catch { throw NativeAttachmentInstallerError.unavailable }
+        }
+    }
 
     init(managedRoot: URL, sourceRoots: [URL]) throws {
+        self.managedRoot = managedRoot
+        self.sourceRoots = sourceRoots
         do {
-            installer = try AttachmentFileInstaller(targetRoot: managedRoot, sourceRoots: sourceRoots)
+            _ = try AttachmentFileInstaller(targetRoot: managedRoot, sourceRoots: sourceRoots)
         } catch {
             throw NativeAttachmentInstallerError.unavailable
         }
@@ -89,8 +100,14 @@ final class NativeAttachmentInstaller {
         }
         do {
             let prepared = try installer.prepareImmutableStage(targetInput: target, operationId: operationID)
+            let expected = target.deletingLastPathComponent()
+                .appendingPathComponent(".mindwtr-install-" + operationID + ".candidate", isDirectory: true).appendingPathComponent("stage")
+            // Retain the native record's root spelling across RN system aliases.
+            guard prepared.stagedUrl.standardizedFileURL.resolvingSymlinksInPath() == expected.standardizedFileURL.resolvingSymlinksInPath() else {
+                throw NativeAttachmentInstallerError.unavailable
+            }
             return NativeAttachmentFiles.ReservedAttachmentStageProof(
-                stageURI: prepared.stagedUrl.absoluteString, stagedIdentity: prepared.stagedIdentity,
+                stageURI: expected.absoluteString, stagedIdentity: prepared.stagedIdentity,
                 directoryIdentity: prepared.directoryIdentity, privateDirectoryIdentity: prepared.privateDirectoryIdentity)
         } catch { throw NativeAttachmentInstallerError.unavailable }
     }
@@ -114,12 +131,30 @@ final class NativeAttachmentInstaller {
     /// latest live-reference check. The compatibility JSON allowlist is sealed.
     func retirePrivateStage(stage: NativeAttachmentFiles.ReservedAttachmentStageProof,
                             targetURI: String, operationID: String) throws -> String {
-        let staged = try fileURL(stage.stageURI), target = try fileURL(targetURI)
+        _ = try fileURL(stage.stageURI)
+        _ = try fileURL(targetURI)
         guard operationID.utf8.count == 32,
               operationID.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
             throw NativeAttachmentInstallerError.invalidRequest
         }
         do {
+            let candidate = ".mindwtr-install-" + operationID + ".candidate"
+            var rootParts = try NativeAttachmentFiles.filePath(managedRoot.absoluteString).split(separator: "/", omittingEmptySubsequences: false)
+            if rootParts.last?.isEmpty == true { rootParts.removeLast() }
+            let targetParts = try NativeAttachmentFiles.filePath(targetURI).split(separator: "/", omittingEmptySubsequences: false)
+            let stageParts = try NativeAttachmentFiles.filePath(stage.stageURI).split(separator: "/", omittingEmptySubsequences: false)
+            guard let targetName = targetParts.last, !targetName.isEmpty,
+                  targetParts.dropLast().elementsEqual(rootParts, by: { $0.utf8.elementsEqual($1.utf8) }),
+                  stageParts.last == "stage", let candidateName = stageParts.dropLast().last,
+                  candidateName.utf8.elementsEqual(candidate.utf8),
+                  stageParts.dropLast(2).elementsEqual(rootParts, by: { $0.utf8.elementsEqual($1.utf8) }) else {
+                throw NativeAttachmentInstallerError.unavailable
+            }
+            // Missing children can retain an Apple alias after canonicalization.
+            // Translate only the validated root; RN still checks each named child.
+            let root = managedRoot.standardizedFileURL.resolvingSymlinksInPath()
+            let target = root.appendingPathComponent(String(targetName))
+            let staged = root.appendingPathComponent(candidate, isDirectory: true).appendingPathComponent("stage")
             switch try installer.retireOwnedPrivateStage(stagedInput: staged, targetInput: target,
                 operationId: operationID, expectedStagedIdentity: stage.stagedIdentity,
                 expectedDirectoryIdentity: stage.directoryIdentity,

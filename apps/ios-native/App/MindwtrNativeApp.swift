@@ -172,7 +172,9 @@ private struct AppLockRoot: View {
                     InboxScreen(model: model)
                         .overlay(alignment: .bottomTrailing) {
                             if model.taskRecoveryAvailable {
-                                Button("Resume draft") { model.showTaskRecovery() }
+                                Button(model.taskAttachmentState == .savedCleanup
+                                    || (model.taskAttachmentState == .discardedCleanup && !model.taskAttachmentHasIndependentDraft)
+                                    ? "File cleanup" : "Resume draft") { model.showTaskRecovery() }
                                     .buttonStyle(.borderedProminent)
                                     .padding(16)
                                     .accessibilityIdentifier("task-recovery-open")
@@ -197,6 +199,8 @@ private struct AppLockRoot: View {
                                 .frame(maxWidth: 320).padding(.bottom, 26)
                             if model.busy || lock.authenticating {
                                 ProgressView().accessibilityLabel(model.label("appLock.authenticating"))
+                            } else if !model.ready && model.taskAttachmentState == .savedCleanup {
+                                TaskAttachmentRecoveryStatus(model: model, palette: palette)
                             } else if model.taskRecoveryStartupCorrupt {
                                 Text("An unreadable task draft prevents startup. Its contents cannot be shown.")
                                     .rnFont(15).multilineTextAlignment(.center).padding(.bottom, 12)
@@ -210,6 +214,13 @@ private struct AppLockRoot: View {
                                     .foregroundStyle(palette.onTint)
                                     .accessibilityIdentifier("app-lock-recovery-cancel")
                             } else if !model.ready || lock.enabled == nil {
+                                if !model.ready && model.error != nil {
+                                    Text(model.label("settings.feedback.actionFailed").isEmpty
+                                        ? "Couldn't complete this action. Try again."
+                                        : model.label("settings.feedback.actionFailed"))
+                                        .rnFont(15).foregroundStyle(palette.danger).multilineTextAlignment(.center).padding(.bottom, 12)
+                                        .accessibilityIdentifier("app-lock-read-error")
+                                }
                                 Button(model.label("common.retry").isEmpty ? "Retry" : model.label("common.retry")) {
                                     Task { await model.retryAppLockRead() }
                                 }.foregroundStyle(palette.onTint).accessibilityIdentifier("app-lock-read-retry")
@@ -232,18 +243,22 @@ private struct AppLockRoot: View {
         .preferredColorScheme(model.theme.text("scheme").isEmpty ? nil : palette.dark ? .dark : .light)
         .onAppear { lock.sceneChanged(phase) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            model.cancelTaskFileImport()
             model.flushTaskDraftCheckpointInBackground()
             if model.appLockActive && !lock.authenticating { lock.readFailed() }
             lock.concealSnapshot()
         }
         .onChange(of: phase) { next in
-            if next != .active { model.flushTaskDraftCheckpointInBackground() }
+            if next != .active {
+                model.cancelTaskFileImport()
+                model.flushTaskDraftCheckpointInBackground()
+            }
             if next != .active && model.appLockActive && !lock.authenticating { lock.readFailed() }
             lock.sceneChanged(next)
             if next == .active && !lock.concealed { Task { await model.refresh() } }
         }
         .onChange(of: lock.concealed) { concealed in
-            if concealed { model.dismissTaskShare() }
+            if concealed { model.cancelTaskFileImport(); model.dismissTaskShare() }
             if !concealed && phase == .active { Task { await model.refresh() } }
         }
         .task(id: "\(model.ready)-\(lock.nonce)-\(phase == .active)-\(lock.authenticating)") {
@@ -266,29 +281,42 @@ private struct TaskRecoveryGate: View {
     @ObservedObject var model: CoreModel
     let palette: AppPalette
     @State private var confirmingDiscard = false
+    private var retainedCleanup: Bool {
+        model.taskAttachmentState == .savedCleanup
+            || (model.taskAttachmentState == .discardedCleanup && !model.taskAttachmentHasIndependentDraft)
+    }
+    private var canResume: Bool {
+        model.taskAttachmentState == .none || model.taskAttachmentState == .active
+            || model.taskAttachmentHasIndependentDraft
+    }
 
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Text("Saved task draft").rnFont(24, .bold)
+                    Text(model.taskAttachmentState == .savedCleanup ? "Task saved"
+                        : retainedCleanup ? "Draft discarded" : "Saved task draft")
+                        .rnFont(24, .bold)
                         .accessibilityAddTraits(.isHeader)
-                    Text(model.taskRecoveryReviewTitle.isEmpty ? "Untitled task" : model.taskRecoveryReviewTitle)
-                        .rnFont(17, .semibold)
-                        .accessibilityIdentifier("task-recovery-title")
-                    if !model.taskRecoveryReviewNote.isEmpty {
-                        Text(model.taskRecoveryReviewNote).rnFont(15)
-                            .foregroundStyle(palette.secondary)
-                            .accessibilityIdentifier("task-recovery-note")
+                    if !retainedCleanup {
+                        Text(model.taskRecoveryReviewTitle.isEmpty ? "Untitled task" : model.taskRecoveryReviewTitle)
+                            .rnFont(17, .semibold)
+                            .accessibilityIdentifier("task-recovery-title")
+                        if !model.taskRecoveryReviewNote.isEmpty {
+                            Text(model.taskRecoveryReviewNote).rnFont(15)
+                                .foregroundStyle(palette.secondary)
+                                .accessibilityIdentifier("task-recovery-note")
+                        }
+                        ForEach(Array(model.taskRecoveryReviewLines.enumerated()), id: \.offset) { entry in
+                            Text(entry.element).rnFont(15).foregroundStyle(palette.secondary)
+                        }
                     }
-                    ForEach(Array(model.taskRecoveryReviewLines.enumerated()), id: \.offset) { entry in
-                        Text(entry.element).rnFont(15).foregroundStyle(palette.secondary)
-                    }
+                    TaskAttachmentRecoveryStatus(model: model, palette: palette)
                     if let conflict = model.taskRecoveryConflict {
                         Text(conflict).rnFont(15).foregroundStyle(palette.danger)
                             .accessibilityIdentifier("task-recovery-conflict")
                     }
-                    if let protectionError = model.taskRecoveryCheckpointError {
+                    if !retainedCleanup, let protectionError = model.taskRecoveryCheckpointError {
                         Text(protectionError).rnFont(15).foregroundStyle(palette.danger)
                             .accessibilityIdentifier("task-recovery-error")
                         Button(model.label("common.retry")) {
@@ -297,23 +325,27 @@ private struct TaskRecoveryGate: View {
                         .frame(maxWidth: .infinity, minHeight: 44)
                         .accessibilityIdentifier("task-recovery-retry-checkpoint")
                     }
-                    if model.busy {
+                    if model.busy && model.taskAttachmentState == .none {
                         ProgressView().frame(minHeight: 44)
                             .accessibilityIdentifier("task-recovery-loading")
                     }
-                    Button("Resume editing") { Task { await model.restoreTaskRecovery() } }
-                        .buttonStyle(.borderedProminent)
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .disabled(model.busy)
-                        .accessibilityIdentifier("task-recovery-resume")
-                    Button("Keep for later") { Task { await model.keepTaskRecoveryForLater() } }
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .disabled(model.busy || model.taskRecoveryCheckpointError != nil)
-                        .accessibilityIdentifier("task-recovery-keep")
-                    Button("Discard draft", role: .destructive) { confirmingDiscard = true }
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .disabled(model.busy)
-                        .accessibilityIdentifier("task-recovery-discard")
+                    if canResume {
+                        Button("Resume editing") { Task { await model.restoreTaskRecovery() } }
+                            .buttonStyle(.borderedProminent)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .disabled(model.busy)
+                            .accessibilityIdentifier("task-recovery-resume")
+                    }
+                    if !retainedCleanup {
+                        Button("Keep for later") { Task { await model.keepTaskRecoveryForLater() } }
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .disabled(model.busy || model.taskRecoveryCheckpointError != nil)
+                            .accessibilityIdentifier("task-recovery-keep")
+                        Button("Discard draft", role: .destructive) { confirmingDiscard = true }
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .disabled(model.busy)
+                            .accessibilityIdentifier("task-recovery-discard")
+                    }
                 }
                 .padding(24)
                 .frame(maxWidth: 540, minHeight: geometry.size.height, alignment: .center)
@@ -334,7 +366,71 @@ private struct TaskRecoveryGate: View {
             Text("This removes the unsaved task changes from this device.")
         }
         .task {
-            if model.taskRecoveryConflict == nil { await model.restoreTaskRecovery() }
+            if canResume && model.taskRecoveryConflict == nil { await model.restoreTaskRecovery() }
+        }
+    }
+}
+
+struct TaskAttachmentRecoveryStatus: View {
+    @ObservedObject var model: CoreModel
+    let palette: AppPalette
+
+    private var message: String? {
+        switch model.taskAttachmentState {
+        case .none: return nil
+        case .active: return "File editing is active. Save or discard this draft to finish."
+        case .interrupted: return "File editing was interrupted. Retry to confirm the result before continuing."
+        case .savedCleanup: return "Task saved. File cleanup still needs to finish. Retry will finish cleanup."
+        case .discardedCleanup:
+            return model.taskAttachmentHasIndependentDraft
+                ? "An earlier draft was discarded. Its file cleanup still needs to finish."
+                : "Draft changes were discarded. File cleanup still needs to finish."
+        case .blocked: return "This draft needs a recovery decision before file editing can continue."
+        }
+    }
+
+    var body: some View {
+        if message != nil || model.taskAttachmentError != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                if let message {
+                    Text(message).rnFont(14).foregroundStyle(palette.secondary)
+                        .accessibilityIdentifier("task-attachment-status")
+                }
+                if model.taskAttachmentError != nil {
+                    Text(model.label("settings.feedback.actionFailed").isEmpty
+                        ? "Couldn't complete this action. Try again."
+                        : model.label("settings.feedback.actionFailed")).rnFont(14).foregroundStyle(palette.danger)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("task-attachment-error")
+                }
+                if model.taskAttachmentWorking {
+                    ProgressView().frame(minHeight: 44)
+                }
+                if model.taskAttachmentState == .interrupted || model.taskAttachmentState == .savedCleanup
+                    || model.taskAttachmentState == .discardedCleanup || model.taskAttachmentState == .blocked {
+                    if model.taskAttachmentState == .discardedCleanup
+                        && (model.taskPresented || model.taskAttachmentHasIndependentDraft) {
+                        Text("Save or discard the current draft before retrying file cleanup.")
+                            .rnFont(14).foregroundStyle(palette.secondary)
+                    }
+                    Button(model.label("common.retry").isEmpty ? "Retry" : model.label("common.retry")) {
+                        Task { await model.retryTaskAttachmentRecovery() }
+                    }
+                    .frame(minWidth: 44, minHeight: 44)
+                    .disabled(model.busy || model.taskAttachmentWorking
+                        || (model.taskAttachmentState == .discardedCleanup
+                            && (model.taskPresented || model.taskAttachmentHasIndependentDraft)))
+                    .accessibilityIdentifier("task-attachment-retry")
+                }
+                if model.taskAttachmentState == .discardedCleanup && !model.taskPresented
+                    && !model.taskAttachmentHasIndependentDraft {
+                    Button("Continue") { Task { await model.continueAfterTaskAttachmentDiscard() } }
+                        .frame(minWidth: 44, minHeight: 44)
+                        .disabled(model.busy || model.taskAttachmentWorking)
+                        .accessibilityIdentifier("task-attachment-continue")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

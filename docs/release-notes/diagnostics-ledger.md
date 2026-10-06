@@ -30,6 +30,8 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 ## v1.3.5 (add before tagging, trim in the release after)
 
+- **`v1.3.5/ios-editor-owned-attachments`** — `apps/ios-native/App/CoreModel.swift` via the existing forced Diagnostics file sink in `apps/android-native/bundle/host-entry.ts`. `Native iOS attachment draft acknowledged` with bounded `operation` (`add`, `remove`, `save`, `discard`, or `recover`) and `outcome=confirmed` proves the app model accepted the matching attachment operation or proven saved result after checking its editor claim. It does not by itself prove picker interaction, file availability, or cleanup completion. No task identifiers, filenames, paths, or payloads are logged.
+
 - **`v1.3.5/ios-retained-cleanup-ordinary-work`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift`. The fixed native line `Native iOS retained attachment cleanup preserved during ordinary write releaseCheck=v1.3.5/ios-retained-cleanup-ordinary-work outcome=confirmed` proves an ordinary domain write received a durable acknowledgment while exact detached attachment cleanup ownership remained retained. It does not prove file cleanup or UI acceptance. No task text, identifiers, paths, or file proofs are logged.
 
 - **`v1.3.5/ios-attachment-recovery`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift`, when startup returns the validated result of a recovered attachment Save. `Native iOS attachment recovery returned`, `outcome=saved` proves the domain acknowledgment was surfaced to the app. It does not claim the editor displayed it or verify current file existence. No task identifiers, contents, paths, proofs, or raw errors are logged.
