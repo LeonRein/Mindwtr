@@ -123,6 +123,8 @@ type NativeBridge = {
     widgetInputs?(): string;
     widgetPublish?(payload: string): string | null;
     widgetAppState?(): string;
+    /** Android only (BackgroundSync.kt): the background sync job kept scheduled (true) or cancelled (false), as core decides. */
+    bgSyncSchedule?(on: boolean): string | null;
 };
 
 declare const globalThis: Record<string, unknown> & { MindwtrHost?: unknown };
@@ -321,6 +323,8 @@ const submit = (work: (signal: AbortSignal) => Promise<unknown>): string => {
  * Sync (host-sync.ts), on a host with RN's AsyncStorage bridge (Android). The iOS host and the gates' stand-in bridge have
  * none, so their contract has no Settings › Sync device, as before.
  */
+/** The Android build's flavor (D8, CoreHost's BuildConfig.FOSS; absent elsewhere): as RN's FOSS_BUILD, it hides Dropbox and defaults speech to Whisper. */
+const isFossBuild = globalThis.__mindwtrFossBuild === true;
 // kvMultiGet, not kvGet: the gates' stand-in bridge has kvGet and kvSet for the queue's record, and no sync.
 const nativeSync: NativeSync | null = typeof (globalThis.__mindwtrNative as { kvMultiGet?: unknown } | undefined)?.kvMultiGet === 'function'
     ? createNativeSync({
@@ -345,6 +349,8 @@ const nativeSync: NativeSync | null = typeof (globalThis.__mindwtrNative as { kv
         },
         emit: (event) => { checked(native().hostEvent(JSON.stringify(event))); },
         trace: (line) => { try { native().log(line); } catch { /* logcat is best effort */ } },
+        scheduleBackgroundSync: (on) => { const bridge = native(); if (bridge.bgSyncSchedule) checked(bridge.bgSyncSchedule(on)); },
+        isFossBuild,
     })
     : null;
 /** The device's network state as Kotlin last reported it (HostNetwork.kt); unknown until then, which never reads as offline. */
@@ -368,7 +374,7 @@ const widgets = typeof (globalThis.__mindwtrNative as { widgetPublish?: unknown 
     : null;
 
 /** Settings › AI and the AI actions (host-ai.ts), on the same host: RN's AsyncStorage and SecureStore hold what RN's do. */
-const nativeAI = nativeSync ? createNativeAI(keyValue, () => globalThis.__mindwtrSecrets as HostSecrets) : null;
+const nativeAI = nativeSync ? createNativeAI(keyValue, () => globalThis.__mindwtrSecrets as HostSecrets, isFossBuild) : null;
 
 const localAttachments = nativeSync ? null : createNativeLocalAttachmentsForHost();
 const attachmentsHost = nativeSync?.attachmentsHost ?? localAttachments?.contractHost;
@@ -3293,6 +3299,18 @@ globalThis.MindwtrHost = {
     /** The badge and the finished-cycle count now. */
     syncState(): string {
         return submit(async () => requireSync().state());
+    },
+    /**
+     * CoreWork's background run (core's runner; host-sync.ts backgroundSync), after the start order drained the queue: `trigger`
+     * is 'scheduled' or 'capture', `stored` what the drains stored, `deadlineMs` a debug build's shorter deadline (0: core's). A
+     * long call (CoreHost.callLong): it settles with the run.
+     */
+    backgroundSync(trigger: string, stored: number, deadlineMs: number): string {
+        return submit(async () => {
+            if (trigger !== 'scheduled' && trigger !== 'capture') throw new Error(`INVALID_INPUT: no background sync trigger ${trigger}`);
+            const count = (value: number) => (Number.isInteger(value) && value > 0 ? value : 0);
+            return requireSync().backgroundSync(trigger, count(stored), count(deadlineMs));
+        });
     },
     /**
      * The pending-captures queue drained into the store (core's ingestPendingCaptures): at every boot after the journal's replay,

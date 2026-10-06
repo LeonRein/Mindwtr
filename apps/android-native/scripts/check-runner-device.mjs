@@ -37,7 +37,7 @@ if (!serial) {
     process.exit(2);
 }
 const app = resolve(import.meta.dirname, '..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const adbBin = process.env.ADB ?? '/home/dd/Android/Sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
 const PKG = 'tech.dongdongbh.mindwtr.nativeclient.dev';
@@ -338,8 +338,10 @@ try {
         check(task.status === 'next' && JSON.parse(task.contexts ?? '[]').includes(`@${context}`),
             `(2d) CoreWork stored the capture at once, read as quick-add: next, @${context}`);
         await sleep(2000);
-        check(stored(title(4)).length === 1 && stored(title(5)).length === 1 && count(allLogs(), ...INGESTED) > jobs,
-            '(2d) each capture is stored once, by CoreWork\'s ingest job');
+        check(stored(title(4)).length === 1 && stored(title(5)).length === 1, '(2d) each capture is stored once');
+        // The ingest job ends once its capture sync settled (pass S4a), which can be after the store write.
+        await waitUntil('CoreWork\'s ingest job to end', () => count(allLogs(), ...INGESTED) > jobs, 300_000, 2_000);
+        check(stored(title(4)).length === 1 && stored(title(5)).length === 1, '(2d) each capture is stored once, by CoreWork\'s ingest job');
         check(queued().length === before.length, '(2d) their queue files are gone');
     }
 

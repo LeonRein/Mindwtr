@@ -77,6 +77,21 @@ android {
         }
     }
 
+    // RN's two Android channels (D8) as product flavors: RN builds one or the other with FOSS_BUILD (apps/mobile/app.config.ts).
+    // A FOSS build hides Dropbox and the Play-only parts and defaults speech to offline Whisper: core reads BuildConfig.FOSS as
+    // RN's isFossBuild. Both keep RN's package; a channel is its signing key.
+    flavorDimensions += "channel"
+    productFlavors {
+        create("play") {
+            dimension = "channel"
+            buildConfigField("boolean", "FOSS", "false")
+        }
+        create("foss") {
+            dimension = "channel"
+            buildConfigField("boolean", "FOSS", "true")
+        }
+    }
+
     // RN's app shortcuts, generated per build type (buildShortcuts below).
     sourceSets { urlSchemes.keys.forEach { getByName(it).res.srcDir(layout.buildDirectory.dir("generated/shortcuts/$it/res")) } }
     // RN's attachment installer Kotlin, with its JVM tests, compiled as it is (rnAttachmentInstaller below); RN's widget
@@ -165,7 +180,7 @@ tasks.withType<com.android.build.gradle.tasks.MergeSourceSetFolders>().configure
     if (name.startsWith("merge") && name.endsWith("Assets") && !name.contains("Test")) {
         val execs = providers
         doLast {
-            val traced = if (name == "mergeBenchmarkTraceAssets") "--allow-module-trace" else null
+            val traced = if (name.endsWith("BenchmarkTraceAssets")) "--allow-module-trace" else null
             execs.exec { commandLine(listOfNotNull("node", verifyBundle, outputDir.get().asFile.resolve("core-host.js").path, traced)) }.result.get().assertNormalExitValue()
         }
     }
@@ -218,6 +233,7 @@ val rnAttachmentInstaller by tasks.registering(Sync::class) {
     into(layout.buildDirectory.dir("generated/rnInstaller"))
 }
 tasks.named("preBuild") { dependsOn(buildCoreBundle, buildShortcuts, buildWidgets, rnAttachmentInstaller) }
-tasks.matching { it.name == "preBenchmarkTraceBuild" }.configureEach { dependsOn(buildTracedCoreBundle) }
-// The widget module's RN tests (Robolectric) run with the app's.
-tasks.matching { it.name == "testDebugUnitTest" }.configureEach { dependsOn(":widget:testDebugUnitTest") }
+tasks.matching { it.name.startsWith("pre") && it.name.endsWith("BenchmarkTraceBuild") }.configureEach { dependsOn(buildTracedCoreBundle) }
+// Both channels' JVM tests under the one name the gates and CI run (flavors leave no testDebugUnitTest), with the widget module's
+// RN tests (Robolectric).
+tasks.register("testDebugUnitTest") { dependsOn("testPlayDebugUnitTest", "testFossDebugUnitTest", ":widget:testDebugUnitTest") }

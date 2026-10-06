@@ -81,6 +81,8 @@ export type MobileBackgroundSyncPorts = {
   /** App lifecycle changes ('active' when the app comes to the foreground). */
   onAppStateChange(listener: (state: string) => void): { remove(): void };
   now?: () => number;
+  /** The run's deadline when the host shortens it (the native app's debug device check only); else MOBILE_BACKGROUND_SYNC_DEADLINE_MS. */
+  deadlineMs?: () => number;
 };
 
 const withDeadline = <T>(work: Promise<T>, deadlineMs: number, onDeadline: () => T): Promise<T> => (
@@ -263,7 +265,8 @@ export const createMobileBackgroundSyncRunner = (ports: MobileBackgroundSyncPort
     // work and can take a while after a long backlog. Counting from startedAt
     // would hand the sync whatever is left of the four minutes — possibly none
     // of it, abandoning a run that never began and arming the failure cooldown.
-    const deadlineAt = now() + MOBILE_BACKGROUND_SYNC_DEADLINE_MS;
+    const deadlineMs = ports.deadlineMs?.() ?? MOBILE_BACKGROUND_SYNC_DEADLINE_MS;
+    const deadlineAt = now() + deadlineMs;
     ports.sync.setRequestDeadline(deadlineAt);
     // A "started" line without its "finished" line in a shared log is the
     // signature of a run that never settled (#1001).
@@ -287,7 +290,7 @@ export const createMobileBackgroundSyncRunner = (ports: MobileBackgroundSyncPort
             scope: 'sync',
             force: true,
             extra: {
-              deadlineMs: String(MOBILE_BACKGROUND_SYNC_DEADLINE_MS),
+              deadlineMs: String(deadlineMs),
               elapsedMs: String(now() - startedAt),
               stage,
               releaseCheck: 'v1.3.2/background-sync-wallclock-abort',

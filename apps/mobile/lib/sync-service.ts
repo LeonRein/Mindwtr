@@ -253,8 +253,9 @@ export const performMobileSync: MobileSyncService['performMobileSync'] = (syncPa
 
 export { setBackgroundSafeFetchDeadline as setMobileSyncRequestDeadline };
 
-export function abortMobileSync(): boolean {
-  return mobileSyncService().abortMobileSync();
+/** 'deadline' (the background run gave up) ends the cycle with no follow-up; 'lifecycle' queues one. */
+export function abortMobileSync(reason?: 'lifecycle' | 'deadline'): boolean {
+  return mobileSyncService().abortMobileSync(reason);
 }
 
 export const __mobileSyncTestUtils = {

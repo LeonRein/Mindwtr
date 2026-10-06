@@ -119,7 +119,8 @@ internal object ProcessCoreHost {
             File(app.filesDir, "journal"), deviceStore(app), File(app.filesDir, DiagnosticsLogFile.RELATIVE_PATH),
             keyValue, HostFiles(app.filesDir, app.cacheDir, content = AndroidContentSource(app)), installer,
             ReminderAlarms(app, keyValue, checkpointRnState = { if (legacy != null) LegacyRnStoreGuard.checkpointRnState(app.dataDir) }),
-            HostWidgets(app) { appState })
+            HostWidgets(app) { appState },
+            scheduleBackgroundSync = { on -> CoreWork.scheduleSyncStored(app, on) })
         try {
             runtime.start(coreBundle(app), legacy?.bootState ?: "", legacy?.backup ?: "")
             setLanguage(runtime, language ?: legacy?.language)
@@ -160,15 +161,39 @@ internal object ProcessCoreHost {
     /** The boot's widget publication, held with it; null once it ran. */
     private val deferredWidgets = HeldPublication<CoreHost>()
 
+    /** Set once a screen of this process showed its content: from then on sync's triggers start at once ([startSyncWithScreen]). */
+    private var screenShown = false
+
     /**
      * The first screen shows its content (the Inbox's first rows, another tab's boot read, or the screen's fallback): the boot's
      * held sync start runs now, on the sync thread. It stays after the boot's journal replay and queue drain, as before; only
      * the first screen no longer waits for it.
      */
     fun startDeferredSync(trigger: String = "content") {
-        deferredSync.getAndSet(null)?.let { start -> syncThread.execute { start() } }
+        synchronized(deferredSync) {
+            screenShown = true
+            deferredSync.getAndSet(null)
+        }?.let { start -> syncThread.execute { start() } }
         deferredWidgets.take()?.let { publishHeldWidgets(it, trigger) }
     }
+
+    /**
+     * Sync's triggers in a CoreWork job's recovery: at once once a screen showed, else held for the first screen, as RN's headless
+     * runs never mount its root layout's triggers. A process with no screen syncs only through core's background run (CoreJob),
+     * which the job awaits; a trigger's sync there would outlive the job's protection.
+     */
+    private fun startSyncWithScreen(app: Application, runtime: CoreHost) {
+        val now = synchronized(deferredSync) {
+            // A boot's held start already waiting covers this one.
+            if (!screenShown) deferredSync.compareAndSet(null) { startSync(app, runtime) }
+            screenShown
+        }
+        if (now) startSync(app, runtime)
+    }
+
+
+    /** Whether MainActivity is resumed (RN's AppState "active"). */
+    val appActive get() = appState == "active"
 
     /**
      * The write journal's replay: after the validated load, before this boot hands the host to any screen or entry point
@@ -258,14 +283,16 @@ internal object ProcessCoreHost {
         drain = { drain(runtime, queue(app), app) },
         owe = { message -> recordFailure(PendingFailure(FailedAction("journal", ""), message, null)) },
         retryLater = { runCatching { CoreWork.retryDrain(app) }.onFailure { Log.w(CoreHost.TAG, "Native Android drain retry not queued", it) } },
-        // The boot's start waits for the first screen's content (startDeferredSync); CoreWork's and a retry's start at once. The
-        // reminder alarms start with sync.
+        // The boot's start waits for the first screen's content (startDeferredSync); a retry's starts at once, CoreWork's once a
+        // screen showed (startSyncWithScreen). The reminder alarms start with sync; CoreWork's at once.
         startSync = {
-            val start = {
+            if (deferSync) deferredSync.set {
                 startSync(app, runtime)
                 startReminders(runtime)
+            } else {
+                startSyncWithScreen(app, runtime)
+                startReminders(runtime)
             }
-            if (deferSync) deferredSync.set(start) else start()
         },
         refreshWidgets = { refreshWidgets(runtime) },
     )
@@ -392,6 +419,8 @@ internal object ProcessCoreHost {
         }
         return try {
             val ingested = runtime.ingestPendingCaptures(UUID.randomUUID().toString()).optInt("ingested")
+            // A count not stored only means the capture waits for the scheduled job: the drain itself stands.
+            runCatching { CoreWork.owedUploads(app).add(ingested) }.onFailure { Log.w(CoreHost.TAG, "Native Android owed upload count not stored", it) }
             runtime.logLine("Native Android queue drain", JSONObject().put("outcome", "drained").put("ingested", ingested))
             drained
         } catch (error: Throwable) {

@@ -52,6 +52,8 @@ class CoreHost(
     private val reminders: Reminders? = null,
     /** RN's home-screen widgets (bundle/host-widgets.ts publishes through it); null: this host has none. */
     private val widgets: HostWidgets? = null,
+    /** The background sync job kept scheduled or cancelled, as core decides (CoreWork.scheduleSync); null: this host has none. */
+    private val scheduleBackgroundSync: ((Boolean) -> Unit)? = null,
 ) {
     /**
      * Reminder alarms on the platform (pilot/Reminders.kt): core's plan applied in core's order, the notification permission as RN
@@ -376,7 +378,10 @@ class CoreHost(
             bridge.setProperty("widgetPublish", guarded { args -> widgets.publish(args[0] as String); null })
             bridge.setProperty("widgetAppState", guarded { _ -> widgets.appState() })
         }
+        scheduleBackgroundSync?.let { schedule -> bridge.setProperty("bgSyncSchedule", guarded { args -> schedule(args[0] as Boolean); null }) }
         engine.globalObject.setProperty("__mindwtrNative", bridge)
+        // The build's flavor (D8): core reads it as RN's isFossBuild.
+        engine.globalObject.setProperty("__mindwtrFossBuild", BuildConfig.FOSS)
     }
 
     /**
@@ -613,6 +618,15 @@ class CoreHost(
 
     /** The sync badge and the finished-cycle count now. */
     fun syncState(): JSONObject = callAsync("syncState")
+
+    /**
+     * Core's background run (bundle/host-sync.ts backgroundSync) for CoreWork's capture and sync jobs, after the start order:
+     * [trigger] "capture" or "scheduled", [stored] what the queue drains stored. It syncs for up to core's 4 min deadline, so it
+     * never holds the engine ([callLong]); it settles with the run. `{ schedule }`: whether the sync job runs again. Debug builds
+     * only: `debug.mindwtr.native.bgsync_deadline_ms` shortens that deadline, for check-bgsync-device.mjs.
+     */
+    fun backgroundSync(trigger: String, stored: Int): JSONObject =
+        callLong("backgroundSync", trigger, stored, debugFault("bgsync_deadline_ms").toIntOrNull() ?: 0)
 
     /**
      * A Settings › Sync screen command (host-entry.ts MENU_COMMANDS, one of WriteJournal.UNJOURNALED) with [json] unchanged. It

@@ -135,6 +135,25 @@ describe('mobile background sync policy', () => {
     expect(fake.failureRecord()).toMatchObject({ consecutiveFailures: 1 });
   });
 
+  it('abandons a run at the deadline its host gives (the native app\'s debug check), and logs that deadline', async () => {
+    vi.useFakeTimers();
+    const fake = createPorts({ performSync: vi.fn(() => new Promise<never>(() => undefined)) });
+    const runner = createMobileBackgroundSyncRunner({ ...fake.ports, deadlineMs: () => 15_000 });
+
+    const run = runner.run('scheduled');
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(fake.ports.sync.abort).not.toHaveBeenCalled();
+    expect(fake.ports.sync.setRequestDeadline.mock.calls[0]?.[0]).toBe(Date.now() + 1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(run).resolves.toBe('failed');
+    expect(fake.ports.sync.abort).toHaveBeenCalledTimes(1);
+    expect(fake.logs).toContainEqual(expect.objectContaining({
+      message: 'Mobile background sync did not finish before its deadline and was abandoned',
+      extra: expect.objectContaining({ deadlineMs: '15000', stage: 'timer' }),
+    }));
+  });
+
   it('abandons a run resumed past its deadline as soon as the app is active again', async () => {
     vi.useFakeTimers();
     const fake = createPorts({ performSync: vi.fn(() => new Promise<never>(() => undefined)) });

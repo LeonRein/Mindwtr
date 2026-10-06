@@ -38,7 +38,7 @@ if (!serial) {
 }
 const app = resolve(import.meta.dirname, '..');
 const repo = resolve(app, '../..');
-const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const apk = apkArg ?? resolve(app, 'android/app/build/outputs/apk/play/debug/app-play-debug.apk');
 const bundle = resolve(app, 'android/app/src/main/assets/core-host.js');
 const adbBin = process.env.ADB ?? '/opt/android-sdk/platform-tools/adb';
 const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';

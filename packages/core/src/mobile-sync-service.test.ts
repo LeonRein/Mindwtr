@@ -397,6 +397,49 @@ describe('mobile sync service behind fake ports', () => {
     expect(performSyncCycle).toHaveBeenCalledTimes(2);
   });
 
+  it('ends a cycle the background run abandons at its deadline as a failure, with no follow-up', async () => {
+    const fake = createFakeHost({ values: WEBDAV_VALUES });
+    const service = createMobileSyncService(fake.host);
+    const performSyncCycle = vi.mocked(fake.host.core!.performSyncCycle!);
+    performSyncCycle.mockImplementationOnce(async () => {
+      expect(service.abortMobileSync('deadline')).toBe(true);
+      throw new Error('aborted');
+    });
+
+    const result = await service.performMobileSync();
+
+    expect(result.success).toBe(false);
+    expect(fake.logs.some((line) => line.message === 'Sync aborted at the background run\'s deadline')).toBe(true);
+    await service.waitForMobileSyncIdle();
+    // The background job retries later (its failure cooldown); no unowned cycle starts after it.
+    expect(performSyncCycle).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a deadline stop through the app opening and closing during its cleanup: no follow-up, no second cycle (review S4a 1)', async () => {
+    const fake = createFakeHost({ values: WEBDAV_VALUES });
+    const service = createMobileSyncService(fake.host);
+    const performSyncCycle = vi.mocked(fake.host.core!.performSyncCycle!);
+    let joined: Promise<unknown> | null = null;
+    performSyncCycle.mockImplementationOnce(async () => {
+      // The background run gives up at its deadline...
+      expect(service.abortMobileSync('deadline')).toBe(true);
+      // ...the app opens (its resume asks for a sync, which queues behind this cycle)...
+      joined = service.performMobileSync();
+      // ...and closes again (its leave aborts as a lifecycle change) before the cycle has ended.
+      service.abortMobileSync();
+      throw new Error('aborted');
+    });
+
+    const result = await service.performMobileSync();
+    await joined;
+
+    expect(result.success).toBe(false);
+    expect(fake.logs.some((line) => line.message === 'Sync aborted at the background run\'s deadline')).toBe(true);
+    expect(fake.logs.some((line) => line.message === 'Sync aborted by app lifecycle transition')).toBe(false);
+    await service.waitForMobileSyncIdle();
+    expect(performSyncCycle).toHaveBeenCalledTimes(1);
+  });
+
   it('never syncs a location this device holds as partly encrypted, manual or automatic', async () => {
     const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
     const scope = await readSyncLocationScope({ getItem: async (key: string) => fake.values.get(key) ?? null });
