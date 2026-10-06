@@ -130,7 +130,7 @@ internal object ProcessCoreHost {
             if (replay(runtime)) recovered(app, runtime, deferSync = true)
             // The widgets show what this boot loaded (a store change before the validated load published nothing), once the first
             // screen shows its content, as the boot's sync start waits; a CoreWork job publishes at its end.
-            deferredWidgets.set(runtime)
+            deferredWidgets.hold(runtime)
             return runtime
         } catch (failure: Throwable) {
             runCatching { runtime.close() }
@@ -158,7 +158,7 @@ internal object ProcessCoreHost {
     /** The boot's sync start, held until the first screen shows its content ([startDeferredSync]); null once it ran. */
     private val deferredSync = AtomicReference<(() -> Unit)?>(null)
     /** The boot's widget publication, held with it; null once it ran. */
-    private val deferredWidgets = AtomicReference<CoreHost?>(null)
+    private val deferredWidgets = HeldPublication<CoreHost>()
 
     /**
      * The first screen shows its content (the Inbox's first rows, another tab's boot read, or the screen's fallback): the boot's
@@ -167,7 +167,7 @@ internal object ProcessCoreHost {
      */
     fun startDeferredSync() {
         deferredSync.getAndSet(null)?.let { start -> syncThread.execute { start() } }
-        deferredWidgets.getAndSet(null)?.let(::refreshWidgets)
+        deferredWidgets.take()?.let { publishHeldWidgets(it, "content") }
     }
 
     /**
@@ -307,6 +307,12 @@ internal object ProcessCoreHost {
         return start.optBoolean("ask")
     }
 
+    /** A held publication (the boot's or a resume's) runs: after the screen's first content, or after the fallback. */
+    private fun publishHeldWidgets(runtime: CoreHost, trigger: String) {
+        Log.i(CoreHost.TAG, "Native Android held widget publication releaseCheck=v1.3.5/widget-publication-after-content trigger=$trigger")
+        refreshWidgets(runtime)
+    }
+
     /** The home-screen widgets published from the store now if what they show changed, off the caller's thread. */
     private fun refreshWidgets(runtime: CoreHost) = widgetThread.execute {
         runCatching { runtime.refreshWidgets() }.onFailure { Log.w(CoreHost.TAG, "Native Android widget refresh failed", it) }
@@ -329,10 +335,12 @@ internal object ProcessCoreHost {
         // 5,000 tasks drew 130 ms later); a resume that draws nothing new publishes after the fallback.
         boot?.takeIf { it.isDone }?.let { task -> runCatching { task.get() }.getOrNull() }?.let { runtime ->
             if (state == "active") {
-                deferredWidgets.set(runtime)
-                widgetThread.schedule({ deferredWidgets.getAndSet(null)?.let(::refreshWidgets) }, WIDGET_FALLBACK_MS, TimeUnit.MILLISECONDS)
+                // Its own generation: a fallback left from an earlier resume never takes this hold before this screen draws.
+                val generation = deferredWidgets.hold(runtime)
+                widgetThread.schedule({ deferredWidgets.takeIf(generation)?.let { publishHeldWidgets(it, "fallback") } },
+                    WIDGET_FALLBACK_MS, TimeUnit.MILLISECONDS)
             } else {
-                deferredWidgets.set(null)
+                deferredWidgets.clear()
                 refreshWidgets(runtime)
             }
         }
