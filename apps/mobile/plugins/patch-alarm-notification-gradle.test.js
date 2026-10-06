@@ -51,6 +51,9 @@ const applyAlarmIosDeletePendingPatchToSource = transformFor('alarm-ios-delete-p
 const applyAlarmIosPendingKindPatchToSource = transformFor('alarm-ios-pending-kind');
 const applyAlarmReminderSlotPatchToSource = transformFor('alarm-reminder-slot');
 const applyAlarmIosReminderThreadPatchToSource = transformFor('alarm-ios-reminder-thread');
+const applyAlarmReminderActionsUtilPatchToSource = transformFor('alarm-reminder-actions-util');
+const applyAlarmReminderActionsReceiverPatchToSource = transformFor('alarm-reminder-actions-receiver');
+const applyAlarmIosCompleteCancelsTaskPatchToSource = transformFor('alarm-ios-complete-cancels-task');
 
 const installedAlarmPackage = path.join(testDirectory, '..', '..', '..', 'node_modules', 'react-native-alarm-notification');
 
@@ -1081,7 +1084,12 @@ RCT_EXPORT_METHOD(removeFiredNotification: (NSInteger)id){
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'alarm-java-slot-'));
     try {
       const util = read('android', 'src', 'main', 'java', 'com', 'emekalites', 'react', 'alarm', 'notification', 'AlarmUtil.java');
-      const helpers = util.slice(util.indexOf('    // Mindwtr reminder notification slots'), util.indexOf('    void removeFiredNotification(int id) {'));
+      const helpersStart = util.indexOf('    // Mindwtr reminder notification slots');
+      // The slot helpers alone: the task reminder actions after them need the alarm database.
+      const helpersEnd = [util.indexOf('    // Mindwtr task reminder actions'), util.indexOf('    void removeFiredNotification(int id) {')]
+        .filter((index) => index > helpersStart)
+        .reduce((first, index) => Math.min(first, index));
+      const helpers = util.slice(helpersStart, helpersEnd);
       fs.mkdirSync(path.join(dir, 'android', 'content'), { recursive: true });
       fs.writeFileSync(path.join(dir, 'android', 'content', 'SharedPreferences.java'), `package android.content;
 public interface SharedPreferences {
@@ -1188,6 +1196,96 @@ ${helpers}
     }
   }, 30_000);
 
+  it('makes Snooze from the intent\'s alarm and makes Done cancel the task\'s other reminders', () => {
+    if (!fs.existsSync(installedAlarmPackage)) return;
+    const { tmpRoot, read } = patchInstalledPackage();
+    try {
+      const javaDir = ['android', 'src', 'main', 'java', 'com', 'emekalites', 'react', 'alarm', 'notification'];
+      const util = read(...javaDir, 'AlarmUtil.java');
+      const receiver = read(...javaDir, 'AlarmReceiver.java');
+      expect(util).toContain('snoozeIntent.putExtra("SnoozeAlarm", new com.google.gson.Gson().toJson(alarm));');
+      expect(util).toContain('completeIntent.putExtra("ReminderTag", alarm.getTag() == null ? "" : alarm.getTag());');
+
+      // Snooze: a live row first, then the intent's alarm, and only without either a plain dismiss.
+      const snoozeCase = receiver.slice(receiver.indexOf('case Constants.NOTIFICATION_ACTION_SNOOZE:'), receiver.indexOf('case Constants.NOTIFICATION_ACTION_COMPLETE:'));
+      const order = ['alarmUtil.snoozeAlarm(alarm);', 'alarmUtil.snoozeAlarm(carried);', 'alarmUtil.clearNotification('].map((call) => snoozeCase.indexOf(call));
+      expect(order.every((index) => index >= 0)).toBe(true);
+      expect([...order].sort((a, b) => a - b)).toEqual(order);
+
+      // Done: the task's other reminders go before JS hears of it; only without JS is the tap kept on disk.
+      const completeCase = receiver.slice(receiver.indexOf('case Constants.NOTIFICATION_ACTION_COMPLETE:'), receiver.indexOf('case Constants.NOTIFICATION_ACTION_DISMISS:'));
+      expect(completeCase.indexOf('alarmUtil.cancelTaskReminders(reminderTag, payload.getString("taskId"))')).toBeGreaterThan(-1);
+      expect(completeCase.indexOf('cancelTaskReminders')).toBeLessThan(completeCase.indexOf('emit("OnNotificationOpened"'));
+      expect(completeCase.indexOf('NotificationOpenPayloadStore.persistCompletion(context, pendingPayload);'))
+        .toBeGreaterThan(completeCase.indexOf('} else {\n                                // No JS to tell'));
+      expect(receiver.match(/persistCompletion/g)).toHaveLength(1);
+
+      expect(applyAlarmReminderActionsUtilPatchToSource(util)).toBe(util);
+      expect(applyAlarmReminderActionsReceiverPatchToSource(receiver)).toBe(receiver);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('matches Done to the same task\'s reminders only, never the Pomodoro alert (compiled)', () => {
+    if (!fs.existsSync(installedAlarmPackage)) return;
+    const { tmpRoot, read } = patchInstalledPackage();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'alarm-java-task-'));
+    try {
+      const util = read('android', 'src', 'main', 'java', 'com', 'emekalites', 'react', 'alarm', 'notification', 'AlarmUtil.java');
+      const start = util.indexOf('    static boolean isReminderOfTask(');
+      const helper = util.slice(start, util.indexOf('\n    }\n', start) + 7);
+      fs.writeFileSync(path.join(dir, 'TaskMatch.java'), `public class TaskMatch {
+${helper}
+  static void check(boolean ok, String what) { if (!ok) throw new AssertionError(what); }
+  public static void main(String[] args) {
+    String tag = "mindwtr-reminder:task:a";
+    check(isReminderOfTask(tag, null, tag, "a"), "same tag");
+    check(!isReminderOfTask("mindwtr-reminder:task:b", "taskId==>b;;kind==>task-reminder;;", tag, "a"), "other task");
+    check(isReminderOfTask("", "taskId==>a;;kind==>task-reminder;;alarmKey==>task:a:r3;;", tag, "a"), "untagged repeat of the task");
+    check(isReminderOfTask(null, "kind==>task-review;;taskId==>a;;", "", "a"), "review reminder of the task");
+    check(!isReminderOfTask("", "kind==>pomodoro;;taskId==>a;;", tag, "a"), "Pomodoro alert");
+    check(!isReminderOfTask("", "taskId==>ab;;kind==>task-reminder;;", tag, "a"), "id prefix");
+    check(!isReminderOfTask("", null, "", ""), "nothing to match");
+    check(!isReminderOfTask("", "taskId==>a;;kind==>task-reminder;;", "", null), "no task id");
+  }
+}`);
+      const compile = spawnSync('javac', ['TaskMatch.java'], { cwd: dir, encoding: 'utf8' });
+      expect(compile.status, compile.stderr).toBe(0);
+      const run = spawnSync('java', ['TaskMatch'], { cwd: dir, encoding: 'utf8' });
+      expect(run.status, run.stderr).toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('keeps the iOS Done call although the complete-action patch rewrites its handler on every pass', () => {
+    if (!fs.existsSync(installedAlarmPackage)) return;
+    const { tmpRoot, read } = patchInstalledPackage();
+    try {
+      // patchInstalledPackage ran one pass; a second prebuild runs the registry again on the patched files.
+      applyPatches(path.join(tmpRoot, 'apps', 'mobile'), PATCHES);
+      const module = read('ios', 'RnAlarmNotification.m');
+      const completeBranch = module.slice(module.indexOf('isEqualToString:@"COMPLETE_ACTION"'), module.indexOf('isEqualToString:@"SNOOZE_ACTION"'));
+      expect(completeBranch.match(/mindwtrRemoveTaskReminders\(response\.notification\);/g)).toHaveLength(1);
+      expect(module.match(/static void mindwtrRemoveTaskReminders\(/g)).toHaveLength(1);
+      expect(module).toContain('[(NSString *)kind hasPrefix:@"task-"]');
+      expect(applyAlarmIosCompleteCancelsTaskPatchToSource(module)).toBe(module);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('throws naming the anchor when a reminder action anchor drifts', () => {
+    const util = `    void removeFiredNotification(int id) {
+    }
+`;
+    expect(() => applyAlarmReminderActionsUtilPatchToSource(util)).toThrow(/alarm-reminder-actions-util: expected anchor not found/);
+    const receiver = 'switch (action) { case Constants.NOTIFICATION_ACTION_COMPLETE: break; }';
+    expect(() => applyAlarmReminderActionsReceiverPatchToSource(receiver)).toThrow(/alarm-reminder-actions-receiver: expected anchor not found/);
+  });
+
   it('keeps the Gradle compatibility rewrite in place', () => {
     const input = `apply plugin: 'maven'
 buildscript {
@@ -1272,6 +1370,11 @@ describe('PATCHES registry completeness', () => {
     // per occurrence (a 10-minute repeat stacks six an hour) instead of one per task.
     ['AlarmUtil.java', 'applyAlarmReminderSlotPatchToSource'],
     ['RnAlarmNotification.m', 'applyAlarmIosReminderThreadPatchToSource'],
+    // Added for the reminder buttons: dropping one brings back a Snooze that never
+    // reminds again, or a Done after which the task's next repeat still fires.
+    ['AlarmUtil.java', 'applyAlarmReminderActionsUtilPatchToSource'],
+    ['AlarmReceiver.java', 'applyAlarmReminderActionsReceiverPatchToSource'],
+    ['RnAlarmNotification.m', 'applyAlarmIosCompleteCancelsTaskPatchToSource'],
   ];
 
   it('has exactly one registry entry per original call site — none dropped in the collapse', () => {
@@ -1285,7 +1388,7 @@ describe('PATCHES registry completeness', () => {
   });
 
   it('every entry declares required/firstMatchOnly explicitly', () => {
-    expect(PATCHES).toHaveLength(28);
+    expect(PATCHES).toHaveLength(31);
     for (const patch of PATCHES) {
       expect(typeof patch.id).toBe('string');
       expect(typeof patch.required).toBe('boolean');
@@ -1530,6 +1633,8 @@ describe('pristine react-native-alarm-notification@1.8.0 fixture (#1028 correcti
       expect(utilOut1).toContain('dismissIntent.putExtra("NotificationId", notificationID);');
       expect(utilOut1).toContain('void clearNotification(int notificationId)');
       expect(utilOut1).toContain('// Mindwtr reminder notification slots');
+      expect(utilOut1).toContain('// Mindwtr task reminder actions');
+      expect(receiverOut1).toContain('cancelTaskReminders(reminderTag');
       expect(receiverOut1).toContain('Log.d(TAG, "ACTION_SNOOZE id="');
       expect(receiverOut1).toContain('Log.d(TAG, "ACTION_COMPLETE id="');
       expect(receiverOut1).toContain('Log.d(TAG, "ACTION_DISMISS id="');

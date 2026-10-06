@@ -1132,6 +1132,120 @@ const applyAlarmReminderSlotPatchToSource = (original) => {
   return next;
 };
 
+// Two notification buttons failed once a reminder cycle had reaped the fired
+// alarm's row (it does on the next app start, or 5 s after a reminder while the
+// app is in front): Snooze degraded to a plain dismiss, so it never reminded
+// again. And Done only reached JS, which cancels the task's other alarms on its
+// next cycle; JS timers stop while the app is in the background, so a task's
+// next due-time repeat still fired for the task just completed. Now the snooze
+// intent carries the alarm itself, and Done cancels the task's other armed
+// reminders natively: the same per-task tag, or, for an alarm armed before
+// tags, a task reminder with the same taskId (never the Pomodoro alert).
+const REMINDER_ACTION_HELPERS = `    // Mindwtr task reminder actions
+    // Whether an alarm (its tag, and its data as "key==>value;;" pairs) is a reminder of the
+    // task Done was tapped for.
+    static boolean isReminderOfTask(String otherTag, String otherData, String tag, String taskId) {
+        if (tag != null && !tag.equals("") && tag.equals(otherTag)) return true;
+        if (taskId == null || taskId.equals("") || otherData == null) return false;
+        String otherTaskId = null;
+        String otherKind = null;
+        for (String item : otherData.split(";;")) {
+            int separator = item.indexOf("==>");
+            if (separator < 0) continue;
+            String key = item.substring(0, separator);
+            String value = item.substring(separator + 3);
+            if (key.equals("taskId")) otherTaskId = value;
+            else if (key.equals("kind")) otherKind = value;
+        }
+        return taskId.equals(otherTaskId) && otherKind != null && otherKind.startsWith("task-");
+    }
+
+    // Done on a task's reminder: the task's other armed reminders (its remaining due-time
+    // repeats, a snooze) never fire, even while the app has not seen the Done yet.
+    int cancelTaskReminders(String tag, String taskId) {
+        int cancelled = 0;
+        for (AlarmModel other : getAlarmDB().getAlarmList(1)) {
+            if (!isReminderOfTask(other.getTag(), other.getData(), tag, taskId)) continue;
+            cancelAlarm(other, true);
+            cancelled++;
+        }
+        return cancelled;
+    }
+
+`;
+
+const replaceRequiredAnchors = (source, id, replacements) => {
+  let next = source;
+  for (const [anchor, replacement] of replacements) {
+    if (!next.includes(anchor)) {
+      throw new Error(`${id}: expected anchor not found: ${anchor.trim().split('\n')[0]}`);
+    }
+    next = next.replace(anchor, replacement);
+  }
+  return next;
+};
+
+const applyAlarmReminderActionsUtilPatchToSource = (original) => {
+  if (original.includes('// Mindwtr task reminder actions')) return original;
+  const removeFiredMarker = '    void removeFiredNotification(int id) {';
+  if (!original.includes(removeFiredMarker)) return original;
+  return replaceRequiredAnchors(original, 'alarm-reminder-actions-util', [
+    [removeFiredMarker, `${REMINDER_ACTION_HELPERS}${removeFiredMarker}`],
+    [
+      '                completeIntent.putExtra("NotificationId", notificationID);\n',
+      '                completeIntent.putExtra("NotificationId", notificationID);\n'
+        + '                completeIntent.putExtra("ReminderTag", alarm.getTag() == null ? "" : alarm.getTag());\n',
+    ],
+    [
+      '                snoozeIntent.putExtra("NotificationId", notificationID);\n',
+      '                snoozeIntent.putExtra("NotificationId", notificationID);\n'
+        + '                snoozeIntent.putExtra("SnoozeAlarm", new com.google.gson.Gson().toJson(alarm));\n',
+    ],
+  ]);
+};
+
+const applyAlarmReminderActionsReceiverPatchToSource = (original) => {
+  if (original.includes('cancelTaskReminders(reminderTag')) return original;
+  if (!original.includes('case Constants.NOTIFICATION_ACTION_COMPLETE')) return original;
+  return replaceRequiredAnchors(original, 'alarm-reminder-actions-receiver', [
+    [
+      `                            } else if (intent.getExtras().containsKey("NotificationId")) {
+                                // Dead row: degrade snooze to dismiss instead of`,
+      `                            } else if (intent.getExtras().getString("SnoozeAlarm") != null) {
+                                // Dead row: the intent carries the fired alarm, so the
+                                // snooze is made from it instead of being dropped.
+                                AlarmModel carried = new com.google.gson.Gson().fromJson(intent.getExtras().getString("SnoozeAlarm"), AlarmModel.class);
+                                alarmUtil.snoozeAlarm(carried);
+                                Log.d(TAG, "ACTION_SNOOZE snoozed from the intent's alarm");
+                            } else if (intent.getExtras().containsKey("NotificationId")) {
+                                // Dead row: degrade snooze to dismiss instead of`,
+    ],
+    [
+      `                            alarmUtil.stopAlarmSound();
+
+                            if (ANModule.getReactAppContext() != null) {
+                                ANModule.getReactAppContext().getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit("OnNotificationOpened"`,
+      `                            alarmUtil.stopAlarmSound();
+
+                            String reminderTag = alarm != null ? alarm.getTag() : intent.getExtras().getString("ReminderTag");
+                            int cancelledReminders = alarmUtil.cancelTaskReminders(reminderTag, payload.getString("taskId"));
+                            Log.d(TAG, "ACTION_COMPLETE cancelled task reminders=" + cancelledReminders);
+
+                            if (ANModule.getReactAppContext() != null) {
+                                ANModule.getReactAppContext().getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit("OnNotificationOpened"`,
+    ],
+    [
+      `                            } else {
+                                Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());`,
+      `                            } else {
+                                // No JS to tell: keep the Done on disk until the app next starts
+                                // (Android 12+ blocks the launch below from a notification button).
+                                NotificationOpenPayloadStore.persistCompletion(context, pendingPayload);
+                                Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());`,
+    ],
+  ]);
+};
+
 const getAndroidSourceCandidates = (projectRoot, fileName) => [
   path.join(projectRoot, 'node_modules', 'react-native-alarm-notification', 'android', 'src', 'main', 'java', 'com', 'emekalites', 'react', 'alarm', 'notification', fileName),
   path.join(projectRoot, '..', '..', 'node_modules', 'react-native-alarm-notification', 'android', 'src', 'main', 'java', 'com', 'emekalites', 'react', 'alarm', 'notification', fileName),
@@ -1437,6 +1551,65 @@ RCT_EXPORT_METHOD(collapseDeliveredReminderNotifications){
 ${removeAllMarker}`);
 };
 
+// Done on an iOS reminder removed only that one request: the task's remaining
+// due-time repeats stayed pending until JS next ran a reminder cycle. Remove
+// every pending and delivered reminder of the task: the same thread (one per
+// task), or, for a request made before threads, a task reminder with the same
+// taskId (never the Pomodoro alert). alarm-ios-complete-action rewrites the
+// whole response handler on every pass, so the call is checked (and added
+// again) on its own, after the helper.
+const IOS_COMPLETE_CANCELS_TASK_CALL = '           mindwtrRemoveTaskReminders(response.notification);\n';
+const applyAlarmIosCompleteCancelsTaskPatchToSource = (original) => {
+  const helperMarker = 'static NSString *stringify(NSDictionary *notification) {';
+  const completeMarker = '           [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[response.notification.request.identifier]];\n';
+  if (!original.includes(helperMarker) || !original.includes(completeMarker)) return original;
+  let next = original;
+  if (!next.includes(IOS_COMPLETE_CANCELS_TASK_CALL)) {
+    next = next.replace(completeMarker, `${completeMarker}${IOS_COMPLETE_CANCELS_TASK_CALL}`);
+  }
+  if (next.includes('// Mindwtr task reminder cancel')) return next;
+  return next
+    .replace(helperMarker, `// Mindwtr task reminder cancel: whether a request is a reminder of the task Done was tapped for.
+API_AVAILABLE(ios(10.0))
+static BOOL mindwtrIsReminderOfTask(UNNotificationContent *other, NSString *thread, NSString *taskId) {
+    if ([thread hasPrefix:@"mindwtr-reminder:task:"] && [other.threadIdentifier isEqualToString:thread]) return YES;
+    if (taskId.length == 0) return NO;
+    id data = other.userInfo[@"data"];
+    if (![data isKindOfClass:[NSDictionary class]]) return NO;
+    id kind = [(NSDictionary *)data objectForKey:@"kind"];
+    return [[(NSDictionary *)data objectForKey:@"taskId"] isEqual:taskId]
+        && [kind isKindOfClass:[NSString class]] && [(NSString *)kind hasPrefix:@"task-"];
+}
+
+// Done on a task's reminder: the task's other reminders (its remaining due-time repeats,
+// a snooze) are removed, pending and delivered.
+API_AVAILABLE(ios(10.0))
+static void mindwtrRemoveTaskReminders(UNNotification *notification) {
+    UNNotificationContent *content = notification.request.content;
+    NSString *thread = content.threadIdentifier;
+    id data = content.userInfo[@"data"];
+    id taskIdValue = [data isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)data objectForKey:@"taskId"] : nil;
+    NSString *taskId = [taskIdValue isKindOfClass:[NSString class]] ? (NSString *)taskIdValue : nil;
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    [center getPendingNotificationRequestsWithCompletionHandler:^(NSArray<UNNotificationRequest *> * _Nonnull requests) {
+        NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+        for (UNNotificationRequest *request in requests) {
+            if (mindwtrIsReminderOfTask(request.content, thread, taskId)) [identifiers addObject:request.identifier];
+        }
+        if (identifiers.count > 0) [center removePendingNotificationRequestsWithIdentifiers:identifiers];
+    }];
+    [center getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * _Nonnull delivered) {
+        NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+        for (UNNotification *shown in delivered) {
+            if (mindwtrIsReminderOfTask(shown.request.content, thread, taskId)) [identifiers addObject:shown.request.identifier];
+        }
+        if (identifiers.count > 0) [center removeDeliveredNotificationsWithIdentifiers:identifiers];
+    }];
+}
+
+${helperMarker}`);
+};
+
 const logPatchedCandidate = (label, candidate) => {
   console.log(`[${label}] patched ${candidate}`);
 };
@@ -1660,6 +1833,17 @@ const PATCHES = [
     appliedMarker: '// Mindwtr reminder notification slots',
   },
   {
+    id: 'alarm-reminder-actions-util',
+    platform: 'android',
+    getCandidates: androidJavaCandidates('AlarmUtil.java'),
+    transform: applyAlarmReminderActionsUtilPatchToSource,
+    required: true,
+    // Must run after alarm-dead-row-util: it extends the action intents that
+    // patch gives a NotificationId extra.
+    firstMatchOnly: false,
+    appliedMarker: '// Mindwtr task reminder actions',
+  },
+  {
     id: 'alarm-audio-interface',
     platform: 'android',
     getCandidates: androidJavaCandidates('AudioInterface.java'),
@@ -1727,6 +1911,16 @@ const PATCHES = [
     // produce.
     firstMatchOnly: false,
     appliedMarker: 'Log.d(TAG, "ACTION_SNOOZE id="',
+  },
+  {
+    id: 'alarm-reminder-actions-receiver',
+    platform: 'android',
+    getCandidates: androidJavaCandidates('AlarmReceiver.java'),
+    transform: applyAlarmReminderActionsReceiverPatchToSource,
+    required: true,
+    // Must run after alarm-dead-row-actions: it extends the hardened cases.
+    firstMatchOnly: false,
+    appliedMarker: 'cancelTaskReminders(reminderTag',
   },
   {
     id: 'alarm-complete-action-constants',
@@ -1811,6 +2005,16 @@ const PATCHES = [
     required: true,
     firstMatchOnly: true,
     appliedMarker: '// Mindwtr reminder threads',
+  },
+  {
+    id: 'alarm-ios-complete-cancels-task',
+    platform: 'ios',
+    getCandidates: iosSourceCandidates,
+    transform: applyAlarmIosCompleteCancelsTaskPatchToSource,
+    required: true,
+    // Must run after alarm-ios-complete-action: it extends the COMPLETE_ACTION branch.
+    firstMatchOnly: true,
+    appliedMarker: 'mindwtrRemoveTaskReminders(response.notification);',
   },
 ];
 
