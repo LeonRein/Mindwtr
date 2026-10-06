@@ -10,6 +10,7 @@ final class AttachmentOpenHostTests: XCTestCase {
     private var managed: URL { root.appendingPathComponent("attachment-files/documents/attachments", isDirectory: true) }
     private var cache: URL { root.appendingPathComponent("attachment-files/cache", isDirectory: true) }
     private let taskID = "file-open-task"
+    private let projectID = "file-open-project"
     private let at = "2026-10-06T12:00:00.000Z"
     override func setUpWithError() throws {
         guard let path = ProcessInfo.processInfo.environment["MINDWTR_CORE_BUNDLE"] else { throw XCTSkip("Set MINDWTR_CORE_BUNDLE") }
@@ -53,6 +54,19 @@ final class AttachmentOpenHostTests: XCTestCase {
     }
     private func opened(_ host: CoreHost, _ rows: [[String: Any]], id: String) async throws -> [String: Any] {
         try object(await host.prepareTaskFileOpen(requestJSON: request(rows, id: id)))
+    }
+    private func seedProject(_ attachments: [[String: Any]], status: String = "active") throws {
+        _ = try sql("INSERT INTO projects(id,title,status,color,supportNotes,attachments,createdAt,updatedAt,rev,revBy) VALUES (?,'Preserved Project',?,'#94a3b8','Preserved notes',?,?,?,1,'fixture')",
+            [projectID, status, try json(attachments), at, at])
+    }
+    private func projectRows() throws -> String { try json(NativeJSON.jsonObject(with: Data(sql("SELECT * FROM projects ORDER BY id").utf8))) }
+    private func projectOpened(_ host: CoreHost, id: String) async throws -> [String: Any] {
+        try object(await host.prepareProjectFileOpen(requestJSON: json(["projectId": projectID, "attachmentId": id])))
+    }
+    private func projectMarkers() throws -> Int {
+        let log = root.appendingPathComponent("logs/mindwtr.log")
+        guard FileManager.default.fileExists(atPath: log.path) else { return 0 }
+        return try String(contentsOf: log).components(separatedBy: "v1.3.5/ios-project-local-file-open").count - 1
     }
     private func markers() throws -> Int {
         let log = root.appendingPathComponent("logs/mindwtr.log")
@@ -219,12 +233,12 @@ final class AttachmentOpenHostTests: XCTestCase {
 
     // A private bundle extension drives real asynchronous JSC tickets. It adds
     // no production evaluator or command and leaves taskView/SQLite unchanged.
-    private func probeBundle(_ answers: [[String: Any]]) throws -> URL {
+    private func probeBundle(_ answers: [[String: Any]], method: String = "attachmentRequest") throws -> URL {
         let suffix = """
         ;(() => {
           const oldPoll = MindwtrHost.poll, replies = new Map(), answers = \(try json(answers));
           let next = 1000000000, call = 0;
-          MindwtrHost.attachmentRequest = () => {
+          MindwtrHost[\(try json([method]))[0]] = () => {
             const id = String(++next), value = answers[call++];
             Promise.resolve().then(() => replies.set(id, JSON.stringify({ok:true,value})));
             return id;
@@ -319,5 +333,198 @@ final class AttachmentOpenHostTests: XCTestCase {
         XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try markers(), 0)
         await host.close(); await refused { _ = try await self.opened(host, [attachment], id: "live") }
         XCTAssertEqual(try Data(contentsOf: journal), retained); XCTAssertEqual(try rows(), before); XCTAssertEqual(try Data(contentsOf: file), bytes)
+    }
+
+    func testProjectColdActualManagedFileImageAndAudioPlansDoNotRepairMetadata() async throws {
+        try await seed(); let producer = core(); _ = try await producer.start()
+        let attachments = try await produce(producer)
+        let files = try attachments.map { try XCTUnwrap(URL(string: XCTUnwrap($0["uri"] as? String))) }
+        let bytes = try files.map { try Data(contentsOf: $0) }, identities = try files.map(inode)
+        await producer.close()
+        let stale = attachments.map { row -> [String: Any] in
+            var value = row; value.removeValue(forKey: "size"); value["localStatus"] = "missing"; return value
+        }
+        try seedProject(stale)
+        let cold = core(); _ = try await cold.start(); let tasks = try rows(), projects = try projectRows(), count = try projectMarkers()
+        for (index, kind) in ["file", "image", "file"].enumerated() {
+            let result = try await projectOpened(cold, id: XCTUnwrap(stale[index]["id"] as? String))
+            XCTAssertEqual(result["status"] as? String, "available"); XCTAssertTrue(result["update"] is NSNull)
+            let plan = try XCTUnwrap(result["open"] as? [String: Any]); XCTAssertEqual(plan["kind"] as? String, kind)
+            XCTAssertEqual(kind == "file" ? plan["uri"] as? String : (plan["attachment"] as? [String: Any])?["uri"] as? String, files[index].absoluteString)
+        }
+        XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try files.map { try Data(contentsOf: $0) }, bytes); XCTAssertEqual(try files.map(inode), identities)
+        XCTAssertEqual(try projectMarkers() - count, 3); XCTAssertEqual(try markers(), 0)
+        XCTAssertNil(try EditorDraftStore(databaseURL: database).read()); XCTAssertNil(try NativeAttachmentDraftStore(databaseURL: database).readMixed())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.appendingPathExtension("pending.json").path))
+        let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
+        XCTAssertFalse(log.contains("Private.txt")); XCTAssertFalse(log.contains(files[0].absoluteString))
+    }
+
+    func testArchivedProjectAndMissingManagedFileRemainReadOnly() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("archived-file.txt"), bytes = Data("archived Project".utf8)
+        let live = item("archived-file", uri: file.absoluteString), missing = item("missing", uri: managed.appendingPathComponent("missing.txt").absoluteString)
+        try seedProject([live, missing], status: "archived"); try bytes.write(to: file)
+        let host = core(); _ = try await host.start(); let tasks = try rows(), projects = try projectRows(), identity = try inode(file)
+        let options = try object(await host.call("projectAttachmentEditOptions", argumentsJSON: json([json(["projectId": projectID])])))
+        XCTAssertEqual(options["canEdit"] as? Bool, false)
+        let available = try await projectOpened(host, id: "archived-file")
+        XCTAssertEqual(available["status"] as? String, "available")
+        let unavailable = try await projectOpened(host, id: "missing")
+        XCTAssertEqual(unavailable["status"] as? String, "unavailable"); XCTAssertNotNil(unavailable["message"] as? String)
+        XCTAssertTrue(unavailable["update"] is NSNull); XCTAssertTrue(unavailable["open"] is NSNull)
+        XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try projectMarkers(), 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managed.appendingPathComponent("missing.txt").path))
+    }
+
+    func testProjectUnknownDeletedPurgedLinkAndMalformedRequestsCannotReadOrWrite() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("live.txt"), bytes = Data("Project bytes".utf8), live = item("live", uri: file.absoluteString)
+        var removed = live; removed["id"] = "removed"; removed["deletedAt"] = at
+        let link: [String: Any] = ["id": "link", "kind": "link", "title": "Private link", "uri": "https://example.invalid", "createdAt": at, "updatedAt": at]
+        try seedProject([live, removed, link]); try bytes.write(to: file)
+        let host = core(), hooks = NativeAttachmentHostHooks(); var work = 0
+        hooks.configureJobs = { jobs in jobs.beforeWork = { _, _ in work += 1 } }
+        await host.configureAttachmentHost(hooks); _ = try await host.start()
+        let tasks = try rows(), projects = try projectRows(), identity = try inode(file)
+        let inputs = try [json(["projectId": "unknown", "attachmentId": "live"]), json(["projectId": projectID, "attachmentId": "unknown"]),
+            json(["projectId": projectID, "attachmentId": "removed"]), json(["projectId": projectID, "attachmentId": "link"]),
+            json(["projectId": projectID, "attachmentId": "live", "extra": true]), json(["projectId": projectID, "attachmentId": 1]),
+            json(["projectId": String(repeating: "x", count: 501), "attachmentId": "live"]), String(repeating: " ", count: 2_001)]
+        for input in inputs { await refused { _ = try await host.prepareProjectFileOpen(requestJSON: input) } }
+        XCTAssertEqual(work, 0); XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try projectMarkers(), 0)
+        await host.close()
+        for column in ["deletedAt", "purgedAt"] {
+            _ = try sql("UPDATE projects SET deletedAt=NULL,purgedAt=NULL"); _ = try sql("UPDATE projects SET \(column)=? WHERE id=?", [at, projectID])
+            let cold = core(); await cold.configureAttachmentHost(hooks); _ = try await cold.start(); let retained = try projectRows()
+            await refused { _ = try await self.projectOpened(cold, id: "live") }
+            XCTAssertEqual(work, 0); XCTAssertEqual(try projectRows(), retained); XCTAssertEqual(try rows(), tasks)
+            XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try inode(file), identity); await cold.close()
+        }
+    }
+
+    func testProjectForeignAlternateAndUnsafeManagedTargetsCannotCopy() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("live.txt"), outside = root.appendingPathComponent("outside.txt"), cached = cache.appendingPathComponent("cached.txt")
+        let symlink = managed.appendingPathComponent("symlink.txt"), hardlink = managed.appendingPathComponent("hardlink.txt"), directory = managed.appendingPathComponent("directory.txt")
+        let bytes = Data("unsafe Project bytes".utf8)
+        for url in [file, outside, cached] { try bytes.write(to: url) }
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+        try FileManager.default.linkItem(at: outside, to: hardlink); try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let attachments = [item("outside", uri: outside.absoluteString), item("cached", uri: cached.absoluteString), item("remote", uri: "https://example.invalid/Private.txt"),
+            item("live", uri: "file:" + file.path), item("old-root", uri: "file:///var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000/Library/attachments/old-root.txt"),
+            item("wrong-id", uri: file.absoluteString), item("symlink", uri: symlink.absoluteString), item("hardlink", uri: hardlink.absoluteString), item("directory", uri: directory.absoluteString)]
+        try seedProject(attachments)
+        let host = core(), hooks = NativeAttachmentHostHooks(); var work = 0
+        hooks.configureJobs = { jobs in jobs.beforeWork = { _, _ in work += 1 } }
+        await host.configureAttachmentHost(hooks); _ = try await host.start()
+        let tasks = try rows(), projects = try projectRows(), paths = [file, outside, cached, symlink, hardlink, directory], identities = try paths.map(inode)
+        let managedNames = try FileManager.default.contentsOfDirectory(atPath: managed.path).sorted(), cacheNames = try FileManager.default.contentsOfDirectory(atPath: cache.path).sorted()
+        for (index, row) in attachments.enumerated() {
+            let before = work
+            await refused { _ = try await self.projectOpened(host, id: XCTUnwrap(row["id"] as? String)) }
+            if index < 5 { XCTAssertEqual(work, before, "External or noncanonical URI must stop before typed jobs") }
+        }
+        XCTAssertGreaterThan(work, 0); XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try paths.map(inode), identities); XCTAssertEqual(try [file, outside, cached, hardlink].map { try Data(contentsOf: $0) }, [bytes, bytes, bytes, bytes])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: managed.path).sorted(), managedNames)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: cache.path).sorted(), cacheNames); XCTAssertEqual(try projectMarkers(), 0)
+    }
+
+    func testProjectUpdatedAudioForeignAndMismatchedSharedPlansAreRefused() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("live.txt"), bytes = Data("Project plan bytes".utf8), attachment = item("live", uri: file.absoluteString)
+        try seedProject([attachment]); try bytes.write(to: file)
+        let plan: [String: Any] = ["kind": "file", "uri": file.absoluteString, "mimeType": "text/plain", "viewMimeType": "text/plain"]
+        func answer(_ open: Any, status: String = "available", update: Any = NSNull()) -> [String: Any] {
+            ["status": status, "message": NSNull(), "update": update, "open": open]
+        }
+        var foreign = plan; foreign["uri"] = "https://example.invalid/Private.txt"
+        var changed = attachment; changed["size"] = 999
+        var extra = plan; extra["extra"] = true
+        let answers = [answer(plan, update: ["attachments": [attachment]]), answer(NSNull(), status: "unavailable"), answer(foreign),
+            answer(["kind": "audio", "attachment": attachment]), answer(["kind": "image", "attachment": changed]), answer(extra)]
+        let host = core(bundleURL: try probeBundle(answers + [answer(plan)], method: "projectLocalFileOpenPlan")); _ = try await host.start()
+        let tasks = try rows(), projects = try projectRows(), identity = try inode(file)
+        for _ in answers { await refused { _ = try await self.projectOpened(host, id: "live") } }
+        let accepted = try await projectOpened(host, id: "live")
+        XCTAssertEqual(accepted["status"] as? String, "available", "Final valid ticket proves every earlier forged plan was consumed")
+        XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try projectMarkers(), 1)
+    }
+
+    func testProjectTokenRevisionAndSelectedMetadataAreRecheckedAroundSharedCallsAndMarker() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("live.txt"), bytes = Data("Project token bytes".utf8), attachment = item("live", uri: file.absoluteString)
+        try seedProject([attachment]); try bytes.write(to: file)
+        let tasks = try rows(), projects = try projectRows(), identity = try inode(file)
+        for point in [2, 3, 5] {
+            // The first complete Open is a control (five exact option reads).
+            // Only the second Open's selected boundary returns a changed token.
+            let suffix = """
+            ;(() => {
+              const oldOptions = MindwtrHost.projectAttachmentEditOptions, oldPoll = MindwtrHost.poll, tracked = new Set();
+              let seen = 0;
+              MindwtrHost.projectAttachmentEditOptions = (...args) => { const id = oldOptions(...args); tracked.add(id); return id; };
+              MindwtrHost.poll = id => {
+                const raw = oldPoll(id);
+                if (raw == null || !tracked.has(id)) return raw;
+                tracked.delete(id);
+                const frame = JSON.parse(raw);
+                if (frame.ok && frame.value && frame.value.project && ++seen >= \(5 + point)) {
+                  if (\(point) === 2) frame.value.project.title = 'Changed token';
+                  else if (\(point) === 3) frame.value.revision += ':changed';
+                  else frame.value.project.attachments[0].size = 999;
+                }
+                return JSON.stringify(frame);
+              };
+            })();
+            """
+            let probe = root.appendingPathComponent("project-token-\(point).js")
+            try (String(contentsOf: bundle) + suffix).write(to: probe, atomically: true, encoding: .utf8)
+            let host = core(bundleURL: probe); _ = try await host.start(); let count = try projectMarkers()
+            let control = try await projectOpened(host, id: "live"); XCTAssertEqual(control["status"] as? String, "available")
+            await refused { _ = try await self.projectOpened(host, id: "live") }
+            XCTAssertEqual(try projectMarkers() - count, point == 5 ? 2 : 1)
+            XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+            XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); await host.close()
+        }
+    }
+
+    func testProjectCancellationDrainsReadAndPendingOrClosedHostsPreserveEvidence() async throws {
+        try await seed()
+        let file = managed.appendingPathComponent("live.txt"), bytes = Data("Project cancellation bytes".utf8), attachment = item("live", uri: file.absoluteString)
+        try seedProject([attachment]); try bytes.write(to: file)
+        let host = core(), hooks = NativeAttachmentHostHooks(), entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        hooks.configureJobs = { jobs in jobs.beforeWork = { id, _ in if id == "1" { entered.signal(); release.wait() } } }
+        await host.configureAttachmentHost(hooks); _ = try await host.start()
+        let tasks = try rows(), projects = try projectRows(), identity = try inode(file), input = try json(["projectId": projectID, "attachmentId": "live"])
+        let operation = Task { try await host.prepareProjectFileOpen(requestJSON: input) }; defer { release.signal() }
+        let enteredResult = entered.wait(timeout: .now() + 5); XCTAssertEqual(enteredResult, .success)
+        guard enteredResult == .success else { operation.cancel(); release.signal(); _ = try? await operation.value; return }
+        operation.cancel(); let closed = DispatchSemaphore(value: 0), closeTask = Task { await host.close(); closed.signal() }
+        XCTAssertEqual(closed.wait(timeout: .now() + 0.05), .timedOut)
+        let faults = HostIOFaults(), replacement = core(faults); await refused { _ = try await replacement.start() }
+        release.signal()
+        do { _ = try await operation.value; XCTFail("Cancelled Project opening must not produce a plan") }
+        catch is CancellationError { } catch { XCTFail("Expected cancellation") }
+        await closeTask.value
+        XCTAssertEqual(try rows(), tasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try projectMarkers(), 0)
+        _ = try await replacement.start()
+        let accepted = try await projectOpened(replacement, id: "live"); XCTAssertEqual(accepted["status"] as? String, "available")
+        let capture = try object(await replacement.call("captureOpen"))
+        let command = try json([json(["text": "Pending Project capture", "options": try XCTUnwrap(capture["options"]), "captureId": UUID().uuidString.lowercased(), "openAfterSave": false])])
+        faults.beforeSQL = { if $0 == "COMMIT" { throw HostFailure("Injected pending COMMIT") } }
+        await refused { _ = try await replacement.call("captureSubmit", argumentsJSON: command) }
+        let journal = database.appendingPathExtension("pending.json"), retained = try Data(contentsOf: journal), pendingTasks = try rows(), count = try projectMarkers()
+        await refused { _ = try await self.projectOpened(replacement, id: "live") }
+        XCTAssertEqual(try Data(contentsOf: journal), retained); XCTAssertEqual(try rows(), pendingTasks); XCTAssertEqual(try projectRows(), projects)
+        XCTAssertEqual(try Data(contentsOf: file), bytes); XCTAssertEqual(try inode(file), identity); XCTAssertEqual(try projectMarkers(), count)
+        await replacement.close(); await refused { _ = try await self.projectOpened(replacement, id: "live") }
+        XCTAssertEqual(try Data(contentsOf: journal), retained); XCTAssertEqual(try rows(), pendingTasks); XCTAssertEqual(try projectRows(), projects)
     }
 }

@@ -30,6 +30,7 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 ## v1.3.5 (add before tagging, trim in the release after)
 
+- **`v1.3.5/ios-project-local-file-open`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift` through the forced Diagnostics sink in `apps/android-native/bundle/host-entry.ts`. `operation=project-file-open`, `outcome=prepared` proves current Project authority, managed-file observations and the read-only shared open plan passed validation. It does not prove external sharing or image presentation completed. No Project title, identifiers, attachment text, paths or file proofs are logged.
 - **`v1.3.5/ios-owned-raw-row-save`** — `apps/android-native/bundle/host-entry.ts`, after native complete Save durably acknowledges its domain write. `operation=complete-save`, `outcome=domainSaved` proves the owned Save passed the raw-row authority guards, including the legacy empty-array repair. It does not claim that this particular task contained legacy arrays or that file cleanup finished. No task text, identifiers, paths or row contents are logged.
 - **`v1.3.5/ios-local-file-open`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift` through the forced Diagnostics sink in `apps/android-native/bundle/host-entry.ts`. `operation=file-open`, `outcome=prepared` proves a local task file passed shared open planning and native managed-file validation. It does not prove system preview/share completion or remote download. No file names, paths, task text, identifiers or file proofs are logged.
 

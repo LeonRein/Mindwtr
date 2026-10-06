@@ -87,6 +87,17 @@ public final class CoreHost: @unchecked Sendable {
         }, onCancel: { token.cancel() })
     }
 
+    /// Prepares already-present Project bytes without availability or metadata writes.
+    public func prepareProjectFileOpen(requestJSON: String) async throws -> String {
+        let id = UUID(), token = NativeAttachmentCancellation()
+        localAttachmentRequests.register(token, id: id)
+        defer { localAttachmentRequests.remove(id) }
+        if Task.isCancelled { token.cancel() }
+        return try await withTaskCancellationHandler(operation: {
+            try await perform { try $0.prepareProjectFileOpen(requestJSON: requestJSON, cancellation: token) }
+        }, onCancel: { token.cancel() })
+    }
+
     public func beginAttachmentDraft(expectedSession: String, expectedGeneration: Int) async throws -> String {
         try await perform { try $0.beginAttachmentDraft(expectedSession: expectedSession, expectedGeneration: expectedGeneration) }
     }
@@ -14580,6 +14591,92 @@ private final class Engine: @unchecked Sendable {
                 _ = try? invoke("attachmentDraftAcknowledged", arguments: ["file-open", "prepared"])
                 try owner()
             }
+            return result
+        } catch {
+            if cancellation.isCancelled || error is CancellationError { throw CancellationError() }
+            throw failure
+        }
+    }
+
+    func prepareProjectFileOpen(requestJSON: String, cancellation: NativeAttachmentCancellation) throws -> String {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let failure = HostFailure("Project attachment file could not be opened")
+        do {
+            guard started, !closed, pending == nil, !recoveryActivationPending, lockFD >= 0,
+                  let runtime = context, let jobs = attachmentJobs else { throw failure }
+            let generation = attachmentGeneration
+            func owner() throws {
+                try cancellation.check()
+                guard self.started, !self.closed, self.pending == nil, !self.recoveryActivationPending, self.lockFD >= 0,
+                      self.context === runtime, self.attachmentJobs === jobs, self.attachmentGeneration == generation else { throw failure }
+            }
+            try owner()
+            guard requestJSON.utf8.count <= 2_000,
+                  let request = try NativeJSON.jsonObject(with: Data(requestJSON.utf8)) as? [String: Any],
+                  Set(request.keys) == Set(["projectId", "attachmentId"]),
+                  let projectID = request["projectId"] as? String, !projectID.isEmpty, projectID.utf16.count <= 500,
+                  let selectedID = request["attachmentId"] as? String, !selectedID.isEmpty, selectedID.utf16.count <= 500 else { throw failure }
+            let optionsRequest = try Self.ownedJSON(["projectId": projectID])
+            func options() throws -> [String: Any] {
+                try owner()
+                let raw = try self.invoke("projectAttachmentEditOptions", arguments: [optionsRequest], localCancellation: cancellation)
+                try owner()
+                try self.validateProjectAttachmentEditOptions(raw, projectID: projectID)
+                guard let value = try NativeJSON.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+                      let project = value["project"] as? [String: Any],
+                      let id = project["id"] as? String, Self.ownedEqual(id, projectID) else { throw failure }
+                return value
+            }
+            let authority = try options()
+            func liveProject() throws {
+                guard Self.equalJSON(try options(), authority) else { throw failure }
+            }
+            guard let project = authority["project"] as? [String: Any],
+                  let attachments = project["attachments"] as? [[String: Any]] else { throw failure }
+            let matches = attachments.filter { ($0["id"] as? String).map { Self.ownedEqual($0, selectedID) } == true }
+            guard matches.count == 1, let selected = matches.first, selected["kind"] as? String == "file",
+                  selected["deletedAt"] == nil, let uri = selected["uri"] as? String, !uri.isEmpty else { throw failure }
+            // Only this installation's exact flat managed spelling grants byte authority.
+            let prefix = Data(try mixedSaveManagedURI().utf8), target = Data(uri.utf8)
+            let leaf = target.dropFirst(prefix.count)
+            guard target.starts(with: prefix), !leaf.isEmpty, !leaf.contains(47) else { throw failure }
+            let coordinator = try NativeAttachmentDraftCoordinator(databaseURL: databaseURL, jobs: jobs,
+                requireOwner: owner, invoke: { [unowned self] name, args in try self.invoke(name, arguments: args) })
+            let before = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            try liveProject()
+            let result = try invoke("projectLocalFileOpenPlan", arguments: [requestJSON, before != nil], localCancellation: cancellation)
+            try liveProject()
+            guard result.utf8.count <= 6_400_000,
+                  let answer = try NativeJSON.jsonObject(with: Data(result.utf8)) as? [String: Any],
+                  Set(answer.keys) == Set(["status", "message", "update", "open"]), answer["update"] is NSNull,
+                  let status = answer["status"] as? String,
+                  status == (before == nil ? "unavailable" : "available") else { throw failure }
+            if status == "available" {
+                guard answer["message"] is NSNull, let plan = answer["open"] as? [String: Any],
+                      let kind = plan["kind"] as? String else { throw failure }
+                switch kind {
+                case "file":
+                    guard Set(plan.keys) == Set(["kind", "uri", "mimeType", "viewMimeType"]),
+                          let plannedURI = plan["uri"] as? String, Self.ownedEqual(plannedURI, uri),
+                          plan["mimeType"] is NSNull || plan["mimeType"] is String, plan["viewMimeType"] is String else { throw failure }
+                case "image":
+                    guard Set(plan.keys) == Set(["kind", "attachment"]), let item = plan["attachment"] as? [String: Any],
+                          let id = item["id"] as? String, Self.ownedEqual(id, selectedID), item["kind"] as? String == "file",
+                          item["deletedAt"] == nil, let plannedURI = item["uri"] as? String, Self.ownedEqual(plannedURI, uri),
+                          Self.equalJSON(item, selected) else { throw failure }
+                default: throw failure
+                }
+            } else {
+                guard answer["open"] is NSNull, answer["message"] is String else { throw failure }
+            }
+            let after = try coordinator.snapshotFileOpen(attachmentID: selectedID, targetURI: uri, cancellation: cancellation)
+            guard before == after else { throw failure }
+            try liveProject()
+            if status == "available" {
+                _ = try? invoke("attachmentDraftAcknowledged", arguments: ["project-file-open", "prepared"])
+                try liveProject()
+            }
+            try owner()
             return result
         } catch {
             if cancellation.isCancelled || error is CancellationError { throw CancellationError() }

@@ -796,6 +796,7 @@ struct ProjectDetailScreen: View {
     @State private var projectDateDraft = Date()
 
     var body: some View {
+        let fileOpenID = model.projectFileOpenPresentation?.id
         VStack(spacing: 0) {
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
@@ -1154,6 +1155,8 @@ struct ProjectDetailScreen: View {
             .allowsHitTesting(!model.projectRenameEditing)
             }
         }
+        .disabled(model.projectAttachmentOpening)
+        .accessibilityHidden(model.projectFileOpenPresentation != nil)
         .onChange(of: model.projectRenameEditing) { renameFocused = $0 }
         .onChange(of: model.projectRenameInputEnabled) { if $0 { renameFocused = true } }
         .onChange(of: notesFocused) { if !$0 { Task { await model.flushProjectNotesEdit() } } }
@@ -1223,6 +1226,31 @@ struct ProjectDetailScreen: View {
             Text(model.projectAttachmentOpenError ?? "")
                 .accessibilityIdentifier("project-attachment-open-error")
         }
+        .sheet(item: Binding(
+            get: { model.projectFileOpenPresentation },
+            set: { presentation in
+                if presentation == nil, let fileOpenID { model.dismissProjectFileOpen(presentationID: fileOpenID) }
+            })) { presentation in
+                Group {
+                    if presentation.kind == .file {
+                        AttachmentFileActivitySheet(presentation: presentation)
+                    } else {
+                        NavigationStack {
+                            AttachmentFileQuickLookSheet(presentation: presentation)
+                                .toolbar {
+                                    ToolbarItem(placement: .confirmationAction) {
+                                        Button(model.label("common.done")) {
+                                            model.dismissProjectFileOpen(presentationID: presentation.id)
+                                        }
+                                        .accessibilityIdentifier("project-attachment-preview-done")
+                                    }
+                                }
+                        }
+                    }
+                }
+                .id(presentation.id)
+                .onDisappear { model.dismissProjectFileOpen(presentationID: presentation.id) }
+            }
         .sheet(isPresented: Binding(get: { model.projectDateField != nil },
                                     set: { if !$0 && !model.appLock.concealed { model.cancelProjectDate() } })) {
             projectDateSheet
@@ -1668,7 +1696,8 @@ struct ProjectDetailScreen: View {
                 .padding(12).frame(maxWidth: .infinity, alignment: .leading)
                 .background(palette.filter, in: RoundedRectangle(cornerRadius: 8))
                 projectNotesPanel
-                projectAttachmentsPanel
+                // Bound generic metadata after an observed iOS 17 stack overflow.
+                AnyView(projectAttachmentsPanel)
                 ProjectDatesMetadata(model: model, palette: palette, metadata: metadata) {
                     resignProjectNotesInput()
                 }
@@ -1905,10 +1934,10 @@ struct ProjectDetailScreen: View {
                 ForEach(model.projectAttachmentRows.indices, id: \.self) { index in
                     let entry = model.projectAttachmentRows[index]
                     VStack(alignment: .leading, spacing: 4) {
-                        if entry.text("kind") == "link" {
+                        if ["link", "file"].contains(entry.text("kind")) {
                             Button {
-                                model.openProjectAttachment(entry.text("id"))
                                 resignProjectNotesInput()
+                                model.openProjectAttachment(entry.text("id"))
                             } label: {
                                 Text(entry.text("title")).rnFont(14)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1920,6 +1949,12 @@ struct ProjectDetailScreen: View {
                                 || model.appLock.concealed || entry.flag("downloading"))
                             .accessibilityLabel(entry.text("title"))
                             .accessibilityIdentifier("project-attachment-open-" + entry.text("id"))
+                        } else {
+                            Text(entry.text("title")).rnFont(14).foregroundStyle(palette.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        }
+                        if entry.text("kind") == "link" {
                             Button {
                                 model.removeProjectAttachmentLink(entry.text("id"))
                                 resignProjectNotesInput()
@@ -1931,10 +1966,6 @@ struct ProjectDetailScreen: View {
                             .buttonStyle(.plain).foregroundStyle(palette.danger)
                             .disabled(!model.projectAttachmentRemoveEnabled)
                             .accessibilityIdentifier("project-attachment-remove-" + entry.text("id"))
-                        } else {
-                            Text(entry.text("title")).rnFont(14).foregroundStyle(palette.text)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                         }
                         if entry.flag("downloading") || entry.flag("missing") {
                             Text(model.label(entry.flag("downloading") ? "common.loading"

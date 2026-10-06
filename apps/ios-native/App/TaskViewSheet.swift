@@ -99,10 +99,10 @@ struct TaskViewSheet: View {
             })) { presentation in
                 Group {
                     if presentation.kind == .file {
-                        TaskFileActivitySheet(presentation: presentation)
+                        AttachmentFileActivitySheet(presentation: presentation)
                     } else {
                         NavigationStack {
-                            TaskFileQuickLookSheet(presentation: presentation)
+                            AttachmentFileQuickLookSheet(presentation: presentation)
                                 .toolbar {
                                     ToolbarItem(placement: .confirmationAction) {
                                         Button(strings.text("common.done")) {
@@ -2834,16 +2834,16 @@ private struct TaskActivitySheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
-private struct TaskFileActivitySheet: UIViewControllerRepresentable {
-    let presentation: TaskFileOpenPresentation
+struct AttachmentFileActivitySheet: UIViewControllerRepresentable {
+    let presentation: AttachmentFileOpenPresentation
     func makeUIViewController(context: Context) -> UIActivityViewController {
         UIActivityViewController(activityItems: [presentation.url], applicationActivities: nil)
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
-private struct TaskFileQuickLookSheet: UIViewControllerRepresentable {
-    let presentation: TaskFileOpenPresentation
+struct AttachmentFileQuickLookSheet: UIViewControllerRepresentable {
+    let presentation: AttachmentFileOpenPresentation
 
     func makeCoordinator() -> Coordinator { Coordinator(url: presentation.url) }
     func makeUIViewController(context: Context) -> QLPreviewController {

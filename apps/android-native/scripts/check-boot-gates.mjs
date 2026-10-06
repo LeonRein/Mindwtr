@@ -3421,6 +3421,7 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
 }
 
 const fakeCore = `
+export { planAttachmentOpen, getAttachmentResolutionMessage } from ${JSON.stringify(resolve(app, '../../packages/core/src/attachment-editor-model.ts'))};
 import { logInfo as realLogInfo, setLogger as setRealLogger } from ${JSON.stringify(resolve(app, '../../packages/core/src/logger.ts'))};
 export { createDiagnosticsLog, diagnosticsEntryFromLogPayload, isDiagnosticsLoggingEnabled } from ${JSON.stringify(resolve(app, '../../packages/core/src/diagnostics-log.ts'))};
 export { validateNativeAttachmentDraftBeginV3, validateNativeAttachmentDraftLineageV3,
@@ -3622,6 +3623,12 @@ export function createNativeHostContract(bindings = {}) {
     async commitPreparedOwnedEditorFileAddTaskDraftSave(input) { globalThis.fileEditSaveInputs.push(['legacyCommit', input]); return globalThis.fileEditSaveReply; },
     async addAttachmentFile(input) { globalThis.attachmentInputs.push(['draftAddFile', input]); return globalThis.attachmentReply; },
     async removeAttachment(input) { globalThis.attachmentInputs.push(['draftRemove', input]); return globalThis.attachmentReply; },
+    getProjectAttachmentEditOptions(input) {
+      const project = globalThis.ownerProjects.find((item) => item.id === input.projectId);
+      return project && !project.deletedAt && !project.purgedAt
+        ? { ok: true, value: { revision: 'project-revision', project, canEdit: project.status !== 'archived' } }
+        : { ok: false, error: { code: 'STALE_REVISION', message: 'Project unavailable' } };
+    },
     async openAttachment(input) { globalThis.attachmentInputs.push(['openAttachment', input]); return globalThis.attachmentReply; },
     async settleTaskDraftAttachments(input) { globalThis.attachmentInputs.push(['settleTaskDraftAttachments', input]); return globalThis.attachmentReply; },
     editTaskChecklist(input) {
@@ -5355,6 +5362,43 @@ const poll = async (state, id) => {
         assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
             { releaseCheck: 'v1.3.5/ios-attachment-complete-save', operation: 'complete-save', outcome: 'domainSaved' });
     });
+    await check('Project local planning reuses RN classification without resolving availability or writing metadata', async () => {
+        const local = makeState(0, [], 'ios');
+        const attachments = [
+            { id: 'document', kind: 'file', title: 'Document', uri: 'file:///managed/document.txt', mimeType: 'text/plain', localStatus: 'missing' },
+            { id: 'image', kind: 'file', title: 'Image', uri: 'file:///managed/image.png', mimeType: 'image/png' },
+            { id: 'audio', kind: 'file', title: 'Audio', uri: 'file:///managed/audio.wav', mimeType: 'audio/wav' },
+        ];
+        local.ownerProjects = [{ id: 'p', status: 'active', attachments }];
+        const request = (id) => JSON.stringify({ projectId: 'p', attachmentId: id });
+        const plan = (state, json, available) => poll(state, state.MindwtrHost.projectLocalFileOpenPlan(json, available));
+        for (const status of ['active', 'archived']) {
+            local.ownerProjects[0].status = status;
+            const before = JSON.stringify(local.ownerProjects);
+            for (const [id, kind] of [['document', 'file'], ['image', 'image'], ['audio', 'file']]) {
+                const result = await plan(local, request(id), true);
+                assert.equal(result.ok, true); assert.equal(result.value.status, 'available');
+                assert.equal(result.value.open.kind, kind); assert.equal(result.value.update, null);
+                assert.equal(result.value.message, null);
+            }
+            assert.deepEqual((await plan(local, request('document'), false)).value,
+                { status: 'unavailable', message: 'attachments.missing', update: null, open: null });
+            assert.equal(JSON.stringify(local.ownerProjects), before);
+        }
+        for (const invalid of [{ projectId: 'p', attachmentId: 'missing' }, { projectId: 'p', attachmentId: 'document', extra: true },
+            { projectId: 'missing', attachmentId: 'document' }, { projectId: 'p', attachmentId: '' }])
+            assert.equal((await plan(local, JSON.stringify(invalid), true)).ok, false);
+        for (const available of [null, 'true', 1]) assert.equal((await plan(local, request('document'), available)).ok, false);
+        attachments[0].deletedAt = '2026-10-06T00:00:00Z';
+        assert.equal((await plan(local, request('document'), true)).ok, false); delete attachments[0].deletedAt;
+        local.ownerProjects[0].deletedAt = '2026-10-06T00:00:00Z';
+        assert.equal((await plan(local, request('document'), true)).ok, false); delete local.ownerProjects[0].deletedAt;
+        attachments.push({ ...attachments[0] });
+        assert.equal((await plan(local, request('document'), true)).ok, false); attachments.pop();
+        assert.deepEqual(local.attachmentInputs, []); assert.deepEqual(local.fileCalls, []);
+        assert.equal(local.saveCount, 0);
+        assert.equal((await plan(makeState(0), request('document'), true)).ok, false);
+    });
     await check('owned resume acknowledgment is iOS-only and fixed without claiming Save or UI hydration', async () => {
         const local = makeState(0, [], 'ios');
         assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('owned-resume', 'validated'))).ok, true);
@@ -5377,6 +5421,7 @@ const poll = async (state, id) => {
         ['preexisting-journal-replay', 'v1.3.5/ios-preexisting-attachment-journal-replay'],
         ['container-relocation', 'v1.3.5/ios-attachment-container-recovery'],
         ['file-open', 'v1.3.5/ios-local-file-open', 'prepared'],
+        ['project-file-open', 'v1.3.5/ios-project-local-file-open', 'prepared'],
     ]) await check(`${operation} acknowledgment is fixed, exportable and best effort`, async () => {
         const local = makeState(0, [], 'ios');
         local.settings = { diagnostics: { loggingEnabled: false } };

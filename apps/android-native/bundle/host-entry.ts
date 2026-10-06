@@ -34,6 +34,8 @@ import {
     prepareNativeAttachmentDraftDiscardCandidates,
     prepareNativeAttachmentDraftDiscardCandidatesV3,
     isAttachmentFileInUse,
+    planAttachmentOpen,
+    getAttachmentResolutionMessage,
     taskRevisionOf,
     formatI18nTemplate,
     canSaveTaskListTag,
@@ -1320,6 +1322,22 @@ globalThis.MindwtrHost = {
             requireSaved();
             const { projectId, attachmentId } = projectAttachmentInput(json, true);
             return unwrap(await contract.openAttachment({ owner: { kind: 'project', projectId }, attachmentId: attachmentId!, urlOnly: true }));
+        });
+    },
+    /** Read-only classification after Swift observes the current managed file. */
+    projectLocalFileOpenPlan(json: string, available: boolean): string {
+        return submit(async () => {
+            requireSaved();
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || typeof available !== 'boolean') throw new Error('INVALID_INPUT');
+            const { projectId, attachmentId } = projectAttachmentInput(json, true);
+            const { project } = unwrap(contract.getProjectAttachmentEditOptions({ projectId }));
+            const matches = project.attachments.filter((item) => item.id === attachmentId);
+            const selected = matches[0];
+            if (matches.length !== 1 || selected.kind !== 'file' || selected.deletedAt || !selected.uri) throw new Error('INVALID_INPUT');
+            const t = (key: string): string => unwrap(contract.getStrings({ keys: [key] })).strings[key] ?? key;
+            return available
+                ? { status: 'available', message: null, update: null, open: planAttachmentOpen(selected, { audio: false, t }) }
+                : { status: 'unavailable', message: getAttachmentResolutionMessage({ status: 'unavailable' }, t), update: null, open: null };
         });
     },
     taskAttachmentLinks(json: string): string {
@@ -3416,11 +3434,12 @@ globalThis.MindwtrHost = {
             const preexistingReplay = operation === 'preexisting-journal-replay' && outcome === 'confirmed';
             const containerRecovery = operation === 'container-relocation' && outcome === 'confirmed';
             const fileOpen = operation === 'file-open' && outcome === 'prepared';
+            const projectFileOpen = operation === 'project-file-open' && outcome === 'prepared';
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen)) return {};
             try {
                 if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
                     ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
@@ -3433,6 +3452,7 @@ globalThis.MindwtrHost = {
                     message: 'Native iOS attachment draft acknowledged',
                     context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }
                         : fileOpen ? { releaseCheck: 'v1.3.5/ios-local-file-open' }
+                        : projectFileOpen ? { releaseCheck: 'v1.3.5/ios-project-local-file-open' }
                         : containerRecovery ? { releaseCheck: 'v1.3.5/ios-attachment-container-recovery' }
                         : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
