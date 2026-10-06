@@ -165,9 +165,9 @@ internal object ProcessCoreHost {
      * held sync start runs now, on the sync thread. It stays after the boot's journal replay and queue drain, as before; only
      * the first screen no longer waits for it.
      */
-    fun startDeferredSync() {
+    fun startDeferredSync(trigger: String = "content") {
         deferredSync.getAndSet(null)?.let { start -> syncThread.execute { start() } }
-        deferredWidgets.take()?.let { publishHeldWidgets(it, "content") }
+        deferredWidgets.take()?.let { publishHeldWidgets(it, trigger) }
     }
 
     /**
@@ -307,9 +307,15 @@ internal object ProcessCoreHost {
         return start.optBoolean("ask")
     }
 
-    /** A held publication (the boot's or a resume's) runs: after the screen's first content, or after the fallback. */
+    /**
+     * A held publication (the boot's or a resume's) runs, its line written to the diagnostics log through core on the widget
+     * thread: [trigger] is "content" (the screen's first content), "boot-timeout" (the boot's fallback) or "resume-fallback".
+     */
     private fun publishHeldWidgets(runtime: CoreHost, trigger: String) {
-        Log.i(CoreHost.TAG, "Native Android held widget publication releaseCheck=v1.3.5/widget-publication-after-content trigger=$trigger")
+        widgetThread.execute {
+            runtime.logLine("Native Android held widget publication",
+                JSONObject().put("releaseCheck", "v1.3.5/widget-publication-after-content").put("trigger", trigger))
+        }
         refreshWidgets(runtime)
     }
 
@@ -337,7 +343,7 @@ internal object ProcessCoreHost {
             if (state == "active") {
                 // Its own generation: a fallback left from an earlier resume never takes this hold before this screen draws.
                 val generation = deferredWidgets.hold(runtime)
-                widgetThread.schedule({ deferredWidgets.takeIf(generation)?.let { publishHeldWidgets(it, "fallback") } },
+                widgetThread.schedule({ deferredWidgets.takeIf(generation)?.let { publishHeldWidgets(it, "resume-fallback") } },
                     WIDGET_FALLBACK_MS, TimeUnit.MILLISECONDS)
             } else {
                 deferredWidgets.clear()

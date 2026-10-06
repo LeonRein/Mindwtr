@@ -353,7 +353,7 @@ class InboxViewModel(app: Application, private val saved: SavedStateHandle) : An
                     // The boot's held sync start: now when the boot read was this screen's content (not the Inbox, whose first rows
                     // report it: contentShown); a fallback covers an Inbox read that never draws.
                     if (screen != Screen.Inbox) ProcessCoreHost.startDeferredSync()
-                    main.postDelayed(ProcessCoreHost::startDeferredSync, SYNC_FALLBACK_MS)
+                    main.postDelayed({ ProcessCoreHost.startDeferredSync("boot-timeout") }, SYNC_FALLBACK_MS)
                     restored?.let { resumeEditor(it, savedDraft.optJSONObject("pending")) }
                     // Control edits core had not answered before the process died are sent again, in order.
                     pumpEdits()

@@ -1270,10 +1270,10 @@ assert.equal(coreHost.match(/debugFault\("language"\)/g).length, 1);
     // another tab's boot read, or a 3 s fallback; CoreWork's and the owed retry's start at once. One start at a time.
     // The reminder alarms start with sync (pass R1), held with it.
     assert.match(owner, /startSync = \{\s+val start = \{\s+startSync\(app, runtime\)\s+startReminders\(runtime\)\s+\}\s+if \(deferSync\) deferredSync\.set\(start\) else start\(\)\s+\},/);
-    assert.match(owner, /fun startDeferredSync\(\) \{\s+deferredSync\.getAndSet\(null\)\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.take\(\)\?\.let \{ publishHeldWidgets\(it, \"content\"\) \}\s+\}/, 'the boot\'s widget publication waits with its sync start');
+    assert.match(owner, /fun startDeferredSync\(trigger: String = "content"\) \{\s+deferredSync\.getAndSet\(null\)\?\.let \{ start -> syncThread\.execute \{ start\(\) \} \}\s+deferredWidgets\.take\(\)\?\.let \{ publishHeldWidgets\(it, trigger\) \}\s+\}/, 'the boot\'s widget publication waits with its sync start');
     assert.match(owner, /fun contentShown\(\) \{\s+startDeferredSync\(\)/);
     assert.match(owner, /private fun startSync\(app: Application, runtime: CoreHost\): Unit = synchronized\(syncLock\) \{\s+if \(syncHost != null\) return/);
-    assert.match(model, /if \(screen != Screen\.Inbox\) ProcessCoreHost\.startDeferredSync\(\)\s+main\.postDelayed\(ProcessCoreHost::startDeferredSync, SYNC_FALLBACK_MS\)/);
+    assert.match(model, /if \(screen != Screen\.Inbox\) ProcessCoreHost\.startDeferredSync\(\)\s+main\.postDelayed\(\{ ProcessCoreHost\.startDeferredSync\("boot-timeout"\) \}, SYNC_FALLBACK_MS\)/);
     assert.equal([activity, model, owner, menuModel].join('\n').match(/recovered\(app, runtime(?:, deferSync = true)?\)|ProcessCoreHost\.recovered\(getApplication\(\), runtime\)/g).length, 2, 'recovered after the boot replay and the owed retry (CoreWork\'s is checked with the runner)');
     // Core's receipts are pruned once per boot, and only after a replay that left nothing: never before the replay, never while an
     // entry that may need its receipt is left.
@@ -3402,7 +3402,7 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     assert.match(ownerKt, /private fun refreshWidgets\(runtime: CoreHost\) = widgetThread\.execute \{\s+runCatching \{ runtime\.refreshWidgets\(\) \}\.onFailure \{ Log\.w\(CoreHost\.TAG, "Native Android widget refresh failed", it\) \}\s+\}/);
     // Coming to the front and leaving it both publish (RN's resume refresh and its flush on leaving). Coming to the front, it
     // waits for the screen's first content (startDeferredSync runs it) or the fallback, so a warm start draws first.
-    assert.match(ownerKt, /if \(state == appState\) return\s+appState = state\s+(?:\/\/[^\n]*\s+)*boot\?\.takeIf \{ it\.isDone \}\?\.let \{ task -> runCatching \{ task\.get\(\) \}\.getOrNull\(\) \}\?\.let \{ runtime ->\s+if \(state == "active"\) \{\s+(?:\/\/[^\n]*\s+)*val generation = deferredWidgets\.hold\(runtime\)\s+widgetThread\.schedule\(\{ deferredWidgets\.takeIf\(generation\)\?\.let \{ publishHeldWidgets\(it, "fallback"\) \} \},\s+WIDGET_FALLBACK_MS, TimeUnit\.MILLISECONDS\)\s+\} else \{\s+deferredWidgets\.clear\(\)\s+refreshWidgets\(runtime\)\s+\}\s+\}/, 'a resume\'s fallback publishes only its own hold (HeldPublicationTest)');
+    assert.match(ownerKt, /if \(state == appState\) return\s+appState = state\s+(?:\/\/[^\n]*\s+)*boot\?\.takeIf \{ it\.isDone \}\?\.let \{ task -> runCatching \{ task\.get\(\) \}\.getOrNull\(\) \}\?\.let \{ runtime ->\s+if \(state == "active"\) \{\s+(?:\/\/[^\n]*\s+)*val generation = deferredWidgets\.hold\(runtime\)\s+widgetThread\.schedule\(\{ deferredWidgets\.takeIf\(generation\)\?\.let \{ publishHeldWidgets\(it, "resume-fallback"\) \} \},\s+WIDGET_FALLBACK_MS, TimeUnit\.MILLISECONDS\)\s+\} else \{\s+deferredWidgets\.clear\(\)\s+refreshWidgets\(runtime\)\s+\}\s+\}/, 'a resume\'s fallback publishes only its own hold (HeldPublicationTest)');
     // Kotlin says when a publication did not reach the widgets (its store or redraw failed), so the publisher sends it again.
     const hostWidgetsKt = readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/core/HostWidgets.kt'), 'utf8');
     assert.match(hostWidgetsKt, /\.put\("stale", stale\)/);
