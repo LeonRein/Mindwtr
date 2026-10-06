@@ -25,6 +25,7 @@ import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -35,6 +36,9 @@ import java.util.concurrent.atomic.AtomicReference
  * durable without a clean close. Two hosts on one database would reject each
  * other's writes, so recreation must reuse this one.
  */
+/** A resume whose screen reports no new first content publishes the widgets this long after it (ProcessCoreHost.appState). */
+private const val WIDGET_FALLBACK_MS = 3_000L
+
 internal object ProcessCoreHost {
     private var boot: FutureTask<CoreHost>? = null
     @Volatile private var boots = 0
@@ -207,7 +211,7 @@ internal object ProcessCoreHost {
     /** One sync start at a time: the boot's held start (sync thread) and CoreWork's (its worker) may meet. */
     private val syncLock = Any()
     private val syncThread = Executors.newSingleThreadExecutor { task -> Thread(task, "mindwtr-sync-events") }
-    private val widgetThread = Executors.newSingleThreadExecutor { task -> Thread(task, "mindwtr-widget-refresh") }
+    private val widgetThread = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "mindwtr-widget-refresh") }
     private val syncListeners = CopyOnWriteArraySet<(JSONObject) -> Unit>()
     /** The last sync badge and finished-cycle count (host-sync.ts's `sync` event), for a screen that opens later. */
     @Volatile var syncState: JSONObject? = null
@@ -320,8 +324,18 @@ internal object ProcessCoreHost {
         if (state == appState) return
         appState = state
         // RN republishes the widgets when the app comes to the front (a new day, a changed theme) and flushes a change still
-        // waiting when it leaves; a boot still running publishes once it finished.
-        boot?.takeIf { it.isDone }?.let { task -> runCatching { task.get() }.getOrNull()?.let(::refreshWidgets) }
+        // waiting when it leaves; a boot still running publishes once it finished. Coming to the front, the publication reads
+        // the whole store on core's one thread, so it waits for the screen's first content, as the boot's does (warm starts at
+        // 5,000 tasks drew 130 ms later); a resume that draws nothing new publishes after the fallback.
+        boot?.takeIf { it.isDone }?.let { task -> runCatching { task.get() }.getOrNull() }?.let { runtime ->
+            if (state == "active") {
+                deferredWidgets.set(runtime)
+                widgetThread.schedule({ deferredWidgets.getAndSet(null)?.let(::refreshWidgets) }, WIDGET_FALLBACK_MS, TimeUnit.MILLISECONDS)
+            } else {
+                deferredWidgets.set(null)
+                refreshWidgets(runtime)
+            }
+        }
         val runtime = syncHost ?: return
         syncThread.execute { runCatching { runtime.syncAppState(state) }.onFailure { Log.w(CoreHost.TAG, "Native Android sync app state failed ${failureForLog(it)}") } }
     }
