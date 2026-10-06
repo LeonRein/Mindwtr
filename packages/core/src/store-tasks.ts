@@ -1,5 +1,6 @@
 import { mapSqliteTaskRow, rawReadTaskSnapshot } from './sqlite-adapter';
 import { rawReadProjectSnapshot } from './sqlite-raw-snapshot';
+import { referenceBatchModules, type ReferenceBatchValidator } from './store-reference-batch-modules';
 import { buildNewTask } from './task-creation';
 import { TASK_SQLITE_COLUMNS, taskFromSqliteRow, taskToSqliteRow } from './task-sync-schema';
 import { taskEditValuesEqual } from './json-value-equality';
@@ -987,16 +988,17 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
         request: { taskIds: string[] }; effect: { tasks: { before: Task; after: Task }[];
             projects: { before: Project; after: Project }[]; sections: { before: Section; after: Section }[];
             createdTasks?: Task[] }; deviceIdBefore: string | null; deviceIdToInitialize: string | null; updateAt: string;
-    }, authority: PreparedAreaAuthority, loadFamilyValidator: () => Promise<{
-        validateEnvelope: () => boolean; authorityMatches: (data: AppData) => boolean;
-    }>, conflictMessage: string): Promise<PreparedTaskEditResult> => {
+    }, authority: PreparedAreaAuthority, family: ((input: unknown) => ReferenceBatchValidator) | undefined,
+    conflictMessage: string): Promise<PreparedTaskEditResult> => {
         let result: PreparedTaskEditResult = { success: false, reason: 'conflict', error: conflictMessage };
         const adapter = getStorage();
-        // These modules import the store. Capture its adapter before loading any
-        // family or shared validator, then retain every guard after the await.
-        const [{ validateEnvelope, authorityMatches }, { historyRowLoadProjection }, { NativeReceiptSqliteAdapter }] =
-            await Promise.all([loadFamilyValidator(), import('./native-host-contract-task-checklist'),
-                import('./native-request-receipts')]);
+        // These modules import the store, so they register themselves (store-reference-batch-modules.ts). Capture the
+        // adapter, yield once as the module load did, then retain every guard after the await.
+        await Promise.resolve();
+        const shared = referenceBatchModules.shared;
+        if (!family || !shared) return result;
+        const { validateEnvelope, authorityMatches } = family(input);
+        const { historyRowLoadProjection, NativeReceiptSqliteAdapter } = shared;
         try {
             logInfo('Reference bulk action module loaded', {
                 scope: 'store', category: 'storage',
@@ -1876,31 +1878,13 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
     },
 
     commitPreparedReferenceTasksMove: async (input, authority: PreparedAreaAuthority): Promise<PreparedTaskEditResult> =>
-        commitPreparedRawReferenceBatch(input, authority,
-            async () => {
-                const { readReferenceTasksMoveEnvelope, referenceTasksMoveAuthorityMatches } =
-                    await import('./native-host-contract-reference-bulk-status');
-                return { validateEnvelope: () => Boolean(readReferenceTasksMoveEnvelope({ request: input.request, prepared: input })),
-                    authorityMatches: (data) => referenceTasksMoveAuthorityMatches(input, data) };
-            }, 'Reference Move conflicts with saved data'),
+        commitPreparedRawReferenceBatch(input, authority, referenceBatchModules.move, 'Reference Move conflicts with saved data'),
 
     commitPreparedReferenceTasksAddTag: async (input, authority: PreparedAreaAuthority): Promise<PreparedTaskEditResult> =>
-        commitPreparedRawReferenceBatch(input, authority,
-            async () => {
-                const { readReferenceTasksAddTagEnvelope, referenceTasksAddTagAuthorityMatches } =
-                    await import('./native-host-contract-reference-bulk-tag');
-                return { validateEnvelope: () => Boolean(readReferenceTasksAddTagEnvelope({ request: input.request, prepared: input })),
-                    authorityMatches: (data) => referenceTasksAddTagAuthorityMatches(input, data) };
-            }, 'Reference Add tag conflicts with saved data'),
+        commitPreparedRawReferenceBatch(input, authority, referenceBatchModules.addTag, 'Reference Add tag conflicts with saved data'),
 
     commitPreparedReferenceTasksRemoveTag: async (input, authority: PreparedAreaAuthority): Promise<PreparedTaskEditResult> =>
-        commitPreparedRawReferenceBatch(input, authority,
-            async () => {
-                const { readReferenceTasksRemoveTagEnvelope, referenceTasksRemoveTagAuthorityMatches } =
-                    await import('./native-host-contract-reference-bulk-remove-tag');
-                return { validateEnvelope: () => Boolean(readReferenceTasksRemoveTagEnvelope({ request: input.request, prepared: input })),
-                    authorityMatches: (data) => referenceTasksRemoveTagAuthorityMatches(input, data) };
-            }, 'Reference Remove tag conflicts with saved data'),
+        commitPreparedRawReferenceBatch(input, authority, referenceBatchModules.removeTag, 'Reference Remove tag conflicts with saved data'),
 
     commitPreparedArchivedTasksMutation: async (input, authority: PreparedAreaAuthority): Promise<PreparedTaskEditResult> => {
         let result: PreparedTaskEditResult = { success: false, reason: 'conflict', error: 'Archive Trash conflicts with saved data' };
