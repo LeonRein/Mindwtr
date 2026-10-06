@@ -1,7 +1,7 @@
 import { act, fireEvent, render, waitFor, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Area, Project, Section } from '@mindwtr/core';
+import { useTaskStore, type Area, type Project, type Section, type Task } from '@mindwtr/core';
 
 import { LanguageProvider } from '../../../contexts/language-context';
 import { TaskBulkOrganizeModal } from './TaskBulkOrganizeModal';
@@ -20,6 +20,12 @@ vi.mock('@mindwtr/core', async (importOriginal) => ({
 }));
 
 const t = (key: string) => key;
+const initialStoreState = useTaskStore.getState();
+const tokenTask = (id: string, overrides: Partial<Task> = {}): Task => ({
+    id, title: id, status: 'next', contexts: ['@office'], tags: ['#admin'],
+    createdAt: '2026-10-06T00:00:00.000Z', updatedAt: '2026-10-06T00:00:00.000Z',
+    ...overrides,
+});
 
 const project: Project = {
     id: 'project-1',
@@ -94,10 +100,118 @@ function setInputValue(input: HTMLInputElement, value: string) {
 
 describe('TaskBulkOrganizeModal', () => {
     beforeEach(() => {
+        act(() => useTaskStore.setState(initialStoreState, true));
         createAreaMock.mockReset();
         createProjectMock.mockReset();
         ensureDestinationSavedMock.mockReset();
         ensureDestinationSavedMock.mockResolvedValue(undefined);
+    });
+
+    it('selects existing context and tag suggestions alongside manually typed tokens without applying on Enter', () => {
+        act(() => useTaskStore.setState({ _allTasks: [tokenTask('known')] }));
+        const { getByLabelText, getByRole, onApply } = renderModal();
+        const contexts = getByLabelText('Contexts') as HTMLInputElement;
+        const tags = getByLabelText('Tags') as HTMLInputElement;
+
+        fireEvent.change(contexts, { target: { value: '@new-place, off' } });
+        expect(getByRole('option', { name: '@office' })).toBeInTheDocument();
+        fireEvent.keyDown(contexts, { key: 'ArrowDown' });
+        fireEvent.keyDown(contexts, { key: 'Enter' });
+        expect(contexts).toHaveValue('@new-place, @office, ');
+        expect(onApply).not.toHaveBeenCalled();
+
+        fireEvent.change(tags, { target: { value: 'fresh, adm' } });
+        fireEvent.click(getByRole('option', { name: '#admin' }));
+        expect(tags).toHaveValue('fresh, #admin, ');
+        fireEvent.click(getByRole('button', { name: 'Apply to selected' }));
+        expect(onApply).toHaveBeenCalledWith({ contexts: ['@new-place', '@office'], tags: ['#fresh', '#admin'] });
+    });
+
+    it('uses the editor token scope and refreshes suggestions from workspace changes', () => {
+        act(() => useTaskStore.setState({ _allTasks: [
+            tokenTask('current', { tags: ['#admin', 'Legacy Label'] }),
+            tokenTask('done', { status: 'done', contexts: ['@finished'], tags: ['#completed'] }),
+            tokenTask('archived', { status: 'archived', contexts: ['Seasonal Planning'], tags: ['#archived'] }),
+            tokenTask('deleted', { deletedAt: '2026-10-06T00:00:00.000Z', contexts: ['@deleted'], tags: ['#deleted'] }),
+        ] }));
+        const { getByLabelText, getByRole, queryByRole } = renderModal();
+        const contexts = getByLabelText('Contexts');
+        const tags = getByLabelText('Tags');
+
+        fireEvent.change(contexts, { target: { value: '@' } });
+        expect(getByRole('option', { name: '@office' })).toBeInTheDocument();
+        expect(getByRole('option', { name: '@finished' })).toBeInTheDocument();
+        expect(getByRole('option', { name: '@Seasonal Planning' })).toBeInTheDocument();
+        expect(queryByRole('option', { name: '@deleted' })).not.toBeInTheDocument();
+        fireEvent.keyDown(contexts, { key: 'Escape' });
+        fireEvent.change(tags, { target: { value: '#' } });
+        expect(getByRole('option', { name: '#admin' })).toBeInTheDocument();
+        expect(getByRole('option', { name: '#completed' })).toBeInTheDocument();
+        expect(getByRole('option', { name: '#Legacy Label' })).toBeInTheDocument();
+        expect(queryByRole('option', { name: '#archived' })).not.toBeInTheDocument();
+        expect(queryByRole('option', { name: '#deleted' })).not.toBeInTheDocument();
+
+        act(() => useTaskStore.setState({ _allTasks: [tokenTask('updated', { tags: ['#added'] })] }));
+        expect(getByRole('option', { name: '#added' })).toBeInTheDocument();
+        expect(queryByRole('option', { name: '#admin' })).not.toBeInTheDocument();
+    });
+
+    it('preserves multiword suggested and manually entered context and tag labels on Apply', () => {
+        act(() => useTaskStore.setState({ _allTasks: [tokenTask('multiword', {
+            contexts: ['@Seasonal Planning'], tags: ['#Project Admin'],
+        })] }));
+        const { getByLabelText, getByRole, onApply } = renderModal();
+        fireEvent.change(getByLabelText('Contexts'), { target: { value: 'My Home, Sea' } });
+        fireEvent.click(getByRole('option', { name: '@Seasonal Planning' }));
+        fireEvent.change(getByLabelText('Tags'), { target: { value: 'Fresh Ideas, Pro' } });
+        fireEvent.click(getByRole('option', { name: '#Project Admin' }));
+        fireEvent.click(getByRole('button', { name: 'Apply to selected' }));
+
+        expect(onApply).toHaveBeenCalledWith({
+            contexts: ['@My Home', '@Seasonal Planning'],
+            tags: ['#Fresh Ideas', '#Project Admin'],
+        });
+    });
+
+    it('treats newlines as token separators without splitting spaces inside labels', () => {
+        const { getByLabelText, getByRole, onApply } = renderModal();
+        // Single-line DOM inputs strip newlines; supply a synthetic multiline
+        // change to exercise the Apply boundary independently of that behavior.
+        for (const [label, value] of [
+            ['Contexts', 'Home Office\nTravel Plans'],
+            ['Tags', 'Fresh Ideas\nProject Admin'],
+        ]) {
+            const input = getByLabelText(label);
+            Object.defineProperty(input, 'value', { configurable: true, writable: true, value });
+            fireEvent.input(input);
+        }
+        fireEvent.click(getByRole('button', { name: 'Apply to selected' }));
+
+        expect(onApply).toHaveBeenCalledWith({
+            contexts: ['@Home Office', '@Travel Plans'],
+            tags: ['#Fresh Ideas', '#Project Admin'],
+        });
+    });
+
+    it('dismisses suggestions before the dialog and keeps empty token fields as a no-op', () => {
+        act(() => useTaskStore.setState({ _allTasks: [tokenTask('known')] }));
+        const { getByLabelText, getByRole, queryByRole, onApply, onCancel } = renderModal();
+        const contexts = getByLabelText('Contexts');
+        fireEvent.change(contexts, { target: { value: 'off' } });
+        const suggestions = getByRole('listbox');
+        expect(suggestions).toHaveClass('static', 'w-full');
+        expect(getByRole('dialog')).toContainElement(suggestions);
+        expect(suggestions.closest('label')).toBeNull();
+
+        fireEvent.keyDown(contexts, { key: 'Escape' });
+        expect(queryByRole('listbox')).not.toBeInTheDocument();
+        expect(onCancel).not.toHaveBeenCalled();
+        fireEvent.keyDown(contexts, { key: 'Escape' });
+        expect(onCancel).toHaveBeenCalledOnce();
+
+        fireEvent.change(contexts, { target: { value: '' } });
+        fireEvent.click(getByRole('button', { name: 'Apply to selected' }));
+        expect(onApply).toHaveBeenCalledWith({ contexts: [], tags: [] });
     });
 
     it('offers areas in custom order through search while keeping sentinel choices and selection', async () => {

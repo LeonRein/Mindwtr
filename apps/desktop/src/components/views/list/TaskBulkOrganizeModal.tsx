@@ -1,14 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { ClipboardCheck, X } from 'lucide-react';
 import {
     compareAreasByOrder,
     createBulkOrganizeArea,
     createBulkOrganizeProject,
     ensureBulkOrganizeDestinationSaved,
+    getRetainedTaskContexts,
+    getUsedTaskTokens,
     isSelectableProjectForTaskAssignment,
-    parseBulkOrganizeTokenInput,
     safeParseDate,
+    serializeTaskDraftTokens,
     tFallback,
+    useTaskStore,
     type Area,
     type BulkOrganizeStatus,
     type BulkOrganizeTaskUpdateInput,
@@ -22,6 +25,7 @@ import { DateField } from '../../ui/DateField';
 import { ProjectSelector } from '../../ui/ProjectSelector';
 import { AreaSelector } from '../../ui/AreaSelector';
 import { useNativeDateInputLocale } from '../../../hooks/use-native-date-input-locale';
+import { TokenAutocompleteInput } from '../../Task/TokenAutocompleteInput';
 
 type TaskBulkOrganizeModalProps = {
     isOpen: boolean;
@@ -76,6 +80,11 @@ export function TaskBulkOrganizeModal({
     const createPendingRef = useRef(false);
     const createSessionRef = useRef(0);
     const { nativeDateInputLocale, dateFormatSetting } = useNativeDateInputLocale();
+    const tokenInputId = useId();
+    const retainedTasks = useTaskStore((state) => isOpen ? state._allTasks : null);
+    const allContexts = useMemo(() => retainedTasks ? getRetainedTaskContexts(retainedTasks) : [], [retainedTasks]);
+    const tasks = useTaskStore((state) => isOpen ? state.tasks : null);
+    const allTags = useMemo(() => tasks ? getUsedTaskTokens(tasks, (task) => task.tags) : [], [tasks]);
 
     useEffect(() => {
         createSessionRef.current += 1;
@@ -247,8 +256,8 @@ export function TaskBulkOrganizeModal({
         }
 
         const input: BulkOrganizeTaskUpdateInput = {
-            contexts: parseBulkOrganizeTokenInput(contextsInput, '@'),
-            tags: parseBulkOrganizeTokenInput(tagsInput, '#'),
+            contexts: serializeTaskDraftTokens(contextsInput.replace(/\n/g, ','), 'contexts'),
+            tags: serializeTaskDraftTokens(tagsInput.replace(/\n/g, ','), 'tags'),
         };
 
         if (status !== KEEP_VALUE) input.status = status;
@@ -463,24 +472,32 @@ export function TaskBulkOrganizeModal({
                 </div>
 
                 <div className="grid gap-3 sm:grid-cols-2">
-                    <label className="space-y-1 text-xs font-medium text-muted-foreground">
-                        <span>{tFallback(t, 'taskEdit.contextsLabel', 'Contexts')}</span>
-                        <input
+                    <div className="space-y-1 text-xs font-medium text-muted-foreground">
+                        <label htmlFor={`${tokenInputId}-contexts`}>{tFallback(t, 'taskEdit.contextsLabel', 'Contexts')}</label>
+                        <TokenAutocompleteInput
+                            id={`${tokenInputId}-contexts`}
                             value={contextsInput}
-                            onChange={(event) => setContextsInput(event.currentTarget.value)}
+                            onChange={setContextsInput}
+                            suggestions={allContexts}
+                            prefix="@"
                             className="h-9 w-full rounded-md border border-border bg-card px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                            dropdownClassName="static w-full"
                             placeholder="@computer, @office"
                         />
-                    </label>
-                    <label className="space-y-1 text-xs font-medium text-muted-foreground">
-                        <span>{tFallback(t, 'taskEdit.tagsLabel', 'Tags')}</span>
-                        <input
+                    </div>
+                    <div className="space-y-1 text-xs font-medium text-muted-foreground">
+                        <label htmlFor={`${tokenInputId}-tags`}>{tFallback(t, 'taskEdit.tagsLabel', 'Tags')}</label>
+                        <TokenAutocompleteInput
+                            id={`${tokenInputId}-tags`}
                             value={tagsInput}
-                            onChange={(event) => setTagsInput(event.currentTarget.value)}
+                            onChange={setTagsInput}
+                            suggestions={allTags}
+                            prefix="#"
                             className="h-9 w-full rounded-md border border-border bg-card px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                            dropdownClassName="static w-full"
                             placeholder="#project, #admin"
                         />
-                    </label>
+                    </div>
                 </div>
 
                 {showValidation && (

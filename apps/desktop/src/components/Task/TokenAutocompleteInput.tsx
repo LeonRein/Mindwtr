@@ -22,6 +22,7 @@ type TokenAutocompleteInputProps = {
     prefix: TokenAutocompletePrefix;
     placeholder?: string;
     className?: string;
+    dropdownClassName?: string;
     ariaLabel?: string;
     inputRef?: RefObject<HTMLInputElement | null>;
     onBlur?: FocusEventHandler<HTMLInputElement>;
@@ -72,6 +73,7 @@ export function TokenAutocompleteInput({
     prefix,
     placeholder,
     className,
+    dropdownClassName,
     ariaLabel,
     inputRef,
     onBlur,
@@ -223,7 +225,7 @@ export function TokenAutocompleteInput({
                 <div
                     id={listboxId}
                     role="listbox"
-                    className="absolute z-20 mt-2 w-64 rounded-md border border-border bg-popover shadow-lg p-1 text-xs"
+                    className={cn('absolute z-20 mt-2 w-64 rounded-md border border-border bg-popover shadow-lg p-1 text-xs', dropdownClassName)}
                 >
                     {options.map((option, index) => (
                         <button
