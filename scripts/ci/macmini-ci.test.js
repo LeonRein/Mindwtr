@@ -345,16 +345,42 @@ test.each([1, 2, 4])('symlinked HOME with %s trailing slashes is refused before 
   }
 });
 
-test('self-hosted pre-archive floor runs only after successful smoke and before device archive', () => {
+test('self-hosted pre-archive retirement requires smoke and uploaded evidence before the unchanged floor and archive', () => {
   const workflow = readFileSync(fileURLToPath(new URL('../../.github/workflows/native-platform-ci.yml', import.meta.url)), 'utf8');
   const smoke = workflow.indexOf('- name: Smoke test cold and warm links');
+  const upload = workflow.indexOf('- name: Upload completed simulator validation evidence');
+  const retire = workflow.indexOf('- name: Retire completed simulator build outputs before archive');
   const floor = workflow.indexOf('- name: Ensure disk headroom before the device archive');
   const archive = workflow.indexOf('- name: Create unsigned Release device archive');
-  expect(smoke).toBeGreaterThan(0); expect(floor).toBeGreaterThan(smoke); expect(archive).toBeGreaterThan(floor);
+  expect(smoke).toBeGreaterThan(0); expect(upload).toBeGreaterThan(smoke);
+  expect(retire).toBeGreaterThan(upload); expect(floor).toBeGreaterThan(retire); expect(archive).toBeGreaterThan(floor);
+  expect(workflow.slice(smoke, upload)).toContain('id: ios27_smoke');
+  const uploaded = workflow.slice(upload, retire);
+  expect(uploaded).toContain('id: ios27_pre_archive_evidence');
+  expect(uploaded).toContain("if: success() && runner.environment == 'self-hosted' && matrix.lane == 'xcode27' && steps.ios27_smoke.outcome == 'success'");
+  expect(uploaded).toContain('uses: actions/upload-artifact@');
+  expect(uploaded).toContain('name: ios27-simulator-validation-${{ github.run_id }}-${{ github.run_attempt }}');
+  expect(uploaded).toContain('path: ${{ runner.temp }}/ios27-artifacts');
+  expect(uploaded).toContain('if-no-files-found: error');
+  const retired = workflow.slice(retire, floor);
+  for (const requirement of ["success()", "runner.environment == 'self-hosted'", "matrix.lane == 'xcode27'",
+    "steps.apple_cache.outcome == 'success'", "steps.ios27_smoke.outcome == 'success'",
+    "steps.ios27_pre_archive_evidence.outcome == 'success'", "steps.ios27_pre_archive_evidence.outputs.artifact-id != ''"]) {
+    expect(retired).toContain(requirement);
+  }
+  expect(retired).toContain('MINDWTR_EVIDENCE_UPLOADED: "true"');
+  expect(retired).toContain('run: python3 scripts/ci/cleanup-apple-outputs.py ios-pre-archive');
+  expect(retired).not.toContain('always()');
   const step = workflow.slice(floor, archive);
   expect(step).toContain("if: success() && runner.environment == 'self-hosted' && matrix.lane == 'xcode27'");
   expect(step).toContain('run: bash scripts/ci/prepare-apple-cache.sh before-archive'); expect(step).not.toContain('always()');
   expect(workflow.match(/prepare-apple-cache\.sh before-archive/g)).toHaveLength(1);
+  const finalUpload = workflow.indexOf('- name: Upload Xcode 27 validation evidence');
+  const finalCleanup = workflow.indexOf('- name: Retire completed iOS build outputs');
+  expect(finalUpload).toBeGreaterThan(archive); expect(finalCleanup).toBeGreaterThan(finalUpload);
+  expect(workflow.slice(finalUpload, finalCleanup)).toContain('if: ${{ always() && matrix.lane');
+  expect(workflow.slice(finalCleanup)).toContain("steps.ios27_evidence.outputs.artifact-id != ''");
+  expect(workflow.slice(finalCleanup)).toContain('run: python3 scripts/ci/cleanup-apple-outputs.py ios');
 });
 
 test('the dispatch broker propagates failures, cancels interrupted runs, and rejects invalid commits', () => {

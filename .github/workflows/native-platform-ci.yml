@@ -866,11 +866,28 @@ jobs:
 
       - name: Smoke test cold and warm links on the iOS 27 simulator
         if: matrix.lane == 'xcode27'
+        id: ios27_smoke
         run: |
           bash scripts/ci/smoke-ios27-simulator.sh \
             '${{ steps.ios27_simulator.outputs.simulator_udid }}' \
             '${{ steps.ios27_release_simulator.outputs.app_path }}' \
             "$RUNNER_TEMP/ios27-artifacts"
+
+      - name: Upload completed simulator validation evidence
+        id: ios27_pre_archive_evidence
+        if: success() && runner.environment == 'self-hosted' && matrix.lane == 'xcode27' && steps.ios27_smoke.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ios27-simulator-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios27-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retire completed simulator build outputs before archive
+        if: ${{ success() && runner.environment == 'self-hosted' && matrix.lane == 'xcode27' && steps.apple_cache.outcome == 'success' && steps.ios27_smoke.outcome == 'success' && steps.ios27_pre_archive_evidence.outcome == 'success' && steps.ios27_pre_archive_evidence.outputs.artifact-id != '' }}
+        env:
+          MINDWTR_EVIDENCE_UPLOADED: "true"
+        run: python3 scripts/ci/cleanup-apple-outputs.py ios-pre-archive
 
       - name: Ensure disk headroom before the device archive
         if: success() && runner.environment == 'self-hosted' && matrix.lane == 'xcode27'

@@ -68,6 +68,88 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in removed))
         self.assertTrue(all(path.exists() for path in kept))
 
+    def test_pre_archive_retires_completed_outputs_preserves_archive_inputs_and_evidence(self):
+        removed = [self.file("simulator/" + child + "/fixture", self.cache)
+                   for child in cleanup.DERIVED_OUTPUTS]
+        removed += [self.file("watch/" + child + "/fixture", self.cache)
+                    for child in ("products", "intermediates")]
+        removed += [self.file("swift/" + package + "/out/fixture", self.cache)
+                    for package in cleanup.SWIFT_PACKAGES]
+        kept = [self.file("archive/" + child + "/fixture", self.cache)
+                for child in cleanup.DERIVED_OUTPUTS]
+        kept += [self.file(name + "/fixture", self.cache) for name in (
+            "simulator/Logs", "simulator/SourcePackages", "archive/Logs", "archive/SourcePackages",
+            "swift/watch/checkouts", "swift/watch/repositories", "swift/watch/artifacts",
+            "swift/unknown/out", "watch/unknown", "unknown")]
+        kept += [self.file("apps/mobile/ios/build/generated/source"),
+                 self.file("apps/mobile/ios/Pods/dependency"), self.file("node_modules/dependency"),
+                 self.file("ios27-artifacts/Mindwtr-unsigned.xcarchive/app", self.temporary),
+                 self.file("ios27-artifacts/release-simulator-build.log", self.temporary),
+                 self.file("ios27-artifacts/cold-link-screen.png", self.temporary),
+                 self.file("older-generation/simulator/Build/fixture", self.cache.parent)]
+        original = [(path.stat().st_ino, path.read_bytes()) for path in kept]
+        result = cleanup.cleanup("ios-pre-archive")
+        self.assertEqual(result["kind"], "ios-pre-archive")
+        self.assertEqual(result["removed"], len(removed))
+        self.assertTrue(all(not path.exists() for path in removed))
+        self.assertEqual([(path.stat().st_ino, path.read_bytes()) for path in kept], original)
+        self.assertIn("beforeAvailableBytes", result)
+        self.assertIn("afterAvailableBytes", result)
+        self.assertEqual(cleanup.cleanup("ios-pre-archive")["removed"], 0)
+
+    def test_pre_archive_requires_upload_actions_and_current_compiler(self):
+        output = self.file("simulator/Build/fixture", self.cache)
+        for environment in ({"MINDWTR_EVIDENCE_UPLOADED": "false"}, {"GITHUB_ACTIONS": "false"},
+                            {"MINDWTR_NATIVE_CACHE": str(self.cache.parent / "different")}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment):
+                with self.assertRaises(cleanup.Refused):
+                    cleanup.cleanup("ios-pre-archive")
+                self.assertEqual(output.read_text(), "fixture")
+        with patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "github-hosted", "HOME": "invalid"}):
+            self.assertEqual(cleanup.cleanup("ios-pre-archive")["skipped"], "hosted-runner")
+        self.assertEqual(output.read_text(), "fixture")
+
+    def test_pre_archive_late_symlink_preserves_all_earlier_candidates(self):
+        earlier = [self.file("simulator/Build/fixture", self.cache),
+                   self.file("watch/products/fixture", self.cache)]
+        preserved = self.file("preserved/fixture", self.home)
+        late = self.cache / "swift/watch/out"
+        late.parent.mkdir(parents=True)
+        late.symlink_to(preserved.parent, target_is_directory=True)
+        with self.assertRaises(cleanup.Refused):
+            cleanup.cleanup("ios-pre-archive")
+        self.assertTrue(all(path.read_text() == "fixture" for path in earlier))
+        self.assertEqual(preserved.read_text(), "fixture")
+        self.assertTrue(late.is_symlink())
+
+    def test_pre_archive_parent_symlink_cannot_delete_earlier_output_or_target(self):
+        output = self.file("simulator/Build/fixture", self.cache)
+        preserved = self.file("preserved/products/fixture", self.home)
+        (self.cache / "watch").symlink_to(preserved.parent.parent, target_is_directory=True)
+        with self.assertRaises(OSError):
+            cleanup.cleanup("ios-pre-archive")
+        self.assertEqual(output.read_text(), "fixture")
+        self.assertEqual(preserved.read_text(), "fixture")
+
+    def test_pre_archive_replaced_candidate_is_retained(self):
+        output = self.file("simulator/Build/fixture", self.cache)
+        original = cleanup.candidate_identity
+        count = 0
+        def replace_before_removal(path):
+            nonlocal count
+            if path == output.parent:
+                count += 1
+                if count == 2:
+                    path.rename(path.with_name("retained-original"))
+                    path.mkdir()
+                    (path / "new").write_text("replacement")
+            return original(path)
+        with patch.object(cleanup, "candidate_identity", side_effect=replace_before_removal):
+            with self.assertRaises(cleanup.Refused):
+                cleanup.cleanup("ios-pre-archive")
+        self.assertEqual((output.parent / "new").read_text(), "replacement")
+        self.assertEqual((output.parent.with_name("retained-original") / "fixture").read_text(), "fixture")
+
     def test_upload_failure_preserves_everything(self):
         output = self.file("apps/ios-native/.build/out/fixture")
         os.environ["MINDWTR_EVIDENCE_UPLOADED"] = "false"

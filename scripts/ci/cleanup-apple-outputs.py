@@ -117,12 +117,14 @@ def cleanup(kind):
         candidates.extend(build / child for child in ("out", "tmp"))
         candidates.extend(build / "DerivedData" / child for child in DERIVED_OUTPUTS)
     else:
-        for generation in ("simulator", "archive"):
+        generations = ("simulator",) if kind == "ios-pre-archive" else ("simulator", "archive")
+        for generation in generations:
             candidates.extend(cache / generation / child for child in DERIVED_OUTPUTS)
         candidates.extend(cache / "watch" / child for child in ("products", "intermediates"))
         candidates.extend(cache / "swift" / package / "out" for package in SWIFT_PACKAGES)
-        candidates.append(workspace / "apps/mobile/ios/build")
-        candidates.append(temporary / "ios27-artifacts/Mindwtr-unsigned.xcarchive")
+        if kind != "ios-pre-archive":
+            candidates.append(workspace / "apps/mobile/ios/build")
+            candidates.append(temporary / "ios27-artifacts/Mindwtr-unsigned.xcarchive")
 
     # Inspect every candidate before removing any: a symlink late in the list
     # cannot cause partial cleanup followed by a validation refusal.
@@ -148,8 +150,8 @@ def cleanup(kind):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in ("swiftui", "ios"):
-            raise Refused("Expected swiftui or ios cleanup scope")
+        if len(sys.argv) != 2 or sys.argv[1] not in ("swiftui", "ios", "ios-pre-archive"):
+            raise Refused("Expected swiftui, ios or ios-pre-archive cleanup scope")
         print(json.dumps(cleanup(sys.argv[1]), sort_keys=True))
     except Refused as error:
         print("cleanup-apple-outputs: " + str(error), file=sys.stderr)
