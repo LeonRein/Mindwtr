@@ -699,10 +699,12 @@
     // The host's secure storage (SecretStore.kt: RN's expo-secure-store items in
     // the Android Keystore, under RN's key names), for the credentials core's
     // sync and AI settings keep. Each call runs off the engine thread.
-    var secretCall = function (op, key, value, refuse) {
+    var secretCall = function (op, key, value, refuse, accessibility) {
         return new Promise(function (resolve, reject) {
             if (refuse) refuseIfCancelled();
-            startIo(hostCall(native().secretCall(JSON.stringify({ op: op, key: String(key), value: value }))), function (answer) {
+            var payload = { op: op, key: String(key), value: value };
+            if (op === 'set' && global.__mindwtrHostPlatform === 'ios' && accessibility !== undefined) payload.accessibility = accessibility;
+            startIo(hostCall(native().secretCall(JSON.stringify(payload))), function (answer) {
                 if (answer.error !== undefined) reject(new Error(answer.error));
                 else resolve(op === 'get' ? answer.value : undefined);
             });
@@ -712,10 +714,10 @@
         return {
             /** The value saved under [key], or null. */
             getSecret: function (key) { mark('secrets'); return secretCall('get', key, undefined, refuse); },
-            setSecret: function (key, value) {
+            setSecret: function (key, value, accessibility) {
                 mark('secrets');
                 if (typeof value !== 'string') return Promise.reject(new TypeError('A secret value must be a string'));
-                return secretCall('set', key, value, refuse);
+                return secretCall('set', key, value, refuse, accessibility);
             },
             deleteSecret: function (key) { mark('secrets'); return secretCall('delete', key, undefined, refuse); },
         };

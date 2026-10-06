@@ -55,6 +55,7 @@ import {
     type SyncBadgeState,
     type SyncCryptoPrimitives,
     type SyncSecretStoragePort,
+    type SyncSecretAccessibility,
 } from '@mindwtr/core';
 
 /** host-entry.ts's AsyncStorage over RnKeyValue.kt. */
@@ -69,7 +70,7 @@ export type HostKeyValue = {
 export type NativeSyncBindings = {
     keyValue: HostKeyValue;
     /** host-polyfills.js's secret calls (SecretStore.kt, expo-secure-store's format). */
-    secrets: { getSecret(key: string): Promise<string | null>; setSecret(key: string, value: string): Promise<void>; deleteSecret(key: string): Promise<void> };
+    secrets: { getSecret(key: string): Promise<string | null>; setSecret(key: string, value: string, accessibility?: SyncSecretAccessibility): Promise<void>; deleteSecret(key: string): Promise<void> };
     /** The boot's validated SQLite adapter: the local snapshot a cycle reads and saves. */
     localData: () => { getData(): Promise<AppData>; saveData(data: AppData): Promise<void> };
     /** The device's network state now (HostNetwork.kt), as expo-network reads it. */
@@ -147,7 +148,9 @@ export const createNativeSync = (bindings: NativeSyncBindings) => {
     const secretStorage: SyncSecretStoragePort = {
         isAvailable: async () => true,
         getItem: (key) => bindings.secrets.getSecret(key),
-        setItem: (key, value) => bindings.secrets.setSecret(key, value),
+        setItem: (key, value, accessibility) => globalThis.__mindwtrHostPlatform === 'ios'
+            ? bindings.secrets.setSecret(key, value, accessibility)
+            : bindings.secrets.setSecret(key, value),
         deleteItem: (key) => bindings.secrets.deleteSecret(key),
     };
     const secureConfig = createSecureSyncConfigStore({ storage, secrets: secretStorage, vault: createSyncSecretVault(secretStorage) });

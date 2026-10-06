@@ -327,7 +327,7 @@ const nativeSync: NativeSync | null = typeof (globalThis.__mindwtrNative as { kv
         keyValue,
         secrets: {
             getSecret: (key) => (globalThis.__mindwtrSyncSecrets as HostSecrets).getSecret(key),
-            setSecret: (key, value) => (globalThis.__mindwtrSyncSecrets as HostSecrets).setSecret(key, value),
+            setSecret: (key, value, accessibility) => (globalThis.__mindwtrSyncSecrets as HostSecrets).setSecret(key, value, accessibility),
             deleteSecret: (key) => (globalThis.__mindwtrSyncSecrets as HostSecrets).deleteSecret(key),
         },
         localData: () => {
@@ -539,7 +539,7 @@ const requireSaved = () => {
 /** host-polyfills.js's secret calls (SecretStore.kt). */
 type HostSecrets = {
     getSecret(key: string): Promise<string | null>;
-    setSecret(key: string, value: string): Promise<void>;
+    setSecret(key: string, value: string, accessibility?: 'after-first-unlock' | 'when-unlocked'): Promise<void>;
     deleteSecret(key: string): Promise<void>;
 };
 
@@ -1214,6 +1214,17 @@ const attachmentDraftDependencies = {
 };
 
 globalThis.MindwtrHost = {
+    /** Private fixed receipt; never carries a credential or account. */
+    nativeSecretDelivered(): void {
+        if (globalThis.__mindwtrHostPlatform !== 'ios' || !bootAdapter
+            || isSandboxMode() || isWorkspaceTransitionActive()) return;
+        try {
+            logInfo('Native iOS secure storage operation delivered', {
+                scope: 'native-ios', force: true,
+                context: { releaseCheck: 'v1.3.5/ios-secure-storage', operation: 'secure-storage', outcome: 'delivered' },
+            });
+        } catch { /* A fixed diagnostic never changes the transport result. */ }
+    },
     /** Private fixed transport receipt; no request data or domain authority. */
     nativeHTTPDelivered(): void {
         if (globalThis.__mindwtrHostPlatform !== 'ios' || !bootAdapter

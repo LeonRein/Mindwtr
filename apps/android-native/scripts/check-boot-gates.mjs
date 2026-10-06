@@ -162,6 +162,7 @@ for (const [init, key] of [['?token=first&a=1&token=second', 'token'], ['?a=1', 
     let taken = '';
     const aborted = [];
     const store = new Map();
+    const secretRequests = [];
     let clock = 0;
     let ids = 0;
     let nextCalls = 0;
@@ -176,7 +177,9 @@ for (const [init, key] of [['?token=first&a=1&token=second', 'token'], ['?a=1', 
         },
         netAbort(id) { aborted.push(id); return null; },
         secretCall(json) {
-            const { op, key, value } = JSON.parse(json);
+            const request = JSON.parse(json);
+            secretRequests.push(request);
+            const { op, key, value } = request;
             if (!/^[\w.-]+$/.test(key)) return '!MindwtrNativeError:Invalid secret key';
             const id = String(++ids);
             if (op === 'set') store.set(key, value);
@@ -362,6 +365,17 @@ for (const [init, key] of [['?token=first&a=1&token=second', 'token'], ['?a=1', 
     net.__pumpTimers();
     assert.equal(await syncSaved, undefined);
     assert.equal(store.get('mindwtr_cloud_token'), 'drained', 'a sync secret write reaches the host while another call drains');
+    net.__mindwtrHostPlatform = 'ios';
+    const iosClass = net.__mindwtrSyncSecrets.setSecret('fixture', 'synthetic', 'after-first-unlock');
+    net.__pumpTimers(); await iosClass;
+    assert.deepEqual(secretRequests.at(-1), { op: 'set', key: 'fixture', value: 'synthetic', accessibility: 'after-first-unlock' });
+    const iosDefault = net.__mindwtrSyncSecrets.setSecret('fixture', 'synthetic');
+    net.__pumpTimers(); await iosDefault;
+    assert.equal(Object.hasOwn(secretRequests.at(-1), 'accessibility'), false, 'Old iOS two-argument payload is unchanged');
+    net.__mindwtrHostPlatform = 'android';
+    const androidClass = net.__mindwtrSyncSecrets.setSecret('fixture', 'synthetic', 'after-first-unlock');
+    net.__pumpTimers(); await androidClass;
+    assert.equal(Object.hasOwn(secretRequests.at(-1), 'accessibility'), false, 'Android wire keeps its single existing class');
     net.__resumeHostCalls();
     run("fetch('https://dav.example/later')");
     assert.equal(sent.at(-1).url, 'https://dav.example/later', 'calls reach the host again once it resumes them');
@@ -3977,6 +3991,45 @@ const poll = async (state, id) => {
         other.MindwtrHost.nativeHTTPDelivered(); await new Promise((tick) => setImmediate(tick));
         assert.equal(other.logText, prior, 'Invalid platform emits no transport marker');
         assert.equal(other.httpCalls, 0);
+    }
+}
+// Secure storage alone also leaves KV/sync/AI absent; the fixed success marker
+// does not read an account and uses the existing forced Diagnostics writer.
+{
+    const configureSecrets = (state) => {
+        state.secretCalls = 0;
+        state.__mindwtrNative.secretCall = () => { state.secretCalls++; throw new Error('Unexpected startup secure storage'); };
+        state.__mindwtrNative.ioNext = () => '';
+        state.__mindwtrNative.ioBody = () => '';
+    };
+    const local = makeState(0, [], 'ios', configureSecrets);
+    assert.deepEqual(Object.keys(local.contractBindings), []);
+    assert.equal(typeof local.__mindwtrNative.kvMultiGet, 'undefined');
+    local.MindwtrHost.nativeSecretDelivered();
+    assert.equal(local.logText, null, 'No preboot secure storage receipt');
+    assert.equal((await poll(local, local.MindwtrHost.boot())).ok, true);
+    assert.equal(local.secretCalls, 0, 'Installing the secret bridge performs no startup operation');
+    local.settings = { diagnostics: { loggingEnabled: false } };
+    local.MindwtrHost.nativeSecretDelivered();
+    await poll(local, local.MindwtrHost.logShare());
+    const lines = local.logText.split('\n').filter((line) => line.includes('v1.3.5/ios-secure-storage'));
+    assert.equal(lines.length, 1, 'Forced secure storage marker survives disabled logging');
+    assert.deepEqual(JSON.parse(lines[0]).context, {
+        releaseCheck: 'v1.3.5/ios-secure-storage', operation: 'secure-storage', outcome: 'delivered',
+    });
+    const before = local.logText;
+    for (const field of ['sandbox', 'workspaceTransition']) {
+        local[field] = true; local.MindwtrHost.nativeSecretDelivered(); local[field] = false;
+    }
+    await new Promise((tick) => setImmediate(tick));
+    assert.equal(local.logText, before, 'Unsettled workspace emits no secure storage receipt');
+    for (const platform of ['android', undefined]) {
+        const other = makeState(0, [], platform, configureSecrets);
+        assert.equal((await poll(other, other.MindwtrHost.boot())).ok, true);
+        const prior = other.logText;
+        other.MindwtrHost.nativeSecretDelivered(); await new Promise((tick) => setImmediate(tick));
+        assert.equal(other.logText, prior, 'Invalid platform emits no secure storage marker');
+        assert.equal(other.secretCalls, 0);
     }
 }
 // Production host-entry selects independent local attachment policy only for

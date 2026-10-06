@@ -73,5 +73,10 @@ final class HostIOFaults {
     var httpTimeout: TimeInterval?
     var httpByteLimit: Int?
     var configureHTTPJobs: ((NativeHTTPJobs) -> Void)?
+    var secretService: String?
+    var secretStatus: ((String, String) -> Int32?)?
+    var secretBeforeOperation: ((String, String) -> Void)?
+    var secretAfterOperation: ((String, String) -> Void)?
+    var configureSecretJobs: ((NativeSecretJobs) -> Void)?
 }
 #endif
