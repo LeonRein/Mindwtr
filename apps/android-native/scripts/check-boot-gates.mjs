@@ -3840,7 +3840,8 @@ const syncOnly = [...new Set([...hostSyncTs.matchAll(/^import \{([\s\S]*?)\} fro
 assert(syncOnly.includes('createMobileSyncService') && syncOnly.includes('createMobileSyncTriggers'), 'host-sync.ts\'s core imports parsed');
 // S4b final pass: core's partly-encrypted rule runs only when the host gives the sync service the location probe; without it a
 // device with encryption off would upload plain attachments beside ciphertext. The card's "Check this location again" needs recheck.
-assert(/probeLocationCiphertext: \(\) => transitions\.probeSyncLocationCiphertext\(\),/.test(hostSyncTs), 'the native sync service asks whether the location holds ciphertext');
+// The cycle names its own folder (an activation's candidate is not the stored one), passed through as it is.
+assert(/probeLocationCiphertext: \(target\) => transitions\.probeSyncLocationCiphertext\(target\),/.test(hostSyncTs), 'the native sync service asks whether the location holds ciphertext');
 assert(/recheck: \(\) => transitions\.recheckPartlyEncryptedLocation\(\),/.test(hostSyncTs), 'the native encryption card rechecks a partly encrypted location');
 const fakeCoreWithSync = `${fakeCore}\n${syncOnly.map((name) => `export const ${name} = () => { throw new Error('${name}: sync is not bound in the gates'); };`).join('\n')}\n`;
 const built = await build({
