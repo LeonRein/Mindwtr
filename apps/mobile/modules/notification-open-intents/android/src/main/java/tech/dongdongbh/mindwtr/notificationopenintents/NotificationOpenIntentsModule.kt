@@ -18,6 +18,11 @@ class NotificationOpenIntentsModule : Module() {
       NotificationOpenPayloadStore.consume()
     }
 
+    Function("consumePendingCompletions") {
+      val context = appContext.reactContext ?: return@Function emptyList<Map<String, String>>()
+      NotificationOpenPayloadStore.consumeCompletions(context)
+    }
+
     Function("showPersistentCaptureNotification") { title: String, text: String, channelName: String ->
       val context = appContext.reactContext ?: return@Function
       PersistentCaptureNotifier.post(context, title, text, channelName)

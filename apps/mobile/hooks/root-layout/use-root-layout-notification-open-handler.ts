@@ -9,7 +9,7 @@ import {
 
 import { logInfo } from '@/lib/app-log';
 import { setNotificationOpenHandler } from '@/lib/notification-service';
-import { consumePendingNotificationOpenPayload } from '@/modules/notification-open-intents';
+import { consumePendingNotificationCompletions, consumePendingNotificationOpenPayload } from '@/modules/notification-open-intents';
 
 // Outcome evidence for #1028: a received action that changes nothing must say
 // why, or the log can't separate a lost tap from a deliberately ignored one.
@@ -145,6 +145,13 @@ export function useRootLayoutNotificationOpenHandler({
                     taskId: payload.taskId || '',
                 });
                 handleNotificationOpen(payload);
+            });
+            // Done taps made while the app was not running; each completes its task once.
+            void consumePendingNotificationCompletions().then((completions) => {
+                for (const completion of completions) {
+                    logNotificationOutcome('Stored Done action consumed', { taskId: completion.taskId || '' });
+                    handleNotificationOpen({ ...completion, actionIdentifier: 'complete' });
+                }
             });
         }
         return () => {

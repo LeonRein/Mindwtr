@@ -12,6 +12,7 @@ type NotificationOpenPayload = {
 
 type NotificationOpenIntentsModule = {
   consumePendingOpenPayload(): Record<string, string> | null;
+  consumePendingCompletions?: () => Record<string, string>[];
   ensureReminderChannel?: (channelId: string, channelName: string) => void;
   showPersistentCaptureNotification?: (title: string, text: string, channelName: string) => void;
   hidePersistentCaptureNotification?: () => void;
@@ -81,6 +82,16 @@ export async function consumePendingNotificationOpenPayload(): Promise<Notificat
 
   const payload = await alarmNotificationModule?.consumePendingNotificationOpenPayload?.();
   return payload ? normalizePayload(payload) : null;
+}
+
+/**
+ * Done taps on Android reminders made while the app was not running, oldest first: the native
+ * receiver keeps each on disk until the app starts and applies it here.
+ */
+export async function consumePendingNotificationCompletions(): Promise<NotificationOpenPayload[]> {
+  if (Platform.OS !== 'android') return [];
+  const payloads = nativeModule?.consumePendingCompletions?.() ?? [];
+  return payloads.map((payload) => normalizePayload(payload));
 }
 
 export async function ensureReminderNotificationChannel(channelId: string, channelName: string): Promise<void> {
