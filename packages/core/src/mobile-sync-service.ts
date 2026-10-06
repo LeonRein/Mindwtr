@@ -372,7 +372,8 @@ export type MobileSyncEncryptionPort = Pick<
 > & {
   /** Whether the location holds ciphertext beside plaintext (core's encryption service probeSyncLocationCiphertext,
    *  sampled). Asked before a WebDAV or Dropbox attachment pass with no key; absent on a host without the service. */
-  probeLocationCiphertext?: () => Promise<'plaintext' | 'encrypted' | 'mixed'>;
+  /** [target] names the cycle's own WebDAV folder (an activation's candidate is not the stored one); none reads the stored. */
+  probeLocationCiphertext?: (target?: { webdav?: MobileWebDavSyncConfig }) => Promise<'plaintext' | 'encrypted' | 'mixed'>;
 };
 
 /** Core functions and the store, called through here so a host's tests can replace them the
@@ -1484,7 +1485,15 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
       if (this.encryptionMaterial) return;
       const probe = host.encryption.probeLocationCiphertext;
       if (!probe || (this.backend !== 'webdav' && !(this.backend === 'cloud' && this.cloudProvider === 'dropbox'))) return;
-      this.locationCiphertext ??= await probe();
+      // The cycle's own folder: an activation probe's candidate is not the stored location yet.
+      if (this.locationCiphertext === null) {
+        this.locationCiphertext = await probe(this.backend === 'webdav' && this.webdavConfig ? { webdav: this.webdavConfig } : undefined);
+        if (this.configOverride) {
+          logSyncInfo('Sync candidate location ciphertext checked', {
+            releaseCheck: 'v1.3.5/candidate-ciphertext-probe', backend: this.backend, found: this.locationCiphertext,
+          });
+        }
+      }
       if (this.locationCiphertext !== 'plaintext') throw new SyncEncryptionPartlyEncryptedError();
     }
 

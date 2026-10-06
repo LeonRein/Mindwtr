@@ -318,6 +318,33 @@ describe('mobile sync service behind fake ports', () => {
     expect(fake.values.get(SYNC_BACKEND_KEY)).toBe('off');
   });
 
+  it('asks the candidate WebDAV folder, not the stored one, whether it holds ciphertext', async () => {
+    // The stored folder is partly encrypted (an Enable cut off there); a switch to a clean folder must not be refused for it.
+    const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
+    fake.host.attachments.hasPendingWork = async () => true;
+    fake.host.attachments.syncWebdav = vi.fn(async () => false as const);
+    const probe = vi.fn(async (target?: { webdav?: { url: string } }) => (
+      target?.webdav?.url.startsWith('https://candidate.example.com') ? 'plaintext' as const : 'mixed' as const));
+    fake.host.encryption = { ...fake.host.encryption, probeLocationCiphertext: probe };
+    const withFile = (): AppData => ({ ...emptyData(), tasks: [{ id: 't1', title: 'T', status: 'inbox', tags: [], contexts: [],
+      createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
+      attachments: [{ id: 'a1', kind: 'file', title: 'a.pdf', uri: 'file:///a.pdf', cloudKey: 'attachments/a1.pdf', localStatus: 'available',
+        createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z' }] }] } as AppData);
+    fake.host.localData.getData = async () => withFile();
+    fake.host.core!.getInMemoryAppDataSnapshot = () => withFile();
+    fake.host.core!.performSyncCycle = performSyncCycle;
+    const service = createMobileSyncService(fake.host);
+
+    const result = await service.performMobileSync(undefined, {
+      activationProbe: true,
+      configOverride: { backend: 'webdav', webdav: { url: 'https://candidate.example.com/dav', username: 'bea', password: 'pw' } },
+    });
+
+    expect(probe).toHaveBeenCalledWith({ webdav: expect.objectContaining({ url: 'https://candidate.example.com/dav/data.json' }) });
+    // This fake's attachment pass downloads nothing, so the proof fails after it; the location check no longer refuses.
+    expect(String(result.error ?? '')).not.toContain('PARTLY_ENCRYPTED');
+  });
+
   it('refuses a Dropbox candidate in a FOSS build', async () => {
     const fake = createFakeHost({ isFossBuild: true, dropboxAppKey: 'key' });
     const service = createMobileSyncService(fake.host);

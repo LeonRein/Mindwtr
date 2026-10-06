@@ -18,6 +18,8 @@ const RELEASE_CHECK_FIELD_NAMES = [
     'retryCount',
     // deferred-attachment-pass: which pass owes the deferred pre-sync phase's work.
     'owed',
+    // candidate-ciphertext-probe: what the activation candidate's folder held (plaintext, encrypted or mixed).
+    'found',
     // calendar-mirror-filter reuses releaseCheck, platform, stage, and count below.
     // calendar-date-color-diagnostics uses only aggregate counts; no dates, names, ids, or colors.
     'calendarCount', 'eventCount', 'allDayCount', 'timedCount',
