@@ -50,10 +50,8 @@ const applyAlarmIosUniqueIdentifierPatchToSource = transformFor('alarm-ios-uniqu
 const applyAlarmIosDeletePendingPatchToSource = transformFor('alarm-ios-delete-pending-arg');
 const applyAlarmIosPendingKindPatchToSource = transformFor('alarm-ios-pending-kind');
 const applyAlarmReminderSlotPatchToSource = transformFor('alarm-reminder-slot');
-const applyAlarmIosReminderThreadPatchToSource = transformFor('alarm-ios-reminder-thread');
 const applyAlarmReminderActionsUtilPatchToSource = transformFor('alarm-reminder-actions-util');
 const applyAlarmReminderActionsReceiverPatchToSource = transformFor('alarm-reminder-actions-receiver');
-const applyAlarmIosCompleteCancelsTaskPatchToSource = transformFor('alarm-ios-complete-cancels-task');
 
 const installedAlarmPackage = path.join(testDirectory, '..', '..', '..', 'node_modules', 'react-native-alarm-notification');
 
@@ -1180,22 +1178,6 @@ ${helpers}
     expect(applyAlarmReminderSlotPatchToSource('class AlarmUtil {}')).toBe('class AlarmUtil {}');
   });
 
-  it('threads a task\'s iOS reminders together and collapses each thread to its newest delivery', () => {
-    if (!fs.existsSync(installedAlarmPackage)) return;
-    const { tmpRoot, read } = patchInstalledPackage();
-    try {
-      const module = read('ios', 'RnAlarmNotification.m');
-      // scheduleAlarm and sendNotification take the tag; the repeat re-arm and snooze keep it.
-      expect(module.match(/content\.threadIdentifier = details\[@"tag"\];/g)).toHaveLength(2);
-      expect(module.match(/content\.threadIdentifier = contentInfo\.threadIdentifier;/g)).toHaveLength(2);
-      expect(module).toContain('RCT_EXPORT_METHOD(collapseDeliveredReminderNotifications){');
-      expect(module).toContain('if (![thread hasPrefix:@"mindwtr-reminder:"]) continue;');
-      expect(applyAlarmIosReminderThreadPatchToSource(module)).toBe(module);
-    } finally {
-      fs.rmSync(tmpRoot, { recursive: true, force: true });
-    }
-  }, 30_000);
-
   it('makes Snooze from the intent\'s alarm and makes Done cancel the task\'s other reminders', () => {
     if (!fs.existsSync(installedAlarmPackage)) return;
     const { tmpRoot, read } = patchInstalledPackage();
@@ -1212,12 +1194,14 @@ ${helpers}
       expect(order.every((index) => index >= 0)).toBe(true);
       expect([...order].sort((a, b) => a - b)).toEqual(order);
 
-      // Done: the task's other reminders go before JS hears of it; only without JS is the tap kept on disk.
+      // Every receipt is committed before alarm cancellation and warm/cold delivery.
       const completeCase = receiver.slice(receiver.indexOf('case Constants.NOTIFICATION_ACTION_COMPLETE:'), receiver.indexOf('case Constants.NOTIFICATION_ACTION_DISMISS:'));
-      expect(completeCase.indexOf('alarmUtil.cancelTaskReminders(reminderTag, payload.getString("taskId"))')).toBeGreaterThan(-1);
-      expect(completeCase.indexOf('cancelTaskReminders')).toBeLessThan(completeCase.indexOf('emit("OnNotificationOpened"'));
-      expect(completeCase.indexOf('NotificationOpenPayloadStore.persistCompletion(context, pendingPayload);'))
-        .toBeGreaterThan(completeCase.indexOf('} else {\n                                // No JS to tell'));
+      const persistIndex = completeCase.indexOf('NotificationOpenPayloadStore.persistCompletion(context, pendingPayload)');
+      expect(persistIndex).toBeGreaterThan(-1);
+      for (const operation of ['NotificationOpenPayloadStore.cache(', 'alarmUtil.removeFiredNotification(', 'alarmUtil.cancelAlarm(', 'cancelTaskReminders(', 'emit("OnNotificationOpened"', 'context.startActivity(']) {
+        expect(completeCase.indexOf(operation), operation).toBeGreaterThan(persistIndex);
+      }
+      expect(completeCase).toContain('payload.putString("actionId", completionReceipt);');
       expect(receiver.match(/persistCompletion/g)).toHaveLength(1);
 
       expect(applyAlarmReminderActionsUtilPatchToSource(util)).toBe(util);
@@ -1259,23 +1243,6 @@ ${helper}
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   }, 60_000);
-
-  it('keeps the iOS Done call although the complete-action patch rewrites its handler on every pass', () => {
-    if (!fs.existsSync(installedAlarmPackage)) return;
-    const { tmpRoot, read } = patchInstalledPackage();
-    try {
-      // patchInstalledPackage ran one pass; a second prebuild runs the registry again on the patched files.
-      applyPatches(path.join(tmpRoot, 'apps', 'mobile'), PATCHES);
-      const module = read('ios', 'RnAlarmNotification.m');
-      const completeBranch = module.slice(module.indexOf('isEqualToString:@"COMPLETE_ACTION"'), module.indexOf('isEqualToString:@"SNOOZE_ACTION"'));
-      expect(completeBranch.match(/mindwtrRemoveTaskReminders\(response\.notification\);/g)).toHaveLength(1);
-      expect(module.match(/static void mindwtrRemoveTaskReminders\(/g)).toHaveLength(1);
-      expect(module).toContain('[(NSString *)kind hasPrefix:@"task-"]');
-      expect(applyAlarmIosCompleteCancelsTaskPatchToSource(module)).toBe(module);
-    } finally {
-      fs.rmSync(tmpRoot, { recursive: true, force: true });
-    }
-  }, 30_000);
 
   it('throws naming the anchor when a reminder action anchor drifts', () => {
     const util = `    void removeFiredNotification(int id) {
@@ -1369,12 +1336,10 @@ describe('PATCHES registry completeness', () => {
     // Added for repeat reminders: dropping either brings back one notification
     // per occurrence (a 10-minute repeat stacks six an hour) instead of one per task.
     ['AlarmUtil.java', 'applyAlarmReminderSlotPatchToSource'],
-    ['RnAlarmNotification.m', 'applyAlarmIosReminderThreadPatchToSource'],
     // Added for the reminder buttons: dropping one brings back a Snooze that never
     // reminds again, or a Done after which the task's next repeat still fires.
     ['AlarmUtil.java', 'applyAlarmReminderActionsUtilPatchToSource'],
     ['AlarmReceiver.java', 'applyAlarmReminderActionsReceiverPatchToSource'],
-    ['RnAlarmNotification.m', 'applyAlarmIosCompleteCancelsTaskPatchToSource'],
   ];
 
   it('has exactly one registry entry per original call site — none dropped in the collapse', () => {
@@ -1388,7 +1353,7 @@ describe('PATCHES registry completeness', () => {
   });
 
   it('every entry declares required/firstMatchOnly explicitly', () => {
-    expect(PATCHES).toHaveLength(31);
+    expect(PATCHES).toHaveLength(29);
     for (const patch of PATCHES) {
       expect(typeof patch.id).toBe('string');
       expect(typeof patch.required).toBe('boolean');

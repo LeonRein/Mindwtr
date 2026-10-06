@@ -7,8 +7,6 @@ import org.json.JSONObject
 object NotificationOpenPayloadStore {
   private const val PREFS_NAME = "mindwtr_notification_open"
   private const val PENDING_COMPLETIONS = "pendingCompletions"
-  // A bound on Done taps kept while the app is closed; the oldest go first.
-  private const val MAX_PENDING_COMPLETIONS = 50
   private val completionsLock = Any()
 
   @Volatile
@@ -26,33 +24,60 @@ object NotificationOpenPayloadStore {
     return LinkedHashMap(payload)
   }
 
-  /**
-   * A Done tap no JS could receive (the app was not running): kept on disk, since the process may
-   * die before the app is opened, and applied when the app next starts (consumeCompletions).
-   */
+  private fun readQueue(context: Context): JSONArray {
+    val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val queue = JSONArray(prefs.getString(PENDING_COMPLETIONS, "[]"))
+    for (index in 0 until queue.length()) {
+      // Fail closed: malformed data stays on disk for recovery, never becomes an empty queue.
+      val item = queue.getJSONObject(index)
+      require(item.optString("taskId").isNotBlank()) { "Invalid pending completion" }
+      if (item.optString("actionId").isBlank()) item.put("actionId", "legacy:$index")
+    }
+    return queue
+  }
+
+  private fun writeQueue(context: Context, queue: JSONArray) {
+    val saved = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+      .putString(PENDING_COMPLETIONS, queue.toString()).commit()
+    check(saved) { "Pending completion persistence failed" }
+  }
+
+  /** Every Done tap is durable before cancellation or JS delivery, including a warm process. */
   @JvmStatic
-  fun persistCompletion(context: Context, payload: Map<String, String>) {
-    synchronized(completionsLock) {
-      val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-      val stored = runCatching { JSONArray(prefs.getString(PENDING_COMPLETIONS, "[]")) }.getOrDefault(JSONArray())
-      val queue = JSONArray()
-      for (index in maxOf(0, stored.length() - MAX_PENDING_COMPLETIONS + 1) until stored.length()) {
-        stored.optJSONObject(index)?.let(queue::put)
-      }
-      queue.put(JSONObject(payload as Map<*, *>))
-      prefs.edit().putString(PENDING_COMPLETIONS, queue.toString()).commit()
+  fun persistCompletion(context: Context, payload: Map<String, String>): String = synchronized(completionsLock) {
+    require(!payload["taskId"].isNullOrBlank()) { "Invalid pending completion" }
+    val queue = readQueue(context)
+    // Repeated delivery of the same notification action owns the same receipt.
+    val actionId = payload["actionId"]?.takeIf { it.isNotBlank() }
+      ?: "done:${payload["taskId"]}:${payload["alarmKey"] ?: payload["id"] ?: ""}"
+    if ((0 until queue.length()).none { queue.getJSONObject(it).getString("actionId") == actionId }) {
+      queue.put(JSONObject(payload as Map<*, *>).put("actionId", actionId))
+    }
+    writeQueue(context, queue)
+    actionId
+  }
+
+  /** Non-destructive replay. Receipts survive process death until the task save is acknowledged. */
+  @JvmStatic
+  fun peekCompletions(context: Context): List<Map<String, String>> = synchronized(completionsLock) {
+    val queue = readQueue(context)
+    // Persist IDs added to receipts from an earlier version before exposing them to JS.
+    if (queue.length() > 0) writeQueue(context, queue)
+    (0 until queue.length()).map { index ->
+      val item = queue.getJSONObject(index)
+      item.keys().asSequence().associateWith { item.getString(it) }
     }
   }
 
-  /** Every Done tap kept by persistCompletion, oldest first, and forgets them. */
   @JvmStatic
-  fun consumeCompletions(context: Context): List<Map<String, String>> = synchronized(completionsLock) {
-    val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    val raw = prefs.getString(PENDING_COMPLETIONS, null) ?: return@synchronized emptyList()
-    prefs.edit().remove(PENDING_COMPLETIONS).commit()
-    val queue = runCatching { JSONArray(raw) }.getOrNull() ?: return@synchronized emptyList()
-    (0 until queue.length()).mapNotNull { index ->
-      queue.optJSONObject(index)?.let { item -> item.keys().asSequence().associateWith { key -> item.optString(key) } }
+  fun acknowledgeCompletion(context: Context, actionId: String) = synchronized(completionsLock) {
+    require(actionId.isNotBlank()) { "Invalid completion receipt" }
+    val stored = readQueue(context)
+    val queue = JSONArray()
+    for (index in 0 until stored.length()) {
+      val item = stored.getJSONObject(index)
+      if (item.getString("actionId") != actionId) queue.put(item)
     }
+    writeQueue(context, queue)
   }
 }

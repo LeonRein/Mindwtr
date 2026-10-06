@@ -46,9 +46,6 @@ mod imp {
     /// method call, but every clone shares the same zbus connection and executor.
     pub(crate) struct LinuxNotificationState {
         connection: Mutex<Option<Connection>>,
-        /// The daemon's id for the last notification of each tag (one tag per task): passed back as
-        /// `replaces_id`, so a task's next reminder replaces the one shown instead of stacking.
-        replaced_ids: Mutex<HashMap<String, u32>>,
         endpoint: NotificationEndpoint,
         delivery_timeout: Duration,
         #[cfg(test)]
@@ -59,7 +56,6 @@ mod imp {
         fn default() -> Self {
             Self {
                 connection: Mutex::new(None),
-                replaced_ids: Mutex::new(HashMap::new()),
                 endpoint: NotificationEndpoint::default(),
                 delivery_timeout: DELIVERY_TIMEOUT,
                 #[cfg(test)]
@@ -111,7 +107,6 @@ mod imp {
             &self,
             title: &str,
             body: Option<&str>,
-            tag: Option<&str>,
         ) -> Result<(), DeliveryError> {
             let connection = self.connection().await?;
             let proxy = Proxy::new(
@@ -144,55 +139,27 @@ mod imp {
                 );
             }
             let body = body.unwrap_or_default();
-            // A daemon that no longer shows the replaced notification (closed, expired) shows this
-            // one as new, which is what a reminder wants too.
-            let replaces_id = match tag {
-                Some(tag) => self
-                    .replaced_ids
-                    .lock()
-                    .await
-                    .get(tag)
-                    .copied()
-                    .unwrap_or(0),
-                None => 0,
-            };
-            let id: u32 = proxy
+            let _: u32 = proxy
                 .call(
                     "Notify",
                     &(
-                        "Mindwtr",
-                        replaces_id,
-                        "mindwtr",
-                        title,
-                        body,
-                        actions,
-                        hints,
-                        -1i32,
+                        "Mindwtr", 0u32, "mindwtr", title, body, actions, hints, -1i32,
                     ),
                 )
                 .await
                 .map_err(|error| classify_zbus_error(&error))?;
-            if let Some(tag) = tag {
-                self.replaced_ids.lock().await.insert(tag.to_string(), id);
-            }
 
             Ok(())
         }
 
-        async fn send(
-            &self,
-            title: &str,
-            body: Option<&str>,
-            tag: Option<&str>,
-        ) -> Result<(), DeliveryError> {
+        async fn send(&self, title: &str, body: Option<&str>) -> Result<(), DeliveryError> {
             let title = title.trim();
             if title.is_empty() {
                 return Err(DeliveryError::InvalidTitle);
             }
             let body = body.map(str::trim).filter(|value| !value.is_empty());
-            let tag = tag.map(str::trim).filter(|value| !value.is_empty());
 
-            tokio::time::timeout(self.delivery_timeout, self.send_unbounded(title, body, tag))
+            tokio::time::timeout(self.delivery_timeout, self.send_unbounded(title, body))
                 .await
                 .map_err(|_| DeliveryError::TimedOut)?
         }
@@ -201,7 +168,6 @@ mod imp {
         fn for_test(service: String, delivery_timeout: Duration) -> Self {
             Self {
                 connection: Mutex::new(None),
-                replaced_ids: Mutex::new(HashMap::new()),
                 endpoint: NotificationEndpoint {
                     service,
                     ..NotificationEndpoint::default()
@@ -233,10 +199,9 @@ mod imp {
         state: &LinuxNotificationState,
         title: String,
         body: Option<String>,
-        tag: Option<String>,
     ) -> Result<(), String> {
         state
-            .send(&title, body.as_deref(), tag.as_deref())
+            .send(&title, body.as_deref())
             .await
             .map_err(|error| error.code().to_string())
     }
@@ -266,7 +231,6 @@ mod imp {
 
         #[derive(Debug)]
         struct ReceivedNotification {
-            replaces_id: u32,
             app_icon: String,
             hints: HashMap<String, OwnedValue>,
         }
@@ -276,7 +240,7 @@ mod imp {
             async fn notify(
                 &self,
                 _app_name: &str,
-                replaces_id: u32,
+                _replaces_id: u32,
                 app_icon: &str,
                 _summary: &str,
                 _body: &str,
@@ -286,7 +250,6 @@ mod imp {
             ) -> zbus::fdo::Result<u32> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.received.lock().await.push(ReceivedNotification {
-                    replaces_id,
                     app_icon: app_icon.to_string(),
                     hints,
                 });
@@ -356,7 +319,7 @@ mod imp {
             assert_isolated_session();
             let (_service, state, _calls, received) = mock_service(MockBehavior::Accept).await;
 
-            send_notification(&state, "Logo test".to_string(), None, None)
+            send_notification(&state, "Logo test".to_string(), None)
                 .await
                 .expect("Notify acknowledgement");
 
@@ -395,43 +358,15 @@ mod imp {
             assert_isolated_session();
             let (_service, state, calls, _received) = mock_service(MockBehavior::Accept).await;
 
-            send_notification(&state, "First".to_string(), None, None)
+            send_notification(&state, "First".to_string(), None)
                 .await
                 .expect("first Notify acknowledgement");
-            send_notification(&state, "Second".to_string(), Some("Body".to_string()), None)
+            send_notification(&state, "Second".to_string(), Some("Body".to_string()))
                 .await
                 .expect("second Notify acknowledgement");
 
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             assert_eq!(state.connection_creations.load(Ordering::SeqCst), 1);
-        }
-
-        #[ignore = "requires an isolated session bus"]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_tagged_reminder_replaces_its_tags_last_notification() {
-            assert_isolated_session();
-            let (_service, state, _calls, received) = mock_service(MockBehavior::Accept).await;
-            let task = Some("mindwtr-reminder:task:a".to_string());
-
-            for (title, tag) in [
-                ("Due", task.clone()),
-                ("Repeat", task.clone()),
-                ("Other task", Some("mindwtr-reminder:task:b".to_string())),
-                ("Untagged", None),
-            ] {
-                send_notification(&state, title.to_string(), None, tag)
-                    .await
-                    .expect("Notify acknowledgement");
-            }
-
-            let replaced: Vec<u32> = received
-                .lock()
-                .await
-                .iter()
-                .map(|notification| notification.replaces_id)
-                .collect();
-            // The mock daemon answers every Notify with id 41.
-            assert_eq!(replaced, vec![0, 41, 0, 0]);
         }
 
         #[ignore = "requires an isolated session bus"]
@@ -444,7 +379,6 @@ mod imp {
                 &state,
                 "Private title".to_string(),
                 Some("Private body".to_string()),
-                None,
             )
             .await
             .expect_err("mock daemon rejects Notify");
@@ -461,7 +395,7 @@ mod imp {
             let state =
                 LinuxNotificationState::for_test(unique_service_name(), Duration::from_secs(1));
 
-            let error = send_notification(&state, "Reminder".to_string(), None, None)
+            let error = send_notification(&state, "Reminder".to_string(), None)
                 .await
                 .expect_err("no service owns the test name");
 
@@ -476,7 +410,7 @@ mod imp {
                 mock_service(MockBehavior::Delay(Duration::from_millis(200))).await;
             state.delivery_timeout = Duration::from_millis(20);
 
-            let error = send_notification(&state, "Reminder".to_string(), None, None)
+            let error = send_notification(&state, "Reminder".to_string(), None)
                 .await
                 .expect_err("mock acknowledgement is delayed past the bound");
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -496,7 +430,6 @@ mod imp {
         _state: &LinuxNotificationState,
         _title: String,
         _body: Option<String>,
-        _tag: Option<String>,
     ) -> Result<(), String> {
         Err("unsupported_platform".to_string())
     }

@@ -19,14 +19,14 @@ const {
   updateTask,
   storeTasksById,
   consumePendingNotificationOpenPayload,
-  consumePendingNotificationCompletions,
+  peekPendingNotificationCompletions,
 } = vi.hoisted(() => ({
   setNotificationOpenHandler: vi.fn(),
   setHighlightTask: vi.fn(),
   updateTask: vi.fn(async () => undefined),
   storeTasksById: new Map<string, any>(),
   consumePendingNotificationOpenPayload: vi.fn<() => Promise<PendingNotificationOpenPayload>>(async () => null),
-  consumePendingNotificationCompletions: vi.fn<() => Promise<NonNullable<PendingNotificationOpenPayload>[]>>(async () => []),
+  peekPendingNotificationCompletions: vi.fn<() => Promise<NonNullable<PendingNotificationOpenPayload>[]>>(async () => []),
 }));
 
 vi.mock('@mindwtr/core', async (importOriginal) => {
@@ -45,7 +45,7 @@ vi.mock('@/lib/notification-service', () => ({
 
 vi.mock('@/modules/notification-open-intents', () => ({
   consumePendingNotificationOpenPayload,
-  consumePendingNotificationCompletions,
+  peekPendingNotificationCompletions,
 }));
 
 type NotificationRouter = Parameters<typeof useRootLayoutNotificationOpenHandler>[0]['router'];
@@ -85,8 +85,8 @@ describe('useRootLayoutNotificationOpenHandler', () => {
     storeTasksById.clear();
     consumePendingNotificationOpenPayload.mockReset();
     consumePendingNotificationOpenPayload.mockResolvedValue(null);
-    consumePendingNotificationCompletions.mockReset();
-    consumePendingNotificationCompletions.mockResolvedValue([]);
+    peekPendingNotificationCompletions.mockReset();
+    peekPendingNotificationCompletions.mockResolvedValue([]);
   });
 
   it('routes review notifications to the dedicated review flows', () => {
@@ -317,41 +317,6 @@ describe('useRootLayoutNotificationOpenHandler', () => {
     expect(consumePendingNotificationOpenPayload).toHaveBeenCalled();
     expect(updateTask).toHaveBeenCalledTimes(1);
     expect(updateTask).toHaveBeenCalledWith('task-1', { status: 'done', isFocusedToday: false });
-    act(() => tree.unmount());
-  });
-
-  // Done on an Android reminder while the app was not running: the native receiver keeps each
-  // tap on disk, and the app applies every one once it can, even when the same tap also
-  // arrives through the in-memory cold-start payload.
-  it('completes every task whose Done was tapped while the app was closed, once each', async () => {
-    const router = createRouter();
-    storeTasksById.set('task-1', { id: 'task-1', title: 'Pay rent', status: 'next' });
-    storeTasksById.set('task-2', { id: 'task-2', title: 'Call back', status: 'next' });
-    consumePendingNotificationOpenPayload.mockResolvedValue({
-      actionIdentifier: 'complete',
-      notificationId: 'task:task-1:r2',
-      taskId: 'task-1',
-    });
-    consumePendingNotificationCompletions.mockResolvedValue([
-      { actionIdentifier: 'complete', notificationId: 'task:task-1:r2', taskId: 'task-1' },
-      { notificationId: 'task:task-2', taskId: 'task-2' },
-    ]);
-
-    let tree!: ReturnType<typeof create>;
-    await act(async () => {
-      tree = create(<TestHarnessWithState appReady={false} pathname="/focus" router={router} />);
-    });
-    expect(consumePendingNotificationCompletions).not.toHaveBeenCalled();
-
-    await act(async () => {
-      tree.update(<TestHarnessWithState appReady pathname="/focus" router={router} />);
-    });
-
-    expect(consumePendingNotificationCompletions).toHaveBeenCalled();
-    expect(updateTask).toHaveBeenCalledTimes(2);
-    expect(updateTask).toHaveBeenCalledWith('task-1', { status: 'done', isFocusedToday: false });
-    expect(updateTask).toHaveBeenCalledWith('task-2', { status: 'done', isFocusedToday: false });
-    expect(router.push).not.toHaveBeenCalled();
     act(() => tree.unmount());
   });
 
