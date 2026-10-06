@@ -4,7 +4,7 @@
 //
 // Installs the debug APK with `install -r` (existing development data stays) and checks RN's system entry points on the
 // development scheme mindwtr-native-dev (the phone's RN app keeps mindwtr://, so no link here can reach it):
-// (a) `cmd shortcut get-shortcuts` lists RN's launcher shortcuts (Add task, Focus, Calendar) on RN's component name;
+// (a) `cmd shortcut get-shortcuts` lists RN's launcher shortcuts (Capture, Add task…, Focus, Calendar) on RN's component name;
 // (b) a text share (ACTION_SEND text/plain) opens RN's capture screen with the shared text, and Save stores it once (core,
 // on a copy of the app's database); (c) links land on core's screen: the Inbox, Focus (open-feature today), Waiting,
 // Someday (open-feature), the Calendar, the global search with its query, a task (the editor over Focus), a project, the
@@ -192,17 +192,17 @@ try {
     // (a) RN's launcher shortcuts are the package's manifest shortcuts, on RN's component name (the alias). Android 16
     // hides shortcut ids in its dumps, so each is known by its label's resource name; the App Actions ids in the same XML
     // carry no intent, so Android publishes none of them (the gate checks them). The phone's RN development app, when
-    // installed, publishes the same three from the same XML.
+    // installed, publishes the same four from the same XML (#1333 added Add task…).
     const manifestShortcuts = (pkg) => sh(`cmd shortcut get-shortcuts ${pkg}`).split('ShortcutInfo {').slice(1)
         .filter((entry) => /flags=0x[0-9a-f]+ \[[^\]]*Man/.test(entry))
         .map((entry) => ({ label: /shortLabel=[^\n]*\[(\w+)\]/.exec(entry)?.[1], activity: /activity=ComponentInfo\{([^}]+)\}/.exec(entry)?.[1] }));
     let shortcuts = [];
-    for (let attempt = 0; attempt < 20 && shortcuts.length < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && shortcuts.length < 4; attempt += 1) {
         shortcuts = manifestShortcuts(PKG);
-        if (shortcuts.length < 3) await sleep(1000);
+        if (shortcuts.length < 4) await sleep(1000);
     }
     const labels = shortcuts.map((entry) => entry.label).sort();
-    check(JSON.stringify(labels) === JSON.stringify(['shortcut_add_task_short', 'shortcut_open_calendar_short', 'shortcut_open_focus_short'])
+    check(JSON.stringify(labels) === JSON.stringify(['shortcut_add_task_details_short', 'shortcut_add_task_short', 'shortcut_open_calendar_short', 'shortcut_open_focus_short'])
         && shortcuts.every((entry) => entry.activity === `${PKG}/${PKG}.MainActivity`), `(a) RN's launcher shortcuts on RN's component name: ${JSON.stringify(shortcuts)}`);
     if (sh('pm list packages tech.dongdongbh.mindwtr.dev').split('\n').includes('package:tech.dongdongbh.mindwtr.dev')) {
         const rn = manifestShortcuts('tech.dongdongbh.mindwtr.dev').map((entry) => entry.label).sort();
