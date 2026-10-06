@@ -3422,6 +3422,13 @@ globalThis.MindwtrHost = {
                     || operation === 'discard' && outcome === 'retained'
                     || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen)) return {};
             try {
+                if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
+                    ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
+                    message: 'Native iOS owned raw row Save acknowledged',
+                    context: { releaseCheck: 'v1.3.5/ios-owned-raw-row-save', operation, outcome },
+                }, { force: true });
+            } catch { /* Keep the existing acknowledgment independent of this extra marker. */ }
+            try {
                 await diagnosticsLog.append({ ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
                     message: 'Native iOS attachment draft acknowledged',
                     context: { ...(editorAcknowledged ? { releaseCheck: 'v1.3.5/ios-editor-owned-attachments' }

@@ -156,6 +156,88 @@ afterEach(async () => {
 });
 
 describe('internal complete owned editor Save', () => {
+    it('saves literal empty raw arrays after three Adds and cold-replays the serialized exact effect', async () => {
+        env = await open(path, seed({ attachments: [], checklist: [] }));
+        env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');
+        const envelope = await plan(await request({ events: ['add', 'add', 'add'], checklist: [] }));
+        if (envelope.prepared.decision.kind !== 'changed') throw new Error('Expected actual Add change');
+        expect(envelope.prepared.decision.prepared.rawBefore.tasks[0].before).toMatchObject({ attachments: [], checklist: [] });
+        const frozen = JSON.stringify(envelope);
+        env.db.prepare('UPDATE tasks SET title = ?, description = ?, rev = rev + 1 WHERE id = ?').run('Later unrelated title', 'Later unrelated notes', 'other');
+        const unrelated = env.db.prepare('SELECT * FROM tasks WHERE id = ?').all('other');
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect((await rawTask()).attachments).toHaveLength(3);
+        expect(env.db.prepare('SELECT * FROM tasks WHERE id = ?').all('other')).toEqual(unrelated);
+        const saved = rows(); env = await open(path); env.writes.mockClear();
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
+    it('confirms a literal empty-array owned no-op across recreation without rewriting raw cells', async () => {
+        env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');
+        const envelope = await plan(await request({ events: [], checklist: [] }));
+        expect(envelope.prepared.decision.kind).toBe('noop');
+        expect(envelope.prepared.decision.prepared.rawBefore).toMatchObject({ attachments: [], checklist: [] });
+        const frozen = JSON.stringify(envelope), saved = rows(); env.writes.mockClear();
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled();
+        env = await open(path); env.writes.mockClear();
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
+    it('cold-replays complete file Remove and checklist clearing with no live file or duplicate effect', async () => {
+        env = await open(path, seed({ attachments: [file] }));
+        const envelope = await plan(await request({ events: ['baseline-file'], checklist: [] })), frozen = JSON.stringify(envelope);
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        const row = await rawTask(); expect(row.attachments?.filter((item) => !item.deletedAt)).toEqual([]);
+        expect(toChecklist(row.checklist)).toEqual([]);
+        expect(env.db.prepare('SELECT checklist FROM tasks WHERE id = ?').all('complete')).toEqual([{ checklist: null }]);
+        expect(after(envelope).checklist).toEqual([]);
+        const saved = rows(); env = await open(path); env.writes.mockClear();
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+        env.db.prepare("UPDATE tasks SET checklist = '[]' WHERE id = ?").run('complete');
+        const replaced = rows(); env = await open(path); env.writes.mockClear();
+        expect(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)))
+            .toMatchObject({ ok: false, error: { code: 'STALE_REVISION' } });
+        expect(rows()).toEqual(replaced); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
+    it('refuses a confirmed literal empty-array no-op after its SQL NULL replacement', async () => {
+        env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');
+        const envelope = await plan(await request({ events: [], checklist: [] })), frozen = JSON.stringify(envelope);
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        env = await open(path);
+        env.db.prepare('UPDATE tasks SET attachments = NULL WHERE id = ?').run('complete');
+        const replaced = rows(); env.writes.mockClear();
+        expect(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)))
+            .toMatchObject({ ok: false, error: { code: 'STALE_REVISION' } });
+        expect(rows()).toEqual(replaced); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
+    it('cold-replays changed empty history and refuses an AFTER attachments SQL NULL to [] replacement', async () => {
+        env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');
+        const envelope = await plan(await request({ events: [], edits: { title: 'Edited empty history' }, checklist: [] }));
+        expect(envelope.prepared.decision.kind).toBe('changed');
+        const frozen = JSON.stringify(envelope);
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(env.db.prepare('SELECT title, attachments, checklist FROM tasks WHERE id = ?').all('complete'))
+            .toEqual([{ title: 'Edited empty history', attachments: null, checklist: null }]);
+        const saved = rows(); env = await open(path); env.writes.mockClear();
+        unwrap(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)));
+        expect(rows()).toEqual(saved); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+        env.db.prepare("UPDATE tasks SET attachments = '[]' WHERE id = ?").run('complete');
+        const replaced = rows(); env = await open(path); env.writes.mockClear();
+        expect(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)))
+            .toMatchObject({ ok: false, error: { code: 'STALE_REVISION' } });
+        expect(rows()).toEqual(replaced); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
+    it.each(['attachments', 'checklist'] as const)('refuses a literal [] to SQL NULL %s BEFORE replacement without any row write', async (field) => {
+        env.db.prepare("UPDATE tasks SET attachments = '[]', checklist = '[]' WHERE id = ?").run('complete');
+        const envelope = await plan(await request({ events: ['add'], checklist: [] })), frozen = JSON.stringify(envelope);
+        env.db.prepare(`UPDATE tasks SET ${field} = NULL WHERE id = ?`).run('complete');
+        const changed = rows(); env.writes.mockClear();
+        expect(await env.host.commitPreparedOwnedEditorCompleteTaskDraftSave(JSON.parse(frozen)))
+            .toMatchObject({ ok: false, error: { code: 'STALE_REVISION' } });
+        expect(rows()).toEqual(changed); expect(env.writes).not.toHaveBeenCalled(); expect(JSON.stringify(envelope)).toBe(frozen);
+    });
     it('keeps an unchanged checklist bound after Swift sorts the prepared envelope keys', async () => {
         const envelope = await plan(await request({ edits: { title: 'Sorted wire' } }));
         const sorted = JSON.parse(JSON.stringify(envelope, (_field, value: unknown) =>

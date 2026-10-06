@@ -364,3 +364,6 @@ Task212 attachment file IO foundation (2026-10-04): the private library-scoped S
 
 
 Local attachment host follow-up (2026-10-04, Task215): native JavaScriptCore now runs the shared RN attachment policy over the native file worker and shared Apple installer. Local draft operations, availability and guarded settlement passed twelve real-JSC tests, twelve worker tests and eleven existing URL/recovery checks; the signed iPhone development build passed. This establishes the host boundary. Picker/viewer UI and durable editor file-draft Save/Discard/recovery are the next slice; remote sync, legacy attachment-byte migration and full D01 acceptance remain open. See the parity ledger for exact shared checks and validation limits.
+
+
+Task278 legacy empty-array Save repair (2026-10-06): owned complete Save and unchanged-save authority now retain actual raw JSON members, while cold acknowledgment projects only the frozen expected effect through the existing SQLite writer. Historical replay remains unchanged and intervening raw-cell changes still refuse. Core, Swift/JSC, signed build and isolated iPhone picker/Save/cold-open checks passed; ordinary development data and preferences were preserved. See the [parity ledger](native-mobile-parity.md#legacy-empty-array-owned-save-2026-10-06-task278) for exact scope and validation limits.

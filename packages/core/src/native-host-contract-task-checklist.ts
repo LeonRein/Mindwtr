@@ -30,6 +30,7 @@ import { getTranslator, resolveI18nText } from './i18n';
 import { isTaskActionable, isTaskCancelled, normalizeTaskForLoad } from './task-status';
 import { normalizeProjectLifecycleFields } from './project-status';
 import { mapSqliteTaskRow, rawReadTaskSnapshot, TASK_SQLITE_COLUMNS, taskToSqliteRow } from './sqlite-adapter';
+import { rememberRawReadRow } from './sqlite-raw-snapshot';
 import { sameSectionDeleteJson, sameTaskSqliteRow } from './store-projects/section-actions';
 import { createAreaSaveGuard, readAreaDurableData } from './native-host-contract-area-durable';
 import { isProjectedRecurringTaskId } from './recurrence';
@@ -835,6 +836,20 @@ const validReferenceRawTask = (task: unknown, id: string): task is Task => isRec
     && validRawTask({ ...task, tags: task.tags ?? [], contexts: task.contexts ?? [] }, id);
 const sameRawHistoryRowTask = (left: Task, right: Task): boolean =>
     sameTaskSqliteRow(left, right) && sameSectionDeleteJson(left, right);
+// Owned guards recover exact JSON members from durable-read provenance.
+const sameOwnedRawTask = (left: Task, right: Task): boolean => {
+    const before = rawReadTaskSnapshot(left), after = rawReadTaskSnapshot(right);
+    return before !== null && after !== null && sameRawHistoryRowTask(before, after);
+};
+// Owned AFTER uses the writer's exact encoding (empty checklist -> NULL).
+// BEFORE stays raw; historical envelopes retain their existing comparator.
+const sameOwnedTaskAfter = (current: Task, expected: Task): boolean => {
+    const values = taskToSqliteRow(expected);
+    const row = Object.fromEntries(TASK_SQLITE_COLUMNS.map((column, index) => [column, values[index]]));
+    const stored = mapSqliteTaskRow(row);
+    rememberRawReadRow(stored, row, TASK_SQLITE_COLUMNS, taskToSqliteRow(stored));
+    return sameOwnedRawTask(current, stored);
+};
 // Only the single source update can enter the existing raw Task overlay.
 const validHistoryRowEffect = (checklist: NativePreparedChecklistWrite, id: string): boolean => {
     const { effect } = checklist;
@@ -967,7 +982,7 @@ const ownedRawBeforeMatches = (data: AppData, raw: PreparedChecklistRawBefore): 
         const matches = rows.filter((row) => row.id === bound.id);
         return bound.before === null ? matches.length === 0 : matches.length === 1 && equal(matches[0], bound.before);
     });
-    return binds(data.tasks, raw.tasks, sameRawHistoryRowTask) && binds(data.projects, raw.projects, same)
+    return binds(data.tasks, raw.tasks, sameOwnedRawTask) && binds(data.projects, raw.projects, same)
         && binds(data.sections ?? [], raw.sections, same);
 };
 const ownedChecklistAfterMatches = (data: AppData, effect: PreparedChecklistEffect): boolean => {
@@ -975,7 +990,7 @@ const ownedChecklistAfterMatches = (data: AppData, effect: PreparedChecklistEffe
         const current = rows.filter((row) => row.id === affected.after.id);
         return current.length === 1 && equal(current[0], affected.after);
     });
-    return matches(data.tasks, effect.tasks, sameRawHistoryRowTask) && matches(data.projects, effect.projects, same)
+    return matches(data.tasks, effect.tasks, sameOwnedTaskAfter) && matches(data.projects, effect.projects, same)
         && matches(data.sections ?? [], effect.sections, same)
         && (effect.deviceIdToInitialize === null || data.settings.deviceId === effect.deviceIdToInitialize);
 };
@@ -1913,7 +1928,7 @@ function createTaskChecklistSaveFactory(deps: NativeTaskChecklistSaveDependencie
                 || useTaskStore.getState().persistenceFailure) return fail('SAVE_FAILED', 'Owned no-op has pending persistence');
             const matches = read.value.authority.snapshot.tasks.filter((row) => row.id === proof.request.id);
             try {
-                if (matches.length !== 1 || !sameRawHistoryRowTask(matches[0], proof.rawBefore)
+                if (matches.length !== 1 || !sameOwnedRawTask(matches[0], proof.rawBefore)
                     || (read.value.authority.snapshot.settings.deviceId ?? null) !== proof.witness.deviceIdBefore
                     || !same(plan('save', proof.request, proof.witness, false, false, ownedChecklistSelection),
                         plan('save', proof.request, currentOwnedWitness(proof.witness, read.value.authority.snapshot), false, false, ownedChecklistSelection)))

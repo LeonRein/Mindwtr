@@ -91,7 +91,19 @@ final class AttachmentOpenHostTests: XCTestCase {
     }
 
     func testActualAddCompleteSaveAndColdFileImageAudioPlansPreserveBytesAndRows() async throws {
-        try await seed(); let host = core(); _ = try await host.start()
+        try await checkActualAddCompleteSaveAndColdOpen(legacyEmptyArrays: false)
+    }
+
+    func testLegacyEmptyArraysSupportActualAddCompleteSaveAndColdOpen() async throws {
+        try await checkActualAddCompleteSaveAndColdOpen(legacyEmptyArrays: true)
+    }
+
+    private func checkActualAddCompleteSaveAndColdOpen(legacyEmptyArrays: Bool) async throws {
+        try await seed()
+        if legacyEmptyArrays {
+            _ = try sql("UPDATE tasks SET attachments='[]',checklist='[]' WHERE id=?", [taskID])
+        }
+        let host = core(); _ = try await host.start()
         let attachments = try await produce(host)
         let files = try attachments.map { try XCTUnwrap(URL(string: XCTUnwrap($0["uri"] as? String))) }
         let contents = try files.map { try Data(contentsOf: $0) }, identities = try files.map(inode)
@@ -108,6 +120,7 @@ final class AttachmentOpenHostTests: XCTestCase {
         XCTAssertNil(try EditorDraftStore(databaseURL: database).read()); XCTAssertNil(try NativeAttachmentDraftStore(databaseURL: database).readMixed())
         XCTAssertFalse(FileManager.default.fileExists(atPath: database.appendingPathExtension("pending.json").path))
         let log = try String(contentsOf: root.appendingPathComponent("logs/mindwtr.log"))
+        XCTAssertTrue(log.contains("v1.3.5/ios-owned-raw-row-save"))
         XCTAssertFalse(log.contains("Private.txt")); XCTAssertFalse(log.contains(files[0].absoluteString))
     }
 

@@ -5322,6 +5322,11 @@ const poll = async (state, id) => {
             assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
                 { releaseCheck: 'v1.3.5/ios-attachment-complete-save', operation, outcome });
         }
+        const rawSaveMarkers = local.logText.trim().split('\n').map(JSON.parse)
+            .filter((entry) => entry.context?.releaseCheck === 'v1.3.5/ios-owned-raw-row-save');
+        assert.deepEqual(rawSaveMarkers.map((entry) => entry.context), [
+            { releaseCheck: 'v1.3.5/ios-owned-raw-row-save', operation: 'complete-save', outcome: 'domainSaved' },
+        ]);
         const before = local.logText;
         for (const operation of ['complete-save', 'complete-cancel-undo']) for (const outcome of ['retained', 'replayed', 'removed', '', 'unknown'])
             assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged(operation, outcome))).ok, true);
@@ -5337,6 +5342,18 @@ const poll = async (state, id) => {
             assert.equal((await poll(absent, absent.MindwtrHost.attachmentDraftAcknowledged('complete-cancel-undo', 'confirmed'))).ok, true);
             assert.equal(absent.logText, null);
         }
+    });
+    await check('an extra raw-row marker failure does not suppress the existing complete Save acknowledgment', async () => {
+        const local = makeState(0, [], 'ios'), write = local.__mindwtrNative.logFile;
+        let failOnce = true;
+        local.__mindwtrNative.logFile = (operation, text) => {
+            if (operation === 'append' && failOnce) { failOnce = false; return '!MindwtrNativeError:injected marker failure'; }
+            return write(operation, text);
+        };
+        assert.equal((await poll(local, local.MindwtrHost.attachmentDraftAcknowledged('complete-save', 'domainSaved'))).ok, true);
+        assert.equal(failOnce, false);
+        assert.deepEqual(JSON.parse(local.logText.trim().split('\n').at(-1)).context,
+            { releaseCheck: 'v1.3.5/ios-attachment-complete-save', operation: 'complete-save', outcome: 'domainSaved' });
     });
     await check('owned resume acknowledgment is iOS-only and fixed without claiming Save or UI hydration', async () => {
         const local = makeState(0, [], 'ios');
