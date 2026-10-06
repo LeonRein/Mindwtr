@@ -101,6 +101,8 @@ struct TaskViewSheet: View {
                 Group {
                     if presentation.kind == .file {
                         AttachmentFileActivitySheet(presentation: presentation)
+                    } else if presentation.kind == .audio {
+                        TaskAttachmentAudioSheet(model: model, palette: palette, presentationID: presentation.id)
                     } else {
                         NavigationStack {
                             AttachmentFileQuickLookSheet(presentation: presentation)
@@ -2914,6 +2916,55 @@ struct AttachmentFileActivitySheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: [presentation.url], applicationActivities: nil)
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+private struct TaskAttachmentAudioSheet: View {
+    @ObservedObject var model: CoreModel
+    let palette: AppPalette
+    let presentationID: UUID
+
+    private var playback: TaskAudioPlaybackState? {
+        guard model.taskAudioPlayback?.presentationID == presentationID else { return nil }
+        return model.taskAudioPlayback
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                Text(playback?.title ?? model.label("quickAdd.audioNoteTitle"))
+                    .rnFont(20, .bold).fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.center).accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier("task-audio-title")
+                Text(playback.map { audioTime($0.elapsed) + " / " + audioTime($0.duration) }
+                    ?? model.label("audio.loading"))
+                    .rnFont(16).monospacedDigit().foregroundStyle(palette.secondary)
+                    .accessibilityIdentifier("task-audio-time")
+                Button {
+                    model.toggleTaskAudioPlayback(presentationID: presentationID)
+                } label: {
+                    Text(model.label(playback?.playing == true ? "common.pause" : "common.play"))
+                        .rnFont(16, .semibold).frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered).disabled(playback?.canToggle != true)
+                .accessibilityIdentifier("task-audio-toggle")
+                Button {
+                    model.dismissTaskFileOpen(presentationID: presentationID)
+                } label: {
+                    Text(model.label("common.close"))
+                        .rnFont(16, .semibold).frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered).accessibilityIdentifier("task-audio-close")
+            }
+            .padding(24).frame(maxWidth: .infinity)
+        }
+        .foregroundStyle(palette.text).background(palette.card).tint(palette.tint)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("task-audio-player")
+    }
+
+    private func audioTime(_ value: TimeInterval) -> String {
+        let seconds = value.isFinite ? Int(min(Double(Int.max / 2), max(0, value))) : 0
+        return String(seconds / 60) + ":" + String(format: "%02d", seconds % 60)
+    }
 }
 
 struct AttachmentFileQuickLookSheet: UIViewControllerRepresentable {

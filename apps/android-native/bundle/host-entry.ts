@@ -3460,6 +3460,7 @@ globalThis.MindwtrHost = {
             const mixedAdd = operation === 'add-mixed' && ['confirmed', 'replayed'].includes(outcome);
             const providerAdd = operation === 'provider-add' && outcome === 'confirmed';
             const photoAdd = operation === 'photo-add' && outcome === 'confirmed';
+            const audioPlayback = operation === 'audio-playback' && outcome === 'started';
             const completeSave = operation === 'complete-save' && ['domainSaved', 'settled'].includes(outcome);
             const completeUndo = operation === 'complete-cancel-undo' && outcome === 'confirmed';
             const ownedResume = operation === 'owned-resume' && outcome === 'validated';
@@ -3470,10 +3471,10 @@ globalThis.MindwtrHost = {
             const projectFileRemove = operation === 'project-file-remove' && outcome === 'saved';
             const projectFileAdd = operation === 'project-file-add' && ['saved', 'abandoned'].includes(outcome);
             const editorAcknowledged = ['editor-add', 'editor-remove', 'editor-save', 'editor-discard', 'editor-recover'].includes(operation) && outcome === 'confirmed';
-            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !projectFileRemove && !projectFileAdd
+            if (globalThis.__mindwtrHostPlatform !== 'ios' || !localAttachments && !finishedDiscard && !unstartedDiscard && !removedDraft && !mixedSave && !mixedDiscard && !mixedAdd && !providerAdd && !photoAdd && !audioPlayback && !completeSave && !completeUndo && !ownedResume && !editorAcknowledged && !preexistingReplay && !containerRecovery && !fileOpen && !projectFileOpen && !projectFileRemove && !projectFileAdd
                 || !(['add', 'checkpoint', 'save'].includes(operation) && ['confirmed', 'replayed'].includes(outcome)
                     || operation === 'discard' && outcome === 'retained'
-                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || projectFileRemove || projectFileAdd)) return {};
+                    || operation === 'discard-capacity' && outcome === 'confirmed' || finishedDiscard || unstartedDiscard || removedDraft || mixedSave || mixedDiscard || mixedAdd || providerAdd || photoAdd || audioPlayback || completeSave || completeUndo || ownedResume || editorAcknowledged || preexistingReplay || containerRecovery || fileOpen || projectFileOpen || projectFileRemove || projectFileAdd)) return {};
             try {
                 if (completeSave && outcome === 'domainSaved') await diagnosticsLog.append({
                     ts: new Date().toISOString(), level: 'info', scope: 'native-ios',
@@ -3493,6 +3494,7 @@ globalThis.MindwtrHost = {
                         : preexistingReplay ? { releaseCheck: 'v1.3.5/ios-preexisting-attachment-journal-replay' }
                         : ownedResume ? { releaseCheck: 'v1.3.5/ios-owned-editor-resume' }
                         : completeSave || completeUndo ? { releaseCheck: 'v1.3.5/ios-attachment-complete-save' }
+                        : audioPlayback ? { releaseCheck: 'v1.3.5/ios-task-audio-playback' }
                         : photoAdd ? { releaseCheck: 'v1.3.5/ios-task-photo-add' }
                         : providerAdd ? { releaseCheck: 'v1.3.5/ios-attachment-provider-add' }
                         : mixedAdd ? { releaseCheck: 'v1.3.5/ios-attachment-mixed-add' }

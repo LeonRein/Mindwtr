@@ -253,6 +253,7 @@ private struct AppLockRoot: View {
         .preferredColorScheme(model.theme.text("scheme").isEmpty ? nil : palette.dark ? .dark : .light)
         .onAppear { lock.sceneChanged(phase) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            model.stopTaskAudioForBackground()
             model.cancelTaskFileImport()
             model.cancelProjectFileImport()
             model.flushTaskDraftCheckpointInBackground()
@@ -261,6 +262,7 @@ private struct AppLockRoot: View {
         }
         .onChange(of: phase) { next in
             if next != .active {
+                model.stopTaskAudioForBackground()
                 model.cancelTaskFileImport()
                 model.cancelProjectFileImport()
                 model.flushTaskDraftCheckpointInBackground()

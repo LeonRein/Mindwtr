@@ -1551,6 +1551,177 @@ final class FoundationUITests: XCTestCase {
         app.terminate()
     }
 
+    private func task284Open(readonly: Bool = false) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-ui-test-library", "a1855f22-c1d1-43e3-9cda-5f211f3c8075"]
+        app.launch()
+        if readonly {
+            boardEnabled(app.buttons["tab-menu"], timeout: 30)
+            boardTap(app, "tab-menu"); boardTap(app, "menu-projects")
+            let archived = app.buttons["projects-section-archived"]
+            revealPagedElement(app, archived, in: app.scrollViews["projects-scroll"])
+            if archived.value as? String == "Expand" { archived.tap() }
+            let project = app.buttons["project-open-task284-archived"]
+            revealPagedElement(app, project, in: app.scrollViews["projects-scroll"])
+            boardEnabled(project); project.tap()
+            let task = app.buttons["task-title-task284-readonly"]
+            revealPagedElement(app, task, in: app.scrollViews["project-detail-scroll"])
+            boardEnabled(task); task.tap()
+            boardEnabled(app.buttons["task-view-close"], timeout: 30)
+            XCTAssertFalse(app.buttons["task-mode-edit"].exists)
+            XCTAssertFalse(app.textFields["task-editor-title"].exists)
+        } else {
+            boardTap(app, "tab-inbox")
+            let task = app.buttons["task-title-task284-audio"]
+            boardEnabled(task, timeout: 30); task.tap(); boardTap(app, "task-mode-edit")
+        }
+        return app
+    }
+
+    private func task284OpenAudio(_ app: XCUIApplication, corrupt: Bool = false, readonly: Bool = false) {
+        let attachment = readonly ? "75be01f4-c435-44f5-9cc4-bc1ace6a830c"
+            : corrupt ? "117e2469-ffab-44f4-ae47-e782bb734c3d" : "11b005fb-a1b6-4df1-a1f0-5d62f4600bb4"
+        let scroll = app.scrollViews["task-editor-scroll"]
+        if !readonly {
+            let details = app.buttons["task-editor-section-details"]
+            revealPagedElement(app, details, in: scroll, outerEdge: true)
+            if details.value as? String == "Expand" { details.tap() }
+        }
+        let open = app.buttons[(readonly ? "task-view-attachment-open-" : "task-attachment-open-") + attachment]
+        revealPagedElement(app, open, in: scroll, outerEdge: true)
+        boardEnabled(open); open.tap()
+    }
+
+    private func task284Clock(_ app: XCUIApplication) -> (elapsed: Int, duration: Int)? {
+        let time = app.staticTexts["task-audio-time"]
+        guard time.exists else { return nil }
+        let sides = time.label.components(separatedBy: " / ")
+        guard sides.count == 2 else { return nil }
+        func seconds(_ text: String) -> Int? {
+            let parts = text.components(separatedBy: ":")
+            guard parts.count == 2, let minutes = Int(parts[0]), let seconds = Int(parts[1]),
+                  minutes >= 0, (0..<60).contains(seconds) else { return nil }
+            return minutes * 60 + seconds
+        }
+        guard let elapsed = seconds(sides[0]), let duration = seconds(sides[1]) else { return nil }
+        return (elapsed, duration)
+    }
+
+    private func task284Wait(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line,
+                             _ condition: @escaping () -> Bool) {
+        let expected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [expected], timeout: timeout), .completed, file: file, line: line)
+    }
+
+    private func task284Player(_ app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: "task-audio-player").firstMatch
+    }
+
+    private func task284AssertPlaying(_ app: XCUIApplication) {
+        XCTAssertTrue(task284Player(app).waitForExistence(timeout: 20))
+        XCTAssertEqual(app.staticTexts["task-audio-title"].label, "Task284 tone.wav")
+        let toggle = app.buttons["task-audio-toggle"], close = app.buttons["task-audio-close"]
+        boardEnabled(toggle); boardEnabled(close)
+        XCTAssertGreaterThanOrEqual(toggle.frame.height + 0.000001, 44)
+        XCTAssertGreaterThanOrEqual(close.frame.height + 0.000001, 44)
+        task284Wait { toggle.label == "Pause" && self.task284Clock(app)?.duration == 12 }
+    }
+
+    private func task284ClosePlayer(_ app: XCUIApplication) {
+        boardTap(app, "task-audio-close")
+        XCTAssertTrue(task284Player(app).waitForNonExistence(timeout: 15))
+    }
+
+    func testTaskAudioAutoplayPauseResumeEndReplayAndCloseReopen() {
+        continueAfterFailure = false
+        let app = task284Open()
+        task284OpenAudio(app); task284AssertPlaying(app)
+        task284Wait { (self.task284Clock(app)?.elapsed ?? -1) >= 1 }
+        boardTap(app, "task-audio-toggle")
+        task284Wait { app.buttons["task-audio-toggle"].label == "Play" }
+        let paused = app.staticTexts["task-audio-time"].label
+        let frozen = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            app.staticTexts["task-audio-time"].label != paused
+        }, object: nil)
+        frozen.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [frozen], timeout: 2), .completed)
+        XCTAssertEqual(app.staticTexts["task-audio-time"].label, paused)
+        let pausedElapsed = task284Clock(app)?.elapsed ?? -1
+        XCTAssertGreaterThanOrEqual(pausedElapsed, 1)
+        XCTAssertLessThan(pausedElapsed, 12)
+        boardTap(app, "task-audio-toggle")
+        task284Wait { app.buttons["task-audio-toggle"].label == "Pause"
+            && (self.task284Clock(app)?.elapsed ?? -1) > pausedElapsed }
+        // Wait for this real12-second clip's end, not a simulated callback.
+        task284Wait(timeout: 16) { app.buttons["task-audio-toggle"].label == "Play"
+            && self.task284Clock(app)?.elapsed == 12 }
+        boardTap(app, "task-audio-toggle")
+        task284Wait { app.buttons["task-audio-toggle"].label == "Pause"
+            && (self.task284Clock(app)?.elapsed ?? 12) < 3 }
+        task284Wait { (self.task284Clock(app)?.elapsed ?? -1) >= 1 }
+        task284ClosePlayer(app)
+        task284OpenAudio(app); task284AssertPlaying(app)
+        XCTAssertLessThan(task284Clock(app)?.elapsed ?? 12, 3)
+        task284Wait { (self.task284Clock(app)?.elapsed ?? -1) >= 1 }
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Task audio reopened with fresh foreground playback"; shot.lifetime = .keepAlways; add(shot)
+        task284ClosePlayer(app)
+        boardTap(app, "task-view-close")
+        boardEnabled(app.buttons["task-title-task284-audio"], timeout: 30)
+        app.terminate()
+    }
+
+    func testTaskAudioBackgroundStopsAndCorruptFileReleasesEditor() {
+        continueAfterFailure = false
+        let app = task284Open()
+        task284OpenAudio(app); task284AssertPlaying(app)
+        task284Wait { (self.task284Clock(app)?.elapsed ?? -1) >= 1 }
+        XCUIDevice.shared.press(.home); app.activate()
+        XCTAssertTrue(task284Player(app).waitForNonExistence(timeout: 15))
+        let noReplay = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in self.task284Player(app).exists }, object: nil)
+        noReplay.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [noReplay], timeout: 2), .completed)
+        task284OpenAudio(app); task284AssertPlaying(app)
+        XCTAssertLessThan(task284Clock(app)?.elapsed ?? 12, 3)
+        task284ClosePlayer(app)
+        task284OpenAudio(app, corrupt: true)
+        let alert = app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 20))
+        print("Task284 corrupt audio alert: " + alert.debugDescription)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Corrupt Task audio safe error"; shot.lifetime = .keepAlways; add(shot)
+        XCTAssertTrue(alert.staticTexts.matching(NSPredicate(format: "label == %@",
+            "Couldn't complete this action. Try again.")).firstMatch.exists)
+        for text in alert.staticTexts.allElementsBoundByIndex { XCTAssertFalse(text.label.contains("file://")) }
+        XCTAssertFalse(task284Player(app).exists)
+        let dismiss = alert.buttons["task-attachment-open-dismiss"].firstMatch
+        if dismiss.exists { dismiss.tap() } else { alert.buttons["OK"].tap() }
+        revealAttachmentTestTitle(app)
+        boardEnabled(app.textFields["task-editor-title"])
+        XCTAssertEqual(app.textFields["task-editor-title"].value as? String, "Task284 audio")
+        // A successful Open after the error also proves the busy/claim was released.
+        task284OpenAudio(app); task284AssertPlaying(app); task284ClosePlayer(app)
+        boardTap(app, "task-view-close")
+        boardEnabled(app.buttons["task-title-task284-audio"], timeout: 30)
+        app.terminate()
+    }
+
+    func testTaskReadonlyAudioPlaybackFromArchivedProject() {
+        continueAfterFailure = false
+        let app = task284Open(readonly: true)
+        task284OpenAudio(app, readonly: true); task284AssertPlaying(app)
+        task284Wait { (self.task284Clock(app)?.elapsed ?? -1) >= 1 }
+        boardTap(app, "task-audio-toggle")
+        task284Wait { app.buttons["task-audio-toggle"].label == "Play" }
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Archived readonly Task audio has working playback controls"; shot.lifetime = .keepAlways; add(shot)
+        task284ClosePlayer(app)
+        XCTAssertFalse(app.buttons["task-mode-edit"].exists)
+        XCTAssertFalse(app.textFields["task-editor-title"].exists)
+        boardTap(app, "task-view-close"); boardTap(app, "project-back")
+        app.terminate()
+    }
+
     private func openTask120(_ library: String) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--native-ui-test-library", library]

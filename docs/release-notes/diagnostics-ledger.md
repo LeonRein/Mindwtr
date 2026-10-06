@@ -30,6 +30,8 @@ Convention: a release-specific line carries `extra.releaseCheck = "<version>/<sl
 
 ## v1.3.5 (add before tagging, trim in the release after)
 
+- **`v1.3.5/ios-task-audio-playback`** — `apps/ios-native/App/CoreModel.swift` through `CoreHost.swift` and the forced Diagnostics sink in `apps/android-native/bundle/host-entry.ts`. `operation=audio-playback`, `outcome=started` proves the current foreground Task audio player accepted its first play request after local-file validation. It does not prove audible speaker output, silent-switch behavior or another app's audio ducking. No names, paths, identifiers or codec errors are logged.
+
 - **`v1.3.5/ios-task-photo-add`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift` through the forced Diagnostics sink in `apps/android-native/bundle/host-entry.ts`. `operation=photo-add`, `outcome=confirmed` proves the selected photo was processed, ownership checked and durably added to the protected Task draft. It does not prove the Task was subsequently saved. No image names, metadata, paths, identifiers or file proofs are logged.
 
 - **`v1.3.5/ios-project-local-file-open`** — `apps/ios-native/Sources/MindwtrNativeCore/CoreHost.swift` through the forced Diagnostics sink in `apps/android-native/bundle/host-entry.ts`. `operation=project-file-open`, `outcome=prepared` proves current Project authority, managed-file observations and the read-only shared open plan passed validation. It does not prove external sharing or image presentation completed. No Project title, identifiers, attachment text, paths or file proofs are logged.

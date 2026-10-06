@@ -3,6 +3,7 @@ import MindwtrNativeCore
 import SwiftUI
 import UIKit
 import Combine
+import AVFoundation
 
 #if DEBUG && targetEnvironment(simulator)
 private struct SimulatedSomedayDeleteRefusal: LocalizedError {
@@ -45,6 +46,147 @@ struct AttachmentFileOpenPresentation: Identifiable {
     let id: UUID
     let url: URL
     let kind: Kind
+}
+
+struct TaskAudioPlaybackState {
+    let presentationID: UUID
+    let title: String
+    let elapsed: TimeInterval
+    let duration: TimeInterval
+    let playing: Bool
+    let canToggle: Bool
+}
+
+/// One foreground presentation owns the player and its temporary audio session.
+@MainActor
+private final class TaskAttachmentAudioPlayer: NSObject, AVAudioPlayerDelegate {
+    enum Event { case tick, finished(Bool), failed, interruptionBegan, interruptionEnded, routeLost }
+
+    let presentationID: UUID
+    let host: CoreHost
+    let taskID: String
+    let session: String
+    let generation: Int
+    let title: String
+    var onEvent: ((TaskAttachmentAudioPlayer, Event) -> Void)?
+    private var player: AVAudioPlayer?
+    private var timer: Timer?
+    private var observers: [NSObjectProtocol] = []
+    private var sessionActive = false
+    private var retired = false
+    private var interrupted = false
+    private var finished = false
+
+    init(presentationID: UUID, host: CoreHost, taskID: String, session: String,
+         generation: Int, title: String, url: URL) throws {
+        self.presentationID = presentationID
+        self.host = host
+        self.taskID = taskID
+        self.session = session
+        self.generation = generation
+        self.title = title
+        super.init()
+        let player = try AVAudioPlayer(contentsOf: url)
+        guard player.duration.isFinite, player.duration > 0 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.player = player
+        player.delegate = self
+        let audioSession = AVAudioSession.sharedInstance()
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
+            object: audioSession, queue: .main) { [weak self] notification in
+                guard let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      let type = AVAudioSession.InterruptionType(rawValue: value) else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, !self.retired else { return }
+                    self.onEvent?(self, type == .began ? .interruptionBegan : .interruptionEnded)
+                }
+            })
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification,
+            object: audioSession, queue: .main) { [weak self] notification in
+                guard let value = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                      AVAudioSession.RouteChangeReason(rawValue: value) == .oldDeviceUnavailable else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, !self.retired else { return }
+                    self.onEvent?(self, .routeLost)
+                }
+            })
+    }
+
+    var state: TaskAudioPlaybackState {
+        let duration = player?.duration ?? 0
+        let time = player?.currentTime ?? 0
+        return TaskAudioPlaybackState(presentationID: presentationID, title: title,
+            elapsed: finished ? duration : time.isFinite ? min(duration, max(0, time)) : 0,
+            duration: duration, playing: player?.isPlaying == true, canToggle: !interrupted && !retired)
+    }
+
+    func play() throws {
+        guard !retired, !interrupted, let player else { throw CocoaError(.userCancelled) }
+        if finished || player.currentTime >= max(0, player.duration - 0.1) { player.currentTime = 0 }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playback, mode: .default, options: .duckOthers)
+        try audioSession.setActive(true)
+        sessionActive = true
+        guard player.play() else { throw CocoaError(.fileReadCorruptFile) }
+        finished = false
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 0.25, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func pause(interruption: Bool = false) {
+        guard !retired else { return }
+        if interruption { interrupted = true }
+        player?.pause()
+        timer?.invalidate(); timer = nil
+        deactivate()
+    }
+
+    func finish() {
+        pause()
+        finished = true
+    }
+
+    func endInterruption() { interrupted = false }
+
+    func retire() {
+        guard !retired else { return }
+        retired = true
+        onEvent = nil
+        player?.stop()
+        player?.delegate = nil
+        timer?.invalidate(); timer = nil
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+        player = nil
+        deactivate()
+    }
+
+    private func deactivate() {
+        guard sessionActive else { return }
+        sessionActive = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    @objc private func tick() { if !retired { onEvent?(self, .tick) } }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        let identity = ObjectIdentifier(player)
+        Task { @MainActor [weak self] in
+            guard let self, !self.retired, self.player.map(ObjectIdentifier.init) == identity else { return }
+            self.onEvent?(self, .finished(flag))
+        }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        let identity = ObjectIdentifier(player)
+        Task { @MainActor [weak self] in
+            guard let self, !self.retired, self.player.map(ObjectIdentifier.init) == identity else { return }
+            self.onEvent?(self, .failed)
+        }
+    }
 }
 
 typealias CoreObject = [String: Any]
@@ -836,9 +978,12 @@ final class CoreModel: ObservableObject {
     @Published private(set) var taskAttachmentOpening = false
     @Published private(set) var taskAttachmentOpenError: String?
     @Published private(set) var taskFileOpenPresentation: AttachmentFileOpenPresentation?
+    @Published private(set) var taskAudioPlayback: TaskAudioPlaybackState?
+    private var taskAudioPlayer: TaskAttachmentAudioPlayer?
     @Published private(set) var taskSharePayload: TaskSharePayload?
     @Published private(set) var taskShareError: String?
     private var taskAttachmentOpenClaim = UUID()
+    private var taskAttachmentOpeningFile = false
     @Published private(set) var taskChecklistField: CoreObject = [:]
     @Published private(set) var taskChecklistInputs: [Int: String] = [:]
     @Published var taskChecklistAppendInput = ""
@@ -3329,9 +3474,13 @@ final class CoreModel: ObservableObject {
         observeDiagnosticsConcealment()
         taskAttachmentOpenClaim = claim
         taskAttachmentOpening = true
+        taskAttachmentOpeningFile = kind == "file"
         taskAttachmentOpenError = nil
         defer {
-            if taskAttachmentOpenClaim == claim && taskFileOpenPresentation?.id != claim { taskAttachmentOpening = false }
+            if taskAttachmentOpenClaim == claim && taskFileOpenPresentation?.id != claim {
+                taskAttachmentOpening = false
+                taskAttachmentOpeningFile = false
+            }
         }
         let current = { [self] in
             host === currentHost && ready && !Task.isCancelled
@@ -3382,6 +3531,10 @@ final class CoreModel: ObservableObject {
                       let url = URL(string: uri), url.isFileURL else { throw CocoaError(.coderReadCorrupt) }
                 guard current() else { return }
                 taskFileOpenPresentation = AttachmentFileOpenPresentation(id: claim, url: url, kind: planKind)
+                if planKind == .audio {
+                    startTaskAudio(presentationID: claim, host: currentHost, taskID: id, session: session,
+                        generation: generation, title: attachment.text("title"), url: url)
+                }
                 return
             }
             guard result.text("status") == "available", result["message"] is NSNull,
@@ -3422,12 +3575,89 @@ final class CoreModel: ObservableObject {
     }
 
     private func invalidateTaskAttachmentOpen() {
+        // Stop the original owner synchronously before publishing its removal.
+        taskAudioPlayer?.retire()
+        taskAudioPlayer = nil
+        taskAudioPlayback = nil
         taskAttachmentOpenClaim = UUID()
         taskFileOpenPresentation = nil
         taskAttachmentOpening = false
+        taskAttachmentOpeningFile = false
     }
 
     func dismissTaskAttachmentOpenError() { taskAttachmentOpenError = nil }
+
+    func stopTaskAudioForBackground() {
+        // An awaiting file plan has not revealed its kind yet. Fence its claim,
+        // but leave already-adopted image and document presentations intact.
+        if taskAudioPlayer != nil || taskFileOpenPresentation?.kind == .audio
+            || (taskAttachmentOpening && taskAttachmentOpeningFile && taskFileOpenPresentation == nil) {
+            invalidateTaskAttachmentOpen()
+        }
+    }
+
+    func toggleTaskAudioPlayback(presentationID: UUID) {
+        guard let audio = taskAudioPlayer, audio.presentationID == presentationID,
+              taskAudioOwnerIsCurrent(audio), audio.state.canToggle else { return }
+        do {
+            if audio.state.playing { audio.pause() }
+            else { try audio.play() }
+            taskAudioPlayback = audio.state
+        } catch { failTaskAudio(audio) }
+    }
+
+    private func taskAudioOwnerIsCurrent(_ audio: TaskAttachmentAudioPlayer) -> Bool {
+        taskAudioPlayer === audio && taskAttachmentOpenClaim == audio.presentationID
+            && taskFileOpenPresentation?.id == audio.presentationID && taskFileOpenPresentation?.kind == .audio
+            && host === audio.host && ready && taskPresented && viewedTaskID == audio.taskID
+            && taskRecoverySession == audio.session && taskRecoveryGeneration == audio.generation
+            && !appLock.concealed && UIApplication.shared.applicationState == .active
+    }
+
+    private func startTaskAudio(presentationID: UUID, host: CoreHost, taskID: String, session: String,
+                                generation: Int, title: String, url: URL) {
+        do {
+            let audio = try TaskAttachmentAudioPlayer(presentationID: presentationID, host: host,
+                taskID: taskID, session: session, generation: generation,
+                title: title.isEmpty ? label("quickAdd.audioNoteTitle") : title, url: url)
+            audio.onEvent = { [weak self] player, event in self?.receiveTaskAudioEvent(player, event: event) }
+            taskAudioPlayer = audio
+            guard taskAudioOwnerIsCurrent(audio) else { invalidateTaskAttachmentOpen(); return }
+            try audio.play()
+            taskAudioPlayback = audio.state
+            // The original admitted host records actual autoplay, best-effort.
+            // No new await splits claimed playback from its UI publication.
+            Task { await host.recordTaskAudioPlaybackStarted() }
+        } catch {
+            guard taskAttachmentOpenClaim == presentationID, taskFileOpenPresentation?.id == presentationID else { return }
+            invalidateTaskAttachmentOpen()
+            taskAttachmentOpenError = label("settings.feedback.actionFailed")
+        }
+    }
+
+    private func receiveTaskAudioEvent(_ audio: TaskAttachmentAudioPlayer, event: TaskAttachmentAudioPlayer.Event) {
+        guard taskAudioOwnerIsCurrent(audio) else {
+            if taskAudioPlayer === audio { invalidateTaskAttachmentOpen() }
+            return
+        }
+        switch event {
+        case .tick: break
+        case .finished(let success):
+            guard success else { failTaskAudio(audio); return }
+            audio.finish()
+        case .failed: failTaskAudio(audio); return
+        case .interruptionBegan: audio.pause(interruption: true)
+        case .interruptionEnded: audio.endInterruption()
+        case .routeLost: audio.pause()
+        }
+        taskAudioPlayback = audio.state
+    }
+
+    private func failTaskAudio(_ audio: TaskAttachmentAudioPlayer) {
+        guard taskAudioOwnerIsCurrent(audio) else { return }
+        invalidateTaskAttachmentOpen()
+        taskAttachmentOpenError = label("settings.feedback.actionFailed")
+    }
 
     private func refreshTaskAttachmentRows() async throws {
         let id = viewedTaskID, session = taskRecoverySession
@@ -5380,6 +5610,7 @@ final class CoreModel: ObservableObject {
                     "appLock.title", "appLock.description", "appLock.prompt", "appLock.enablePrompt", "appLock.unlock",
                     "appLock.authenticating", "appLock.useDevicePasscode", "appLock.unavailable", "appLock.cancelled", "appLock.failed",
                     "common.all", "common.close", "common.cancel", "common.done", "common.retry", "common.loading", "common.ok", "common.noMatches",
+                    "common.play", "common.pause", "quickAdd.audioNoteTitle", "audio.loading",
                     "attachments.title", "attachments.missing", "attachments.download", "attachments.addLink", "attachments.addFile",
                     "settings.attachmentsCleanupPendingDeletesConfirmAction", "persistence.saved",
                     "attachments.remove", "attachments.linkPlaceholder", "attachments.linkBatchHint",

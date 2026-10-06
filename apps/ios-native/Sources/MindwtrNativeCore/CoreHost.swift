@@ -341,6 +341,11 @@ public final class CoreHost: @unchecked Sendable {
         _ = try? await perform { try $0.recordEditorAttachmentAcknowledgment(operation: operation) }
     }
 
+    /// Fixed, best-effort proof that the foreground Task player accepted playback.
+    public func recordTaskAudioPlaybackStarted() async {
+        _ = try? await perform { try $0.recordTaskAudioPlaybackStarted() }
+    }
+
     public func validatedDiagnosticsShareURL(_ path: String) async throws -> URL {
         try await perform { try $0.validatedDiagnosticsShareURL(path) }
     }
@@ -4541,6 +4546,12 @@ private final class Engine: @unchecked Sendable {
         guard started, !closed, !recoveryActivationPending,
               ["add", "remove", "save", "discard", "recover"].contains(operation) else { return }
         _ = try invoke("attachmentDraftAcknowledged", arguments: ["editor-" + operation, "confirmed"])
+    }
+
+    func recordTaskAudioPlaybackStarted() throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard started, !closed, !recoveryActivationPending else { return }
+        _ = try invoke("attachmentDraftAcknowledged", arguments: ["audio-playback", "started"])
     }
 
     func validatedDiagnosticsShareURL(_ path: String) throws -> URL {
