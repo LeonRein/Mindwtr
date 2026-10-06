@@ -523,6 +523,18 @@ try {
     console.error(error instanceof Stopped ? `STOPPED: ${error.message}` : `FAIL: ${error.message}`);
     process.exitCode = error instanceof Stopped ? 3 : 1;
 } finally {
+    // A failed run leaves the phone's backend on a folder about to stop: set Sync Off, as step (9) does, so the next check's
+    // app does not keep syncing against it (check-encryption-device.mjs does the same).
+    if (process.exitCode === 1 && dav) {
+        try {
+            if (!front().includes(`${PKG}/`)) device.launch(ACTIVITY);
+            await openSync();
+            await tapTag('sync-backend-off', (current) => current.some((node) => node.text === en['settings.syncOff']), 'Sync off after a failure');
+            console.log('info - Sync set Off after the failure');
+        } catch (error) {
+            console.log(`warn - Sync could not be set Off after the failure: ${error.message}`);
+        }
+    }
     cleanup();
     await sleep(500);
     process.exit(process.exitCode ?? 0);
