@@ -1631,6 +1631,32 @@ describe('canonical local reads contract', () => {
                 expect(nativeValue(await host.commitPreparedProjectAttachmentWrite({ request, prepared: planned.prepared })))
                     .toEqual(planned.prepared.result);
             },
+            commitPreparedProjectFileRemoveWrite: async (control) => {
+                const projectId = settled.projects[1].id;
+                const attachment = fileAttachment('contract-project-file');
+                expect(await call('updateProject', projectId, { attachments: [attachment] })).toMatchObject({ success: true });
+                const host = await nativeHost(control);
+                const before = nativeValue(await readAreaDurableData(false, true)).authority.snapshot;
+                const options = nativeValue(host.getProjectAttachmentEditOptions({ projectId }));
+                const { id, ...expected } = options.project;
+                const request = { requestId: '42532daa-9a6d-48f7-8b34-1c07eb266e5a', projectId: id,
+                    intent: { kind: 'remove' as const, attachmentId: attachment.id }, expected };
+                const planned = nativeValue(host.prepareProjectFileRemoveWrite(request));
+                if (planned.kind !== 'prepared') throw new Error('Project file Remove must prepare a real write');
+                expect(planned.prepared.effect.project.after.attachments).toEqual([
+                    { ...attachment, deletedAt: planned.prepared.updateAt, updatedAt: planned.prepared.updateAt },
+                ]);
+                control.expectPersisted((written) => {
+                    expect(written.projects).toEqual(before.projects.map((row) => row.id === id
+                        ? planned.prepared.effect.project.after : row));
+                    expect(written.tasks).toEqual(before.tasks);
+                    expect(written.sections).toEqual(before.sections);
+                    expect(written.settings).toEqual(before.settings);
+                });
+                control.resetBaseline();
+                expect(nativeValue(await host.commitPreparedProjectFileRemoveWrite({ request, prepared: planned.prepared })))
+                    .toEqual({ id, attachmentIds: [attachment.id] });
+            },
             commitPreparedProjectFocus: async (control) => {
                 const host = await nativeHost(control);
                 const options = nativeValue(host.getProjectFocusOptions({ projectId: settled.projects[1].id }));

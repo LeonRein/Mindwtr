@@ -317,7 +317,7 @@ test.each(['version-command', 'malformed-hash'])('pre-archive compiler identific
   const fixture = archiveFixture();
   try {
     const command = fault === 'version-command' ? 'xcodebuild' : 'shasum';
-    writeFileSync(join(fixture.root, 'bin', command), fault === 'version-command' ? '#!/bin/sh\nexit 1\n' : '#!/bin/sh\necho invalid-hash\n', { mode: 0o755 });
+    writeFileSync(join(fixture.root, 'bin', command), fault === 'version-command' ? '#!/bin/sh\nexit 1\n' : '#!/bin/sh\ncat >/dev/null\necho invalid-hash\n', { mode: 0o755 });
     const result = fixture.runArchive(100, archiveMinimumKiB);
     expect(result.status).not.toBe(0); expect(result.stderr).toContain(fault === 'version-command' ? 'Cannot identify the current compiler cache' : 'Invalid compiler cache identity');
     expect(readFileSync(fixture.simulator, 'utf8')).toBe('fixture'); expect(readFileSync(fixture.archive, 'utf8')).toBe('fixture'); expect(existsSync(join(fixture.root, 'df-state'))).toBe(false);
