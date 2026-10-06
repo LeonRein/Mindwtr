@@ -377,6 +377,10 @@ export interface SyncRunPlatformHooks {
     /** Mobile: gate attachment phases on real pending work (and flip the
      *  visible sync-activity state). Desktop always runs the phases. */
     shouldRunAttachmentPhase?(data: AppData, phase: SyncRunAttachmentPhase): Promise<boolean>;
+    /** Mobile: the prepare phase was deferred (posture not yet known) with
+     *  attachment work pending, so an unchanged document must not skip the
+     *  post-merge pass: it is the only one left to do that work. */
+    hasDeferredAttachmentWork?(): boolean;
     /** Mobile: the merge phase is definitely running — show sync activity. */
     onMergePhaseStart?(): void;
     /** True when the cycle's abort signal fired: attachment pre-sync errors

@@ -410,6 +410,29 @@ describe('mobile sync service behind fake ports', () => {
     expect(JSON.parse(fake.values.get(SYNC_ENCRYPTION_STATE_KEY)!)).toEqual({ state: 'off', partlyEncryptedScope: scope });
   });
 
+  it('runs the attachment pass a deferred pre-sync phase owes, even when the document is unchanged', async () => {
+    // A download the last process never finished (the native installer's boot recovery rolled it back): the record holds a
+    // cloudKey and no local file. On a location this device has no fast-sync record or presence stamp for, the pre-sync
+    // phase defers (encryption-recheck), and the unchanged read check then skipped the post-merge pass as well, so even
+    // Sync now never downloaded it.
+    const fake = createFakeHost({ values: WEBDAV_VALUES, secrets: { [WEBDAV_PASSWORD_KEY]: 'secret' } });
+    const attachmentPasses = vi.fn(async () => false as const);
+    fake.host.attachments.hasPendingWork = async () => true;
+    fake.host.attachments.syncWebdav = attachmentPasses;
+    fake.host.encryption = { ...fake.host.encryption, probeLocationCiphertext: async () => 'plaintext' as const };
+    const service = createMobileSyncService(fake.host);
+    await expect(service.performMobileSync(undefined, { manual: true })).resolves.toMatchObject({ success: true });
+    // No record of a completed cycle here (as after attachment cleanup invalidates it): the posture is unestablished again.
+    fake.values.delete('@mindwtr_fast_sync_state_v1');
+    attachmentPasses.mockClear();
+
+    const result = await service.performMobileSync(undefined, { manual: true });
+
+    expect(result.success).toBe(true);
+    expect(fake.logs.some((line) => line.message.includes('Attachment pre-sync skipped') && line.extra?.reason === 'encryption-recheck')).toBe(true);
+    expect(attachmentPasses).toHaveBeenCalled();
+  });
+
   it('does nothing in sandbox mode', async () => {
     const fake = createFakeHost({ values: WEBDAV_VALUES });
     fake.host.core!.isSandboxMode = () => true;

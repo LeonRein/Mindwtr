@@ -901,6 +901,9 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
      *  attachment prepare phase until the document read has established what is actually at this
      *  location. See `isSyncEncryptionPostureUnestablished`. */
     private deferUploadsUntilDiscovery = false;
+    /** This cycle's prepare phase was deferred while attachment work was pending (SyncRun's
+     *  `hasDeferredAttachmentWork`): the post-merge pass must run even on an unchanged document. */
+    private deferredAttachmentWork = false;
     /** What the location held when this cycle asked (assertLocationNotPartlyEncrypted); asked once. */
     private locationCiphertext: 'plaintext' | 'encrypted' | 'mixed' | null = null;
     /** Encryption state as the gate saw it, kept for the `activation` diagnostic line so a
@@ -1525,6 +1528,7 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
     private createHooks(): SyncRunPlatformHooks {
       return {
         setupCycle: async ({ setStep, setBackend }) => {
+          this.deferredAttachmentWork = false;
           const backend = this.backend;
           setBackend(backend);
           if (backend === 'file' && !(await this.resolveFileBackendConfig())) {
@@ -1704,6 +1708,7 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
             currentChangeAt: String(currentChangeAt),
           });
         },
+        hasDeferredAttachmentWork: () => this.deferredAttachmentWork,
         shouldRunAttachmentPhase: async (data, phase) => {
           const backend = this.backend;
           // #1138 / fresh-join-attachment-posture packet -10: this cycle does not yet know the
@@ -1715,7 +1720,14 @@ export const createMobileSyncService = <Lease>(host: MobileSyncServiceHost<Lease
           // still encrypted. Skip the pre-phase; the post-merge phase runs normally once the read
           // has settled the posture.
           if (phase === 'prepare' && this.deferUploadsUntilDiscovery) {
-            logSyncInfo('Attachment pre-sync skipped', { backend, reason: 'encryption-recheck' });
+            this.deferredAttachmentWork = await host.attachments.hasPendingWork(data, {
+              contentCheckEnabled: backend === 'file' || backend === 'webdav' || backend === 'cloudkit' || backend === 'cloud',
+            });
+            logSyncInfo('Attachment pre-sync skipped', {
+              backend,
+              reason: 'encryption-recheck',
+              ...(this.deferredAttachmentWork ? { owed: 'post-merge', releaseCheck: 'v1.3.5/deferred-attachment-pass' } : {}),
+            });
             return false;
           }
           // #1057 (review B3): every attachment backend now wires check-on-touch

@@ -16,6 +16,8 @@ const RELEASE_CHECK_FIELD_NAMES = [
     // ios-local-attachment-host and ios-attachment-draft-owned reuse releaseCheck, operation, and outcome below.
     // automation concurrent-write replay; capture routing reuses outcome below.
     'retryCount',
+    // deferred-attachment-pass: which pass owes the deferred pre-sync phase's work.
+    'owed',
     // calendar-mirror-filter reuses releaseCheck, platform, stage, and count below.
     // calendar-date-color-diagnostics uses only aggregate counts; no dates, names, ids, or colors.
     'calendarCount', 'eventCount', 'allDayCount', 'timedCount',
