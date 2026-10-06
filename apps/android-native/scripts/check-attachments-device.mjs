@@ -485,10 +485,14 @@ try {
     await waitFor('the Inbox after the restart', onInbox, 60_000);
     const recovery = /Native Android install recovery (.+)/.exec(logs())?.[1] ?? '';
     check(/restored=1/.test(recovery), `(7) the boot's recovery rolled the install back (${recovery})`);
+    // The startup sync's pre-sync pass may already have installed the file again (it runs about a second after the
+    // recovery): what proves the rollback is no installer file left and a target that is absent or the whole file, never part.
     const afterBoot = attachmentFiles();
-    check(!afterBoot.some((name) => name.startsWith('.mindwtr-install-')) && !afterBoot.some((name) => name.startsWith(killedId)),
-        '(7) no installer file and no half file is left; the target was never written');
-    await syncNow('Sync now (the install again)');
+    const target = afterBoot.find((name) => name.startsWith(killedId));
+    const whole = Boolean(target) && phoneSha(`file:///data/user/0/${PKG}/files/attachments/${target}`) === sha256(extraBytes('install'));
+    check(!afterBoot.some((name) => name.startsWith('.mindwtr-install-')) && (!target || whole),
+        `(7) no installer file and no half file is left; the target is ${target ? 'the whole file (the startup sync installed it again)' : 'absent'}`);
+    if (!target) await syncNow('Sync now (the install again)');
     await until('the install to finish', () => attachmentFiles().some((name) => name.startsWith(killedId)), 120_000, 3_000);
     const installed = live(stored('projects', names.project)).find((a) => a.id === killedId);
     check(installed && phoneSha(installed.uri) === sha256(extraBytes('install')), '(7) the next sync installed the whole file (SHA-256)');
