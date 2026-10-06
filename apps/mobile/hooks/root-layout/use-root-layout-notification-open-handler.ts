@@ -33,7 +33,7 @@ const replayNotificationCompletions = (): Promise<void> => {
                     try {
                         if (!completion.actionId || !completion.taskId) throw new Error('Invalid completion receipt');
                         logNotificationOutcome('Done action stored', {
-                            releaseCheck: '1.3.5/reminder-done-durable', outcome: 'stored',
+                            releaseCheck: 'v1.3.5/reminder-done-durable', outcome: 'stored',
                         });
                         const state = useTaskStore.getState();
                         const task = state._tasksById?.get(completion.taskId) ?? state.tasks?.find((item) => item.id === completion.taskId);
@@ -49,12 +49,12 @@ const replayNotificationCompletions = (): Promise<void> => {
                         await flushPendingSave();
                         await acknowledgeNotificationCompletion(completion.actionId);
                         logNotificationOutcome('Done action saved and acknowledged', {
-                            releaseCheck: '1.3.5/reminder-done-durable',
+                            releaseCheck: 'v1.3.5/reminder-done-durable',
                             outcome: blocker || 'completed',
                         });
                     } catch {
                         void logWarn('[Local Notifications] Done action retained for retry', {
-                            scope: 'notifications', extra: { releaseCheck: '1.3.5/reminder-done-durable', outcome: 'retained' },
+                            scope: 'notifications', extra: { releaseCheck: 'v1.3.5/reminder-done-durable', outcome: 'retained' },
                         });
                         // Retry only on another receipt, readiness change, or foreground; no failure loop.
                         replayRequested = false;
@@ -63,7 +63,7 @@ const replayNotificationCompletions = (): Promise<void> => {
                 }
             } catch {
                 void logWarn('[Local Notifications] Done queue retained for retry', {
-                    scope: 'notifications', extra: { releaseCheck: '1.3.5/reminder-done-durable', outcome: 'unreadable' },
+                    scope: 'notifications', extra: { releaseCheck: 'v1.3.5/reminder-done-durable', outcome: 'unreadable' },
                 });
                 replayRequested = false;
                 return;
