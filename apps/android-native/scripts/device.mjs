@@ -330,6 +330,21 @@ export function connect({ serial, pkg, uiFile, adb = process.env.ADB ?? '/home/d
         }
         return newest;
     };
+    /**
+     * Force-stops the app until its process stays gone. Right after `install -r` the launcher's placed widgets get their
+     * update broadcast (TasksWidgetProvider), and SystemUI rebinds a placed Quick Settings tile 5 s after its process died:
+     * either starts the app again just after one force-stop (S23 10-05: "timed out waiting for the app process to end").
+     */
+    const stopApp = async (timeoutMs = 30_000) => {
+        const deadline = Date.now() + timeoutMs;
+        let goneSince = 0;
+        while (Date.now() < deadline) {
+            if (pid()) { sh(`am force-stop ${pkg}`); goneSince = 0; } else if (!goneSince) goneSince = Date.now();
+            else if (Date.now() - goneSince >= 2_000) return;
+            await sleep(250);
+        }
+        fail('timed out waiting for the app process to end');
+    };
     const logs = (processId, tag) => adbRaw('logcat', '-d', `--pid=${processId}`, '-s', `${tag}:*`).toString('utf8');
     const screen = async () => {
         for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -542,5 +557,5 @@ export function connect({ serial, pkg, uiFile, adb = process.env.ADB ?? '/home/d
         return execFileSync('magick', [file, '-format', points.map(([x, y]) => `%[hex:p{${x},${y}}]`).join(' '), 'info:'], { encoding: 'utf8' })
             .trim().split(' ').map((hex) => hex.slice(0, 6).toUpperCase());
     };
-    return { adbRaw, sh, home, front, requireAppFront, launch, pid, tapExpecting, focusAtEnd, logs, screen, waitFor, tap, openCapture, type, swipe, signature, toTop, settle, reveal, pull, colors, revealAction, swipeDone, completeUntil };
+    return { adbRaw, sh, home, front, requireAppFront, launch, pid, stopApp, tapExpecting, focusAtEnd, logs, screen, waitFor, tap, openCapture, type, swipe, signature, toTop, settle, reveal, pull, colors, revealAction, swipeDone, completeUntil };
 }

@@ -258,9 +258,8 @@ try {
     lost = await serveWebdav({ port: LOST_PORT, username: USER, password: PASSWORD });
     for (const port of [WEBDAV_PORT, WEAK_PORT, LOST_PORT]) execFileSync(adbBin, ['-s', serial, 'reverse', `tcp:${port}`, `tcp:${port}`], { stdio: 'inherit' });
     execFileSync(adbBin, ['-s', serial, 'install', '-r', apk], { stdio: 'inherit' });
-    sh(`am force-stop ${PKG}`);
     sh(`setprop debug.mindwtr.native.crypto_delay_ms ${DELAY_MS}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     await waitFor('the Inbox', onInbox, 60_000);
@@ -388,8 +387,7 @@ try {
 
     // (5) A restart: the key stays sealed on the phone, so sync goes on with no passphrase.
     const argonTotal = argonTimes();
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await second.capture(titles.restart);
     await second.syncNow('webdav', { ...fields(WEBDAV_PORT), password: null });
     device.launch(ACTIVITY);

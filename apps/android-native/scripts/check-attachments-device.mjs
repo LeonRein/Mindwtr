@@ -326,8 +326,7 @@ try {
     execFileSync(adbBin, ['-s', serial, 'reverse', `tcp:${WEBDAV_PORT}`, `tcp:${WEBDAV_PORT}`], { stdio: 'ignore' });
     execFileSync(adbBin, ['-s', serial, 'install', '-r', apk], { stdio: 'inherit' });
     sh('setprop debug.mindwtr.native.install_stop \'\'');
-    sh(`am force-stop ${PKG}`);
-    await waitFor('the app process to end', () => pid() === '', 10_000);
+    await device.stopApp();
     await waitFor('home screen', () => front().includes(`${home}/`), 10_000);
     device.launch(ACTIVITY);
     await waitFor('the Inbox', onInbox, 60_000);
@@ -479,7 +478,7 @@ try {
     check(allLogs().includes('Native Android install stop at=journal'), '(7) the sync\'s install died once its journal was on disk');
     const leftover = attachmentFiles().filter((name) => name.startsWith('.mindwtr-install-'));
     check(leftover.some((name) => name.endsWith('.journal')), `(7) the journal is on disk after the death (${leftover.join(', ')})`);
-    if (pid()) { sh(`am force-stop ${PKG}`); await waitFor('the app process to end', () => pid() === '', 10_000); }
+    if (pid()) await device.stopApp();
     await until('home screen', () => front().includes(`${home}/`) || otherAppFront(), 10_000, 500);
     if (!front().includes(`${home}/`)) sh('input keyevent KEYCODE_HOME');
     device.launch(ACTIVITY);
